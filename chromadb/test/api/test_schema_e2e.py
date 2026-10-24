@@ -503,16 +503,15 @@ def test_delete_collection_resets_schema_configuration(
 
 
 @pytest.mark.skipif(not is_spann_disabled_mode, reason=skip_reason_spann_enabled)
-def test_sparse_vector_not_allowed_locally(
+def test_sparse_vector_allowed_locally(
     client_factories: "ClientFactories",
 ) -> None:
-    """Sparse vector configs are not allowed to be created locally."""
+    """Sparse vector configs can be created locally, and the local Search uses them."""
     schema = Schema()
     schema.create_index(key="sparse_metadata", config=SparseVectorIndexConfig())
-    with pytest.raises(
-        InvalidArgumentError, match="Sparse vector indexing is not enabled in local"
-    ):
-        _create_isolated_collection(client_factories, schema=schema)
+    collection, _ = _create_isolated_collection(client_factories, schema=schema)
+    assert collection.schema is not None
+    assert "sparse_metadata" in collection.schema.keys
 
 
 @pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
