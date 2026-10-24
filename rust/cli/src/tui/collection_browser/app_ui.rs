@@ -1,3 +1,5 @@
+// Changed by VecturaDB contributors for the VecturaDB branding.
+// Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
 use crate::tui::collection_browser::app_state::{AppState, ExpandContext};
 use crate::tui::collection_browser::query_editor::{Mode, QueryEditor, QueryEditorState};
 use crate::tui::collection_browser::table::{AppTable, CurrentCell};

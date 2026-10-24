@@ -1,3 +1,5 @@
+// Changed by VecturaDB contributors for the VecturaDB branding.
+// Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
 use crate::commands::browse::BrowseError;
 use crate::commands::db::get_db_name;
 use crate::commands::install::InstallError;

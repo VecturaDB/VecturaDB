@@ -1,8 +1,10 @@
+# Changed by VecturaDB contributors for the VecturaDB branding.
+# Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
 [project]
 name = "VecturaDB"
 dynamic = ["version"]
 
-authors = [{ name = "Jeff Huber", email = "jeff@trychroma.com" }, { name = "Anton Troynikov", email = "anton@trychroma.com" }]
+authors = [{ name = "Jeff Huber", email = "jeff@trychroma.com" }, { name = "Anton Troynikov", email = "anton@trychroma.com" }, { name = "VecturaDB contributors" }]
 description = "VecturaDB, compatible with the Chroma API."
 readme = "README.md"
 requires-python = ">=3.9"

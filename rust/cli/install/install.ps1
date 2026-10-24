@@ -1,3 +1,5 @@
+# Changed by VecturaDB contributors for the VecturaDB branding.
+# Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
 # VecturaDB CLI Installer Script for Windows (PowerShell)
 # Usage:
 #   iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/VecturaDB/VecturaDB/main/rust/cli/install/install.ps1'))

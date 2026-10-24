@@ -1,3 +1,5 @@
+# Changed by VecturaDB contributors for the VecturaDB branding.
+# Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
 import orjson
 import logging
 from typing import Any, Dict, Mapping, Optional, cast, Tuple, List
