@@ -617,6 +617,26 @@ impl SqliteMetadataWriter {
     }
 }
 
+/// Whether the sparse index of a key weights queries by IDF (BM25): the setting of the key, else the default, as the
+/// sparse KNN of distributed Chroma reads it (rust/worker/src/execution/orchestration/sparse_knn.rs:220-240).
+pub fn sparse_bm25_enabled(schema: &Schema, key: &str) -> bool {
+    schema
+        .keys
+        .get(key)
+        .and_then(|types| types.sparse_vector.as_ref())
+        .and_then(|value| value.sparse_vector_index.as_ref())
+        .and_then(|index| index.config.bm25)
+        .unwrap_or_else(|| {
+            schema
+                .defaults
+                .sparse_vector
+                .as_ref()
+                .and_then(|value| value.sparse_vector_index.as_ref())
+                .and_then(|index| index.config.bm25)
+                .unwrap_or(false)
+        })
+}
+
 trait IntoSqliteExpr {
     /// Evaluate to a binary integer (0/1) indicating boolean value
     /// We cannot directly use a boolean value because `Any` and `All` aggregation does not exist
@@ -1338,6 +1358,49 @@ impl SqliteMetadataReader {
         Ok(result)
     }
 
+    /// The query of a BM25 key weighted as distributed Chroma does (rust/worker/src/execution/operators/idf.rs:84-89,
+    /// 208-231): every weight times ln_1p((n - n_t + 0.5) / (n_t + 0.5)), in f32, where n is the number of records of
+    /// the collection and n_t the number of records whose vector of the key has the dimension, at most n.
+    async fn idf_scaled_query(
+        conn: &mut sqlx::SqliteConnection,
+        segment_id: &str,
+        key: &str,
+        query: &chroma_types::SparseVector,
+    ) -> Result<chroma_types::SparseVector, SqliteMetadataError> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM embeddings WHERE segment_id = ?")
+            .bind(segment_id)
+            .fetch_one(&mut *conn)
+            .await?;
+        let mut counts: HashMap<u32, i64> = HashMap::new();
+        if !query.indices.is_empty() {
+            let mut builder = sqlx::QueryBuilder::<Sqlite>::new(
+                "SELECT term.dim, COUNT(*) FROM embedding_metadata_sparse_term AS term \
+                 JOIN embeddings ON embeddings.id = term.id WHERE embeddings.segment_id = ",
+            );
+            builder
+                .push_bind(segment_id)
+                .push(" AND term.key = ")
+                .push_bind(key)
+                .push(" AND term.dim IN (");
+            {
+                let mut dims = builder.separated(", ");
+                for dim in &query.indices {
+                    dims.push_bind(*dim);
+                }
+                dims.push_unseparated(") GROUP BY term.dim");
+            }
+            let rows: Vec<(u32, i64)> = builder.build_query_as().fetch_all(&mut *conn).await?;
+            counts.extend(rows);
+        }
+        let n = n as f32;
+        let mut scaled = query.clone();
+        for (dim, value) in scaled.indices.iter().zip(scaled.values.iter_mut()) {
+            let nt = (counts.get(dim).copied().unwrap_or_default() as f32).min(n);
+            *value *= ((n - nt + 0.5) / (nt + 0.5)).ln_1p();
+        }
+        Ok(scaled)
+    }
+
     async fn sparse_search_with_connection(
         &self,
         collection: chroma_types::CollectionAndSegments,
@@ -1360,6 +1423,13 @@ impl SqliteMetadataReader {
             }) = &payload.rank.expr
             else {
                 return Err(MetadataValueConversionError::InvalidValue.into());
+            };
+            let query = match collection.collection.schema.as_ref() {
+                Some(schema) if sparse_bm25_enabled(schema, key) => {
+                    Self::idf_scaled_query(conn, &collection.metadata_segment.id.to_string(), key, query)
+                        .await?
+                }
+                _ => query.clone(),
             };
             // Only the dimensions of the query: a record with none of them is not a candidate.
             let term = Alias::new("term");
@@ -2086,6 +2156,123 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("a", -1.0), ("c", 0.5)]
         );
+    }
+
+    fn bm25_schema() -> chroma_types::Schema {
+        use chroma_types::{
+            KnnIndex, Schema, SparseIndexAlgorithm, SparseVectorIndexConfig, SparseVectorIndexType,
+            SparseVectorValueType,
+        };
+        let mut schema = Schema::new_default(KnnIndex::Hnsw);
+        schema.keys.entry("sparse".into()).or_default().sparse_vector = Some(SparseVectorValueType {
+            sparse_vector_index: Some(SparseVectorIndexType {
+                enabled: true,
+                config: SparseVectorIndexConfig {
+                    bm25: Some(true),
+                    embedding_function: None,
+                    source_key: None,
+                    algorithm: SparseIndexAlgorithm::Wand,
+                },
+            }),
+        });
+        schema
+    }
+
+    // The BM25 vectors of ChromaBm25EmbeddingFunction (chromadb 1.5.9, k 1.2, b 0.75, avg_doc_length 256) for the
+    // four documents of the Cloud comparison (CLOUD-PROVE.md), and of the query "fox".
+    fn bm25_documents() -> Vec<(&'static str, Vec<(u32, f32)>)> {
+        let doc = |indices: &[u32], value: f32| indices.iter().map(|i| (*i, value)).collect::<Vec<_>>();
+        vec![
+            ("fox1", doc(&[226376294, 741580288, 771291085, 1312749093, 1621867415, 1913189942], 1.6652868)),
+            ("fox2", doc(&[983533787, 1440641117, 1621867415, 1774389278, 1935863057, 2084400053], 1.6652868)),
+            ("ml", doc(&[34379837, 1228389567, 1299890214, 1644170059, 2088942923], 1.6697302)),
+            ("pie", doc(&[207604854, 662344706, 1085451005, 1180591805, 1481737067, 1985449994], 1.6652868)),
+        ]
+    }
+
+    async fn bm25_fox(fillers: u32) -> Vec<(String, f32)> {
+        let mut logs: Vec<_> = bm25_documents()
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, pairs))| {
+                sparse_log(
+                    i as i64 + 1,
+                    id,
+                    Operation::Add,
+                    Some(UpdateMetadataValue::SparseVector(
+                        chroma_types::SparseVector::from_pairs(pairs),
+                    )),
+                )
+            })
+            .collect();
+        // Records without the term, as the 300 fillers of the Cloud test: they change n, not n_t.
+        for f in 0..fillers {
+            logs.push(sparse_log(
+                10 + f as i64,
+                &format!("f{f}"),
+                Operation::Add,
+                Some(UpdateMetadataValue::SparseVector(
+                    chroma_types::SparseVector::from_pairs(vec![(f + 1, 1.0)]),
+                )),
+            ));
+        }
+        let (reader, mut cas) = setup_with_logs(logs).await;
+        cas.collection.schema = Some(bm25_schema());
+        let result = reader
+            .sparse_search(cas, vec![exact_payload(vec![(1621867415, 1.6877435)], 10)])
+            .await
+            .unwrap();
+        result.results[0]
+            .records
+            .iter()
+            .map(|r| (r.id.clone(), r.score.unwrap()))
+            .collect()
+    }
+
+    // BM25 with IDF as on Chroma Cloud once the collection is indexed: only fox1 and fox2, with the score of Cloud.
+    #[tokio::test]
+    async fn test_sparse_bm25_scores_of_chroma_cloud() {
+        // 4 records, n_t 2: the distributed cluster on AKS answered -0.9481 after compaction.
+        let four = bm25_fox(0).await;
+        assert_eq!(four.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), vec!["fox1", "fox2"]);
+        for (_, score) in &four {
+            assert!((score - (-0.9481)).abs() < 5e-5, "{score}");
+        }
+        // 304 records, n_t 2: Chroma Cloud answered -12.50207 (CLOUD-PROVE.md, test B, after indexing).
+        let many = bm25_fox(300).await;
+        assert_eq!(many.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), vec!["fox1", "fox2"]);
+        for (_, score) in &many {
+            assert!((score - (-12.50207)).abs() < 5e-6, "{score}");
+        }
+    }
+
+    // Without bm25 on the key the query is not weighted: 1 - q.d.
+    #[tokio::test]
+    async fn test_sparse_without_bm25_is_not_weighted() {
+        let (reader, cas) = setup_with_logs(
+            bm25_documents()
+                .into_iter()
+                .enumerate()
+                .map(|(i, (id, pairs))| {
+                    sparse_log(
+                        i as i64 + 1,
+                        id,
+                        Operation::Add,
+                        Some(UpdateMetadataValue::SparseVector(
+                            chroma_types::SparseVector::from_pairs(pairs),
+                        )),
+                    )
+                })
+                .collect(),
+        )
+        .await;
+        let result = reader
+            .sparse_search(cas, vec![exact_payload(vec![(1621867415, 1.6877435)], 10)])
+            .await
+            .unwrap();
+        for record in &result.results[0].records {
+            assert_eq!(record.score.unwrap(), 1.0 - 1.6877435_f32 * 1.6652868_f32);
+        }
     }
 
     #[tokio::test]

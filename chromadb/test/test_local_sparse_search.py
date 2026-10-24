@@ -77,3 +77,47 @@ def test_sparse_metadata_public_roundtrip(tmp_path: Path) -> None:
         assert final[0] is None or "sparse" not in final[0]
     finally:
         cast(Client, client)._system.stop()
+
+
+def test_bm25_scores_of_chroma_cloud(tmp_path: Path) -> None:
+    """BM25 with IDF on the embedded client: the scores Chroma Cloud gives once the collection is indexed."""
+    from chromadb.utils.embedding_functions import ChromaBm25EmbeddingFunction
+
+    client = chromadb.PersistentClient(
+        path=str(tmp_path),
+        settings=Settings(_env_file=None, anonymized_telemetry=False),  # type: ignore[call-arg]
+    )
+    try:
+        schema = Schema()
+        schema.create_index(
+            key="doc_bm25",
+            config=SparseVectorIndexConfig(
+                source_key=K.DOCUMENT,
+                embedding_function=ChromaBm25EmbeddingFunction(),
+                bm25=True,
+            ),
+        )
+        collection = client.create_collection(
+            "bm25-cloud", schema=schema, embedding_function=None
+        )
+        documents = [
+            "The quick brown fox jumps over the lazy dog",
+            "A fast auburn fox leaps over a sleepy canine",
+            "Machine learning is a subset of artificial intelligence",
+            "Grandma bakes an apple pie every Sunday",
+        ] + [f"filler number {i} about the topic tech" for i in range(300)]
+        ids = ["fox1", "fox2", "ml", "pie"] + [f"f{i}" for i in range(300)]
+        collection.add(
+            ids=ids,
+            embeddings=[[float(i % 7), 1.0] for i in range(len(ids))],
+            documents=documents,
+        )
+        result = collection.search(
+            Search().rank(Knn(query="fox", key="doc_bm25")).limit(10).select(K.SCORE)
+        )
+        # Chroma Cloud, 304 records with 2 containing "fox", after indexing: -12.50207.
+        assert result["ids"] == [["fox1", "fox2"]]
+        for score in result["scores"][0]:
+            assert abs(score - (-12.50207)) < 5e-6
+    finally:
+        cast(Client, client)._system.stop()

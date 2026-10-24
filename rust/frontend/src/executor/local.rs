@@ -472,11 +472,6 @@ impl LocalExecutor {
             let Some(schema) = &plan.scan.collection_and_segments.collection.schema else {
                 return Err(unsupported());
             };
-            if sparse_bm25_enabled(schema, key) {
-                return Err(ExecutorError::NotImplemented(
-                    "BM25 sparse Search is not supported locally".into(),
-                ));
-            }
             schema
                 .is_knn_key_indexing_enabled(key, &QueryVector::Sparse(vector.clone()))
                 .map_err(|error| ExecutorError::Internal(Box::new(error)))?;
@@ -514,24 +509,9 @@ impl Configurable<LocalExecutorConfig> for LocalExecutor {
     }
 }
 
-// Match the distributed sparse orchestrator's per-key/default BM25 inheritance.
-fn sparse_bm25_enabled(schema: &chroma_types::Schema, key: &str) -> bool {
-    schema
-        .keys
-        .get(key)
-        .and_then(|types| types.sparse_vector.as_ref())
-        .and_then(|value| value.sparse_vector_index.as_ref())
-        .and_then(|index| index.config.bm25)
-        .unwrap_or_else(|| {
-            schema
-                .defaults
-                .sparse_vector
-                .as_ref()
-                .and_then(|value| value.sparse_vector_index.as_ref())
-                .and_then(|index| index.config.bm25)
-                .unwrap_or(false)
-        })
-}
+// The BM25 setting of a sparse key, as the search reads it.
+#[cfg(test)]
+use chroma_segment::sqlite_metadata::sparse_bm25_enabled;
 
 #[cfg(test)]
 #[path = "local_backfill_tests.rs"]
