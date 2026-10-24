@@ -272,6 +272,10 @@ async fn repairs_legacy_construction_settings_and_preserves_records_and_logs() {
                 .execute(&mut db)
                 .await
                 .unwrap();
+            sqlx::query("DROP TABLE collection_forks")
+                .execute(&mut db)
+                .await
+                .unwrap();
             if version < 7 {
                 sqlx::query("ALTER TABLE collections DROP COLUMN config_json_str")
                     .execute(&mut db)
