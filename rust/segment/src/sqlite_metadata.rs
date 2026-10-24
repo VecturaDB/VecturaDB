@@ -4,6 +4,7 @@ use std::{
     num::TryFromIntError,
 };
 
+use crate::local_hnsw::{LocalHnswSegmentReader, LocalHnswSegmentReaderError};
 use chroma_error::{ChromaError, ErrorCodes};
 use chroma_sqlite::{
     db::SqliteDb,
@@ -49,8 +50,10 @@ pub enum SqliteMetadataError {
     SeaQuery(#[from] sea_query::error::Error),
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
-    #[error("Sparse query produced a non-finite score")]
-    NonFiniteSparseScore,
+    #[error("Error reading the local HNSW index: {0}")]
+    LocalHnsw(Box<LocalHnswSegmentReaderError>),
+    #[error("Error reading phantom record: {0}")]
+    PhantomRecord(u32),
     #[error("Could not encode or decode sparse metadata: {0}")]
     SparseMetadataJson(serde_json::Error),
     #[error("Could not serialize schema: {0}")]
@@ -60,7 +63,7 @@ pub enum SqliteMetadataError {
 impl ChromaError for SqliteMetadataError {
     fn code(&self) -> ErrorCodes {
         match self {
-            Self::NonFiniteSparseScore => ErrorCodes::InvalidArgument,
+            Self::LocalHnsw(err) => err.code(),
             _ => ErrorCodes::Internal,
         }
     }
@@ -648,7 +651,7 @@ trait IntoSqliteExpr {
 
 // Search reserves #id for the record identifier; ordinary Get metadata evaluation
 // must retain its existing meaning for literal metadata keys.
-fn sparse_search_filter(filter: &Where) -> SimpleExpr {
+fn search_filter(filter: &Where) -> SimpleExpr {
     match filter {
         Where::Composite(composite) => {
             let and = matches!(composite.operator, BooleanOperator::And);
@@ -657,9 +660,9 @@ fn sparse_search_filter(filter: &Where) -> SimpleExpr {
                 .iter()
                 .fold(Expr::val(and).into(), |expression, child| {
                     if and {
-                        Expr::expr(expression).and(sparse_search_filter(child))
+                        Expr::expr(expression).and(search_filter(child))
                     } else {
-                        Expr::expr(expression).or(sparse_search_filter(child))
+                        Expr::expr(expression).or(search_filter(child))
                     }
                 })
         }
@@ -1339,11 +1342,14 @@ impl SqliteMetadataReader {
             },
         })
     }
-    /// Exact sparse ranking and projection share one SQLite read snapshot.
-    /// Callers validate supported expressions before replay or execution.
-    pub async fn sparse_search(
+    /// The Search of single-node Chroma, run as distributed Chroma runs it once a collection is compacted
+    /// (rust/worker/src/server.rs:681-851 and the operators chained by rust/worker/src/execution/orchestration/rank.rs):
+    /// the filter, one KNN for each leaf of the rank expression (dense from the local HNSW index, sparse from SQLite),
+    /// then rank, group by, limit and select. Every SQLite read of the request shares one snapshot.
+    pub async fn search(
         &self,
         collection: chroma_types::CollectionAndSegments,
+        hnsw_reader: Option<&LocalHnswSegmentReader>,
         payloads: Vec<chroma_types::plan::SearchPayload>,
     ) -> Result<chroma_types::operator::SearchResult, SqliteMetadataError> {
         let mut tx = self.db.get_conn().begin().await?;
@@ -1353,10 +1359,261 @@ impl SqliteMetadataReader {
             .fetch_optional(&mut *tx)
             .await?;
         let result = self
-            .sparse_search_with_connection(collection, payloads, &mut tx)
+            .search_with_connection(collection, hnsw_reader, payloads, &mut tx)
             .await?;
         tx.commit().await?;
         Ok(result)
+    }
+
+    async fn search_with_connection(
+        &self,
+        collection: chroma_types::CollectionAndSegments,
+        hnsw_reader: Option<&LocalHnswSegmentReader>,
+        payloads: Vec<chroma_types::plan::SearchPayload>,
+        conn: &mut sqlx::SqliteConnection,
+    ) -> Result<chroma_types::operator::SearchResult, SqliteMetadataError> {
+        use chroma_types::{
+            operator::{QueryVector, RecordMeasure, SearchResult},
+            ranking::EnrichedRecord,
+        };
+        let mut results = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let records = match &payload.rank.expr {
+                Some(expr) => {
+                    // The knn results in the DFS order of the leaves, as the rank evaluation consumes them.
+                    let mut knn_results = Vec::new();
+                    for knn in expr.knn_queries() {
+                        knn_results.push(match knn.query {
+                            QueryVector::Dense(query) => {
+                                self.dense_knn(
+                                    conn,
+                                    &collection,
+                                    hnsw_reader,
+                                    &payload.filter,
+                                    query,
+                                    knn.limit,
+                                )
+                                .await?
+                            }
+                            QueryVector::Sparse(query) => {
+                                self.sparse_knn(
+                                    conn,
+                                    &collection,
+                                    &payload.filter,
+                                    &knn.key.to_string(),
+                                    &query,
+                                    knn.limit,
+                                )
+                                .await?
+                            }
+                        });
+                    }
+                    let mut ranks = expr.rank(knn_results);
+                    if payload.group_by.is_active() {
+                        let mut hydrated = self
+                            .hydrate(
+                                conn,
+                                &collection,
+                                ranks.iter().map(|record| record.offset_id),
+                                false,
+                                true,
+                            )
+                            .await?;
+                        let mut enriched_records = Vec::with_capacity(ranks.len());
+                        for record in ranks {
+                            let metadata = hydrated
+                                .remove(&record.offset_id)
+                                .ok_or(SqliteMetadataError::PhantomRecord(record.offset_id))?
+                                .metadata
+                                .unwrap_or_default();
+                            enriched_records.push(EnrichedRecord { record, metadata });
+                        }
+                        ranks = payload.group_by.group_ranked(enriched_records);
+                    }
+                    ranks
+                        .into_iter()
+                        .skip(payload.limit.offset as usize)
+                        .take(payload.limit.limit.unwrap_or(u32::MAX) as usize)
+                        .collect()
+                }
+                // Without a rank expression the records come in their storage order, and the score is the position.
+                None => self
+                    .filtered_records(conn, &collection, &payload.filter, Some(&payload.limit))
+                    .await?
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank_position, (offset_id, _))| RecordMeasure {
+                        offset_id,
+                        measure: rank_position as f32,
+                    })
+                    .collect(),
+            };
+            results.push(
+                self.select(conn, &collection, hnsw_reader, records, &payload.select)
+                    .await?,
+            );
+        }
+        Ok(SearchResult {
+            results,
+            pulled_log_bytes: 0,
+        })
+    }
+
+    /// The selection of the records that pass the filter of a Search, by their SQLite row, in storage order.
+    fn search_selection(
+        collection: &chroma_types::CollectionAndSegments,
+        filter: &Filter,
+    ) -> sea_query::SelectStatement {
+        let mut selection = Query::select();
+        selection
+            .columns([
+                (Embeddings::Table, Embeddings::Id),
+                (Embeddings::Table, Embeddings::EmbeddingId),
+            ])
+            .from(Embeddings::Table)
+            .and_where(
+                Expr::col((Embeddings::Table, Embeddings::SegmentId))
+                    .eq(collection.metadata_segment.id.to_string()),
+            );
+        if let Some(ids) = &filter.query_ids {
+            selection.and_where(Expr::col((Embeddings::Table, Embeddings::EmbeddingId)).is_in(ids));
+        }
+        if let Some(where_clause) = &filter.where_clause {
+            selection.distinct().cond_where(search_filter(where_clause));
+        }
+        selection.order_by((Embeddings::Table, Embeddings::Id), sea_query::Order::Asc);
+        selection
+    }
+
+    /// The SQLite row and the user id of the records that pass the filter, in storage order, optionally paginated.
+    async fn filtered_records(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        collection: &chroma_types::CollectionAndSegments,
+        filter: &Filter,
+        limit: Option<&Limit>,
+    ) -> Result<Vec<(u32, String)>, SqliteMetadataError> {
+        let mut selection = Self::search_selection(collection, filter);
+        if let Some(limit) = limit {
+            selection
+                .offset(limit.offset as u64)
+                .limit(limit.limit.unwrap_or(u32::MAX) as u64);
+        }
+        let (sql, values) = selection.build_sqlx(SqliteQueryBuilder);
+        let rows = sqlx::query_with(&sql, values).fetch_all(&mut *conn).await?;
+        rows.into_iter()
+            .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
+            .collect()
+    }
+
+    /// A dense KNN leaf on the local HNSW index (rust/worker/src/execution/operators/knn_hnsw.rs): the `limit`
+    /// nearest records that pass the filter, with their distance, by SQLite row.
+    async fn dense_knn(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        collection: &chroma_types::CollectionAndSegments,
+        hnsw_reader: Option<&LocalHnswSegmentReader>,
+        filter: &Filter,
+        query: Vec<f32>,
+        limit: u32,
+    ) -> Result<Vec<chroma_types::operator::RecordMeasure>, SqliteMetadataError> {
+        use chroma_types::operator::RecordMeasure;
+        let Some(hnsw_reader) = hnsw_reader else {
+            return Ok(Vec::new());
+        };
+        // Records by user id: the HNSW index knows them by label, the other leaves and the rank by SQLite row.
+        let mut rows_by_user_id = HashMap::new();
+        let mut allowed_labels = Vec::new();
+        if filter.query_ids.is_some() || filter.where_clause.is_some() {
+            let allowed = self
+                .filtered_records(conn, collection, filter, None)
+                .await?;
+            if allowed.is_empty() {
+                return Ok(Vec::new());
+            }
+            for (row, user_id) in allowed {
+                allowed_labels.push(
+                    hnsw_reader
+                        .get_offset_id_by_user_id(&user_id)
+                        .await
+                        .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))?,
+                );
+                rows_by_user_id.insert(user_id, row);
+            }
+        }
+        let space = collection
+            .collection
+            .schema
+            .as_ref()
+            .map(|schema| {
+                schema.get_internal_hnsw_config_with_legacy_fallback(&collection.vector_segment)
+            })
+            .transpose()
+            .map_err(|err| {
+                SqliteMetadataError::LocalHnsw(Box::new(
+                    LocalHnswSegmentReaderError::InvalidHnswConfiguration(err),
+                ))
+            })?
+            .flatten()
+            .ok_or(SqliteMetadataError::LocalHnsw(Box::new(
+                LocalHnswSegmentReaderError::MissingHnswConfiguration,
+            )))?
+            .space;
+        let query = if let chroma_types::Space::Cosine = space {
+            chroma_distance::normalize(&query)
+        } else {
+            query
+        };
+        let neighbors = hnsw_reader
+            .query_embedding(&allowed_labels, query, limit)
+            .await
+            .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))?;
+        let mut user_ids = Vec::with_capacity(neighbors.len());
+        for neighbor in &neighbors {
+            user_ids.push(
+                hnsw_reader
+                    .get_user_id_by_offset_id(neighbor.offset_id)
+                    .await
+                    .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))?,
+            );
+        }
+        if rows_by_user_id.is_empty() {
+            for batch in user_ids.chunks(500) {
+                let (sql, values) = Query::select()
+                    .columns([
+                        (Embeddings::Table, Embeddings::Id),
+                        (Embeddings::Table, Embeddings::EmbeddingId),
+                    ])
+                    .from(Embeddings::Table)
+                    .and_where(
+                        Expr::col((Embeddings::Table, Embeddings::SegmentId))
+                            .eq(collection.metadata_segment.id.to_string()),
+                    )
+                    .and_where(
+                        Expr::col((Embeddings::Table, Embeddings::EmbeddingId)).is_in(batch),
+                    )
+                    .build_sqlx(SqliteQueryBuilder);
+                for row in sqlx::query_with(&sql, values).fetch_all(&mut *conn).await? {
+                    rows_by_user_id.insert(row.try_get::<String, _>(1)?, row.try_get::<u32, _>(0)?);
+                }
+            }
+        }
+        let mut records = neighbors
+            .into_iter()
+            .zip(user_ids)
+            .map(|(neighbor, user_id)| {
+                rows_by_user_id
+                    .get(&user_id)
+                    .map(|row| RecordMeasure {
+                        offset_id: *row,
+                        measure: neighbor.measure,
+                    })
+                    .ok_or(SqliteMetadataError::PhantomRecord(neighbor.offset_id))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // As the merge of the distributed KNN results: by distance, then by record.
+        records.sort_unstable();
+        Ok(records)
     }
 
     /// The query of a BM25 key weighted as distributed Chroma does (rust/worker/src/execution/operators/idf.rs:84-89,
@@ -1402,127 +1659,131 @@ impl SqliteMetadataReader {
         Ok(scaled)
     }
 
-    async fn sparse_search_with_connection(
+    /// A sparse KNN leaf (rust/worker/src/execution/orchestration/sparse_knn.rs): the `limit` records that pass the
+    /// filter with the lowest 1 - q.d, by SQLite row, with the query weighted by IDF on a BM25 key.
+    async fn sparse_knn(
         &self,
-        collection: chroma_types::CollectionAndSegments,
-        payloads: Vec<chroma_types::plan::SearchPayload>,
         conn: &mut sqlx::SqliteConnection,
-    ) -> Result<chroma_types::operator::SearchResult, SqliteMetadataError> {
-        use chroma_types::operator::{
-            Key, QueryVector, RankExpr, RecordMeasure, SearchPayloadResult, SearchRecord,
-            SearchResult,
-        };
+        collection: &chroma_types::CollectionAndSegments,
+        filter: &Filter,
+        key: &str,
+        query: &chroma_types::SparseVector,
+        candidate_limit: u32,
+    ) -> Result<Vec<chroma_types::operator::RecordMeasure>, SqliteMetadataError> {
+        use chroma_types::operator::RecordMeasure;
         use futures::TryStreamExt;
         use std::collections::BinaryHeap;
-        let mut results = Vec::with_capacity(payloads.len());
-        for payload in payloads {
-            let Some(RankExpr::Knn {
-                query: QueryVector::Sparse(query),
-                key: Key::MetadataField(key),
-                limit: candidate_limit,
-                ..
-            }) = &payload.rank.expr
-            else {
-                return Err(MetadataValueConversionError::InvalidValue.into());
+        let query = match collection.collection.schema.as_ref() {
+            Some(schema) if sparse_bm25_enabled(schema, key) => {
+                Self::idf_scaled_query(conn, &collection.metadata_segment.id.to_string(), key, query)
+                    .await?
+            }
+            _ => query.clone(),
+        };
+        // Only the dimensions of the query: a record with none of them is not a candidate.
+        let term = Alias::new("term");
+        let mut selection = Query::select();
+        selection
+            .column((Embeddings::Table, Embeddings::Id))
+            .column((term.clone(), Alias::new("dim")))
+            .column((term.clone(), Alias::new("value")))
+            .from(Embeddings::Table)
+            .join_as(
+                sea_query::JoinType::InnerJoin,
+                Alias::new("embedding_metadata_sparse_term"),
+                term.clone(),
+                Expr::col((Embeddings::Table, Embeddings::Id))
+                    .equals((term.clone(), Alias::new("id"))),
+            )
+            .and_where(
+                Expr::col((Embeddings::Table, Embeddings::SegmentId))
+                    .eq(collection.metadata_segment.id.to_string()),
+            )
+            .and_where(Expr::col((term.clone(), Alias::new("key"))).eq(key))
+            .and_where(Expr::col((term.clone(), Alias::new("dim"))).is_in(query.indices.clone()))
+            .order_by((Embeddings::Table, Embeddings::Id), sea_query::Order::Asc)
+            .order_by((term, Alias::new("dim")), sea_query::Order::Asc);
+        if let Some(ids) = &filter.query_ids {
+            selection.and_where(Expr::col((Embeddings::Table, Embeddings::EmbeddingId)).is_in(ids));
+        }
+        if let Some(where_clause) = &filter.where_clause {
+            selection.cond_where(search_filter(where_clause));
+        }
+        let (sql, values) = selection.build_sqlx(SqliteQueryBuilder);
+        let weights: HashMap<u32, f32> = query.iter().collect();
+        let mut best: BinaryHeap<RecordMeasure> = BinaryHeap::new();
+        let mut offer = |offset_id: u32, dot: f32| {
+            // As the sparse index of distributed Chroma once a collection is compacted: only the records that
+            // share a dimension with the query are candidates, not the disjoint or empty ones with measure 1.
+            let candidate = RecordMeasure {
+                offset_id,
+                measure: 1.0 - dot,
             };
-            let query = match collection.collection.schema.as_ref() {
-                Some(schema) if sparse_bm25_enabled(schema, key) => {
-                    Self::idf_scaled_query(conn, &collection.metadata_segment.id.to_string(), key, query)
-                        .await?
+            if best.len() < candidate_limit as usize {
+                best.push(candidate);
+            } else if best.peek().is_some_and(|worst| candidate < *worst) {
+                best.pop();
+                best.push(candidate);
+            }
+        };
+        if candidate_limit > 0 && !query.indices.is_empty() {
+            let mut rows = sqlx::query_with(&sql, values).fetch(&mut *conn);
+            let mut current: Option<(u32, f32)> = None;
+            while let Some(row) = rows.try_next().await? {
+                let offset_id: u32 = row.try_get(0)?;
+                let dim: u32 = row.try_get(1)?;
+                let value = row.try_get::<f64, _>(2)? as f32;
+                // Rows come by record, then by dimension: the products add up in the order of the dimensions.
+                let product = weights.get(&dim).copied().unwrap_or_default() * value;
+                match current.as_mut() {
+                    Some((current_offset, dot)) if *current_offset == offset_id => *dot += product,
+                    _ => {
+                        if let Some((done_offset, dot)) = current.take() {
+                            offer(done_offset, dot);
+                        }
+                        current = Some((offset_id, product));
+                    }
                 }
-                _ => query.clone(),
-            };
-            // Only the dimensions of the query: a record with none of them is not a candidate.
-            let term = Alias::new("term");
-            let mut selection = Query::select();
-            selection
+            }
+            if let Some((done_offset, dot)) = current.take() {
+                offer(done_offset, dot);
+            }
+        }
+        Ok(best.into_sorted_vec())
+    }
+
+    /// The user id of the given SQLite rows, with their document and metadata when asked.
+    async fn hydrate(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        collection: &chroma_types::CollectionAndSegments,
+        offset_ids: impl Iterator<Item = u32>,
+        document: bool,
+        metadata: bool,
+    ) -> Result<HashMap<u32, ProjectionRecord>, SqliteMetadataError> {
+        let offset_ids = offset_ids.collect::<Vec<_>>();
+        let mut records = HashMap::with_capacity(offset_ids.len());
+        for batch in offset_ids.chunks(500) {
+            let (sql, values) = Query::select()
                 .columns([
                     (Embeddings::Table, Embeddings::Id),
                     (Embeddings::Table, Embeddings::EmbeddingId),
                 ])
-                .column((term.clone(), Alias::new("dim")))
-                .column((term.clone(), Alias::new("value")))
                 .from(Embeddings::Table)
-                .join_as(
-                    sea_query::JoinType::InnerJoin,
-                    Alias::new("embedding_metadata_sparse_term"),
-                    term.clone(),
-                    Expr::col((Embeddings::Table, Embeddings::Id))
-                        .equals((term.clone(), Alias::new("id"))),
-                )
                 .and_where(
                     Expr::col((Embeddings::Table, Embeddings::SegmentId))
                         .eq(collection.metadata_segment.id.to_string()),
                 )
-                .and_where(Expr::col((term.clone(), Alias::new("key"))).eq(key))
-                .and_where(Expr::col((term.clone(), Alias::new("dim"))).is_in(query.indices.clone()))
-                .order_by((Embeddings::Table, Embeddings::Id), sea_query::Order::Asc)
-                .order_by((term, Alias::new("dim")), sea_query::Order::Asc);
-            if let Some(ids) = &payload.filter.query_ids {
-                selection
-                    .and_where(Expr::col((Embeddings::Table, Embeddings::EmbeddingId)).is_in(ids));
+                .and_where(
+                    Expr::col((Embeddings::Table, Embeddings::Id))
+                        .is_in(batch.iter().map(|id| *id as i64)),
+                )
+                .build_sqlx(SqliteQueryBuilder);
+            let mut rows_by_user_id = HashMap::with_capacity(batch.len());
+            for row in sqlx::query_with(&sql, values).fetch_all(&mut *conn).await? {
+                rows_by_user_id.insert(row.try_get::<String, _>(1)?, row.try_get::<u32, _>(0)?);
             }
-            if let Some(filter) = &payload.filter.where_clause {
-                selection.cond_where(sparse_search_filter(filter));
-            }
-            let (sql, values) = selection.build_sqlx(SqliteQueryBuilder);
-            let weights: HashMap<u32, f32> = query.iter().collect();
-            let mut best: BinaryHeap<(RecordMeasure, String)> = BinaryHeap::new();
-            let mut offer = |offset_id: u32, id: String, dot: f32| {
-                // As the sparse index of distributed Chroma once a collection is compacted: only the records that
-                // share a dimension with the query are candidates, not the disjoint or empty ones with measure 1.
-                let measure = 1.0 - dot;
-                if !measure.is_finite() {
-                    return Err(SqliteMetadataError::NonFiniteSparseScore);
-                }
-                let candidate = (RecordMeasure { offset_id, measure }, id);
-                if best.len() < *candidate_limit as usize {
-                    best.push(candidate);
-                } else if best.peek().is_some_and(|worst| candidate.0 < worst.0) {
-                    best.pop();
-                    best.push(candidate);
-                }
-                Ok(())
-            };
-            if *candidate_limit > 0 && !query.indices.is_empty() {
-                let mut rows = sqlx::query_with(&sql, values).fetch(&mut *conn);
-                let mut current: Option<(u32, String, f32)> = None;
-                while let Some(row) = rows.try_next().await? {
-                    let offset_id: u32 = row.try_get(0)?;
-                    let id: String = row.try_get(1)?;
-                    let dim: u32 = row.try_get(2)?;
-                    let value = row.try_get::<f64, _>(3)? as f32;
-                    // Rows come by record, then by dimension: the products add up in the order of the dimensions.
-                    let product = weights.get(&dim).copied().unwrap_or_default() * value;
-                    match current.as_mut() {
-                        Some((current_offset, _, dot)) if *current_offset == offset_id => *dot += product,
-                        _ => {
-                            if let Some((done_offset, done_id, dot)) = current.take() {
-                                offer(done_offset, done_id, dot)?;
-                            }
-                            current = Some((offset_id, id, product));
-                        }
-                    }
-                }
-                if let Some((done_offset, done_id, dot)) = current.take() {
-                    offer(done_offset, done_id, dot)?;
-                }
-            }
-            let winners: Vec<_> = best
-                .into_sorted_vec()
-                .into_iter()
-                .skip(payload.limit.offset as usize)
-                .take(payload.limit.limit.unwrap_or(u32::MAX) as usize)
-                .collect();
-            let want_metadata = payload.select.keys.contains(&Key::Metadata)
-                || payload
-                    .select
-                    .keys
-                    .iter()
-                    .any(|k| matches!(k, Key::MetadataField(_)));
-            let want_document = payload.select.keys.contains(&Key::Document);
-            let mut projected = HashMap::new();
-            for batch in winners.chunks(500) {
+            if document || metadata {
                 let get = Get {
                     scan: Scan {
                         collection_and_segments: collection.clone(),
@@ -1531,7 +1792,7 @@ impl SqliteMetadataReader {
                         log_upper_bound_offset: 0,
                     },
                     filter: Filter {
-                        query_ids: Some(batch.iter().map(|(_, id)| id.clone()).collect()),
+                        query_ids: Some(rows_by_user_id.keys().cloned().collect()),
                         where_clause: None,
                     },
                     limit: Limit {
@@ -1539,48 +1800,122 @@ impl SqliteMetadataReader {
                         limit: None,
                     },
                     proj: Projection {
-                        document: want_document,
-                        metadata: want_metadata,
+                        document,
+                        metadata,
                         embedding: false,
                     },
                 };
-                for record in self.get_with_connection(get, conn).await?.result.records {
-                    projected.insert(record.id.clone(), record);
-                }
-            }
-            let mut records = Vec::with_capacity(winners.len());
-            for (measure, id) in winners {
-                let Some(mut record) = projected.remove(&id) else {
-                    return Err(MetadataValueConversionError::InvalidValue.into());
-                };
-                if !payload.select.keys.contains(&Key::Metadata) {
-                    if let Some(metadata) = record.metadata.as_mut() {
-                        metadata.retain(|key, _| {
-                            payload
-                                .select
-                                .keys
-                                .contains(&Key::MetadataField(key.clone()))
-                        });
+                for mut record in self.get_with_connection(get, conn).await?.result.records {
+                    // Without the metadata projection the record still carries the scalar metadata it was read with.
+                    if !metadata {
+                        record.metadata = None;
+                    }
+                    if let Some(row) = rows_by_user_id.get(&record.id) {
+                        records.insert(*row, record);
                     }
                 }
-                records.push(SearchRecord {
-                    id,
-                    document: if want_document { record.document } else { None },
-                    embedding: None,
-                    metadata: if want_metadata { record.metadata } else { None },
-                    score: payload
-                        .select
-                        .keys
-                        .contains(&Key::Score)
-                        .then_some(measure.measure),
-                });
+            } else {
+                for (id, row) in rows_by_user_id {
+                    records.insert(
+                        row,
+                        ProjectionRecord {
+                            id,
+                            document: None,
+                            embedding: None,
+                            metadata: None,
+                        },
+                    );
+                }
             }
-            results.push(SearchPayloadResult { records });
         }
-        Ok(SearchResult {
-            results,
-            pulled_log_bytes: 0,
-        })
+        Ok(records)
+    }
+
+    /// The selected keys of the records, in their order (rust/worker/src/execution/operators/select.rs).
+    async fn select(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        collection: &chroma_types::CollectionAndSegments,
+        hnsw_reader: Option<&LocalHnswSegmentReader>,
+        records: Vec<chroma_types::operator::RecordMeasure>,
+        select: &chroma_types::operator::Select,
+    ) -> Result<chroma_types::operator::SearchPayloadResult, SqliteMetadataError> {
+        use chroma_types::operator::{Key, SearchPayloadResult, SearchRecord};
+        if records.is_empty() {
+            return Ok(SearchPayloadResult {
+                records: Vec::new(),
+            });
+        }
+
+        // Determine which keys to select
+        let select_document = select.keys.contains(&Key::Document);
+        let select_embedding = select.keys.contains(&Key::Embedding);
+        let select_score = select.keys.contains(&Key::Score);
+
+        // Check if we need to select any metadata
+        let select_all_metadata = select.keys.contains(&Key::Metadata);
+
+        // Collect specific metadata keys to select
+        let metadata_fields_to_select = select
+            .keys
+            .iter()
+            .filter_map(|field| {
+                if let Key::MetadataField(key) = field {
+                    Some(key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<std::collections::HashSet<_>>();
+
+        let select_metadata = select_all_metadata || !metadata_fields_to_select.is_empty();
+
+        let mut hydrated = self
+            .hydrate(
+                conn,
+                collection,
+                records.iter().map(|record| record.offset_id),
+                select_document,
+                select_metadata,
+            )
+            .await?;
+
+        let mut selected = Vec::with_capacity(records.len());
+        for record in records {
+            let data = hydrated
+                .remove(&record.offset_id)
+                .ok_or(SqliteMetadataError::PhantomRecord(record.offset_id))?;
+            let embedding = match (select_embedding, hnsw_reader) {
+                (true, Some(reader)) => Some(
+                    reader
+                        .get_embedding_by_user_id(&data.id)
+                        .await
+                        .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))?,
+                ),
+                (true, None) => {
+                    return Err(SqliteMetadataError::LocalHnsw(Box::new(
+                        LocalHnswSegmentReaderError::UninitializedSegment,
+                    )))
+                }
+                (false, _) => None,
+            };
+            let mut full_metadata = data.metadata.unwrap_or_default();
+            if !select_all_metadata {
+                full_metadata.retain(|key, _| metadata_fields_to_select.contains(key));
+            }
+            selected.push(SearchRecord {
+                id: data.id,
+                document: select_document.then_some(data.document).flatten(),
+                embedding,
+                metadata: if full_metadata.is_empty() {
+                    None
+                } else {
+                    Some(full_metadata)
+                },
+                score: select_score.then_some(record.measure),
+            });
+        }
+        Ok(SearchPayloadResult { records: selected })
     }
 }
 
@@ -2146,7 +2481,7 @@ mod tests {
             vec![("a".into(), 7, 2.0), ("c".into(), 7, 0.5)]
         );
         let result = reader
-            .sparse_search(cas, vec![exact_payload(vec![(7, 1.0)], 10)])
+            .search(cas, None, vec![exact_payload(vec![(7, 1.0)], 10)])
             .await
             .unwrap();
         assert_eq!(
@@ -2220,7 +2555,7 @@ mod tests {
         let (reader, mut cas) = setup_with_logs(logs).await;
         cas.collection.schema = Some(bm25_schema());
         let result = reader
-            .sparse_search(cas, vec![exact_payload(vec![(1621867415, 1.6877435)], 10)])
+            .search(cas, None, vec![exact_payload(vec![(1621867415, 1.6877435)], 10)])
             .await
             .unwrap();
         result.results[0]
@@ -2268,12 +2603,93 @@ mod tests {
         )
         .await;
         let result = reader
-            .sparse_search(cas, vec![exact_payload(vec![(1621867415, 1.6877435)], 10)])
+            .search(cas, None, vec![exact_payload(vec![(1621867415, 1.6877435)], 10)])
             .await
             .unwrap();
         for record in &result.results[0].records {
             assert_eq!(record.score.unwrap(), 1.0 - 1.6877435_f32 * 1.6652868_f32);
         }
+    }
+
+    // The Search beyond one leaf: two leaves fused with their defaults, a group by on the metadata, and no rank.
+    #[tokio::test]
+    async fn test_search_fuses_leaves_groups_and_keeps_storage_order() {
+        use chroma_types::operator::{Aggregate, GroupBy, Key, QueryVector, Rank, RankExpr, Select};
+        let logs = [
+            ("a", vec![(1, 1.0)], "x"),
+            ("b", vec![(1, 0.5), (2, 1.0)], "x"),
+            ("c", vec![(2, 0.5)], "y"),
+            ("d", vec![(9, 1.0)], "y"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (id, pairs, label))| {
+            let mut log = sparse_log(
+                i as i64 + 1,
+                id,
+                Operation::Add,
+                Some(UpdateMetadataValue::SparseVector(
+                    chroma_types::SparseVector::from_pairs(pairs),
+                )),
+            );
+            log.record
+                .metadata
+                .as_mut()
+                .unwrap()
+                .insert("label".into(), UpdateMetadataValue::Str(label.into()));
+            log
+        })
+        .collect();
+        let (reader, cas) = setup_with_logs(logs).await;
+        let leaf = |dim: u32| RankExpr::Knn {
+            query: QueryVector::Sparse(chroma_types::SparseVector::from_pairs(vec![(dim, 1.0)])),
+            key: Key::MetadataField("sparse".into()),
+            limit: 10,
+            default: Some(1.0),
+            return_rank: false,
+        };
+        let score = Select {
+            keys: [Key::Score].into_iter().collect(),
+        };
+        // a 0.0 + 1.0 (default), b 0.5 + 0.0, c 1.0 (default) + 0.5; d is in neither leaf.
+        let fused = chroma_types::plan::SearchPayload {
+            rank: Rank {
+                expr: Some(RankExpr::Summation(vec![leaf(1), leaf(2)])),
+            },
+            select: score.clone(),
+            ..Default::default()
+        };
+        let mut grouped = fused.clone();
+        grouped.group_by = GroupBy {
+            keys: vec![Key::MetadataField("label".into())],
+            aggregate: Some(Aggregate::MinK {
+                keys: vec![Key::Score],
+                k: 1,
+            }),
+        };
+        let unranked = chroma_types::plan::SearchPayload {
+            limit: Limit {
+                offset: 1,
+                limit: Some(2),
+            },
+            select: score,
+            ..Default::default()
+        };
+        let result = reader
+            .search(cas, None, vec![fused, grouped, unranked])
+            .await
+            .unwrap();
+        let rows = |i: usize| {
+            result.results[i]
+                .records
+                .iter()
+                .map(|r| (r.id.as_str(), r.score.unwrap()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(0), vec![("b", 0.5), ("a", 1.0), ("c", 1.5)]);
+        assert_eq!(rows(1), vec![("b", 0.5), ("c", 1.5)]);
+        // Without a rank the records come in storage order, and the score is the position after the offset.
+        assert_eq!(rows(2), vec![("b", 0.0), ("c", 1.0)]);
     }
 
     #[tokio::test]
@@ -2322,7 +2738,7 @@ mod tests {
         filtered.filter.query_ids = Some(vec!["a".into(), "b".into(), "c".into()]);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            reader.sparse_search(cas.clone(), vec![full, page, filtered]),
+            reader.search(cas.clone(), None, vec![full, page, filtered]),
         )
         .await
         .expect("single-connection Search must not self-wait")
@@ -2360,7 +2776,7 @@ mod tests {
             let mut projection = exact_payload(vec![(1, 1.0)], 1);
             projection.select.keys = keys.iter().cloned().collect();
             let result = reader
-                .sparse_search(cas.clone(), vec![projection])
+                .search(cas.clone(), None, vec![projection])
                 .await
                 .unwrap();
             let record = &result.results[0].records[0];
@@ -2387,7 +2803,7 @@ mod tests {
             },
         ));
         let result = reader
-            .sparse_search(cas.clone(), vec![scalar_filtered])
+            .search(cas.clone(), None, vec![scalar_filtered])
             .await
             .unwrap();
         assert_eq!(
@@ -2428,7 +2844,7 @@ mod tests {
                 "exercise public Search wire filter"
             );
             let result = reader
-                .sparse_search(cas.clone(), vec![payload])
+                .search(cas.clone(), None, vec![payload])
                 .await
                 .unwrap();
             assert_eq!(
@@ -2441,7 +2857,7 @@ mod tests {
             );
         }
         let negative = reader
-            .sparse_search(cas.clone(), vec![exact_payload(vec![(1, -1.0)], 2)])
+            .search(cas.clone(), None, vec![exact_payload(vec![(1, -1.0)], 2)])
             .await
             .unwrap();
         assert_eq!(
@@ -2453,18 +2869,24 @@ mod tests {
             vec![("a", -1.0), ("d", 3.0)]
         );
         assert!(reader
-            .sparse_search(cas.clone(), vec![exact_payload(vec![], 0)])
+            .search(cas.clone(), None, vec![exact_payload(vec![], 0)])
             .await
             .unwrap()
             .results[0]
             .records
             .is_empty());
+        // As distributed Chroma, the accumulated score is not checked: here it overflows.
         let overflow = reader
-            .sparse_search(cas, vec![exact_payload(vec![(1, f32::MAX)], 2)])
-            .await;
-        assert!(
-            overflow.is_err(),
-            "nonfinite accumulated score is not silently serialized"
+            .search(cas, None, vec![exact_payload(vec![(1, f32::MAX)], 2)])
+            .await
+            .unwrap();
+        assert_eq!(
+            overflow.results[0]
+                .records
+                .iter()
+                .map(|r| (r.id.as_str(), r.score.unwrap()))
+                .collect::<Vec<_>>(),
+            vec![("d", f32::NEG_INFINITY), ("e", f32::NEG_INFINITY)]
         );
     }
 
@@ -2487,14 +2909,14 @@ mod tests {
         let connection = db.get_conn().acquire().await.unwrap();
         assert!(tokio::time::timeout(
             std::time::Duration::from_millis(20),
-            reader.sparse_search(cas.clone(), vec![exact_payload(vec![], 2)])
+            reader.search(cas.clone(), None, vec![exact_payload(vec![], 2)])
         )
         .await
         .is_err());
         drop(connection);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            reader.sparse_search(cas, vec![exact_payload(vec![], 2)]),
+            reader.search(cas, None, vec![exact_payload(vec![], 2)]),
         )
         .await
         .unwrap()
@@ -2548,8 +2970,9 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
         let old = reader
-            .sparse_search_with_connection(
+            .search_with_connection(
                 cas.clone(),
+                None,
                 vec![exact_payload(vec![(1, 1.0)], 2)],
                 &mut snapshot,
             )
@@ -2559,7 +2982,7 @@ mod tests {
         assert_eq!(old.results[0].records[0].document.as_deref(), Some("old"));
         snapshot.commit().await.unwrap();
         let new = reader
-            .sparse_search(cas, vec![exact_payload(vec![(1, 1.0)], 2)])
+            .search(cas, None, vec![exact_payload(vec![(1, 1.0)], 2)])
             .await
             .unwrap();
         assert_eq!(new.results[0].records[0].score, Some(4.0));

@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 //! RankedGroupBy operator for grouping ranked search results by metadata keys.
 //!
 //! This operator takes ranked records from the RankExpr operator and:
@@ -6,7 +7,7 @@
 //! 3. Keeps the top k records per group
 //! 4. Flattens all groups back into a single list, re-sorted by score
 
-use std::{cmp::Reverse, collections::HashMap};
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use chroma_blockstore::provider::BlockfileProvider;
@@ -20,8 +21,9 @@ use chroma_segment::{
 };
 use chroma_system::Operator;
 use chroma_types::{
-    operator::{Aggregate, GroupBy, Key, RecordMeasure},
-    MetadataValue, Segment, SegmentShard, SegmentShardError,
+    operator::{GroupBy, RecordMeasure},
+    ranking::EnrichedRecord,
+    Segment, SegmentShard, SegmentShardError,
 };
 use thiserror::Error;
 use tracing::{Instrument, Span};
@@ -79,27 +81,6 @@ impl ChromaError for RankedGroupByError {
     }
 }
 
-/// Record enriched with metadata for grouping and sorting
-#[derive(Clone)]
-struct EnrichedRecord {
-    record: RecordMeasure,
-    metadata: HashMap<String, MetadataValue>,
-}
-
-impl EnrichedRecord {
-    /// Extract key values for grouping or sorting
-    fn extract_key(&self, keys: &[Key]) -> Vec<Option<MetadataValue>> {
-        keys.iter()
-            .map(|key| match key {
-                Key::MetadataField(field) => self.metadata.get(field).cloned(),
-                Key::Score => Some(MetadataValue::Float(self.record.measure as f64)),
-                // Other keys shouldn't appear (validation prevents them)
-                _ => None,
-            })
-            .collect()
-    }
-}
-
 #[async_trait]
 impl Operator<RankedGroupByInput, RankedGroupByOutput> for GroupBy {
     type Error = RankedGroupByError;
@@ -111,14 +92,11 @@ impl Operator<RankedGroupByInput, RankedGroupByOutput> for GroupBy {
         tracing::trace!("[RankedGroupBy] Running on {} records", input.records.len());
 
         // Fast path: no grouping configured or no records
-        let aggregate = match &self.aggregate {
-            Some(agg) if !self.keys.is_empty() && !input.records.is_empty() => agg,
-            _ => {
-                return Ok(RankedGroupByOutput {
-                    records: input.records.clone(),
-                });
-            }
-        };
+        if self.aggregate.is_none() || self.keys.is_empty() || input.records.is_empty() {
+            return Ok(RankedGroupByOutput {
+                records: input.records.clone(),
+            });
+        }
 
         // --- Metadata hydration ---
 
@@ -200,43 +178,8 @@ impl Operator<RankedGroupByInput, RankedGroupByOutput> for GroupBy {
             };
         }
 
-        // --- Group by ---
-
-        enriched_records.sort_by_cached_key(|r| r.extract_key(&self.keys));
-
-        let groups = enriched_records
-            .chunk_by(|a, b| a.extract_key(&self.keys) == b.extract_key(&self.keys));
-
-        // --- Aggregate ---
-
-        let mut records = groups
-            .flat_map(|group| {
-                let mut group_vec = group.iter().collect::<Vec<_>>();
-
-                match aggregate {
-                    Aggregate::MinK { keys, k } => {
-                        group_vec.sort_by_cached_key(|record| record.extract_key(keys));
-                        group_vec
-                            .into_iter()
-                            .take(*k as usize)
-                            .map(|record| record.record)
-                            .collect::<Vec<_>>()
-                    }
-                    Aggregate::MaxK { keys, k } => {
-                        group_vec.sort_by_cached_key(|record| Reverse(record.extract_key(keys)));
-                        group_vec
-                            .into_iter()
-                            .map(|record| record.record)
-                            .take(*k as usize)
-                            .collect::<Vec<_>>()
-                    }
-                }
-            })
-            .collect::<Vec<_>>();
-
-        // --- Flatten and re-sort ---
-
-        records.sort();
+        // The grouping is in chroma_types (execution/ranking.rs), shared with single-node Chroma.
+        let records = self.group_ranked(enriched_records);
 
         Ok(RankedGroupByOutput { records })
     }
