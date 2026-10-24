@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 //! Evaluation of rank expressions and grouping of ranked records, shared by the operators of distributed Chroma
 //! (rust/worker/src/execution/operators/rank.rs and ranked_group_by.rs) and the search of single-node Chroma.
 

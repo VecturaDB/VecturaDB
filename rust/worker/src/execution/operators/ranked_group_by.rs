@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 //! RankedGroupBy operator for grouping ranked search results by metadata keys.
 //!
 //! This operator takes ranked records from the RankExpr operator and:

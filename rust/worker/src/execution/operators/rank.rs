@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use async_trait::async_trait;
 use chroma_error::{ChromaError, ErrorCodes};
 use chroma_system::Operator;
