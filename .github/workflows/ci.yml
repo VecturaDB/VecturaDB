@@ -233,7 +233,8 @@ jobs:
           chromadb/test/property --ignore-glob chromadb/test/property/test_cross_version_persist.py
           --ignore chromadb/test/property/test_add_mcmr.py
       - name: Smoke test with the CLI server
+        # chroma run listens on localhost, which can resolve to ::1 only: the clients call localhost, as users do
         run: |
           chroma run --path ./smoke-data --port 8001 &
-          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8001/api/v2/heartbeat && break; sleep 2; done
-          python vecturadb/smoke.py 8001
+          for i in $(seq 1 30); do curl -sf http://localhost:8001/api/v2/heartbeat && break; sleep 2; done
+          python vecturadb/smoke.py 8001 localhost
