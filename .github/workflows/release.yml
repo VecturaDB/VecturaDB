@@ -1,0 +1,107 @@
+# Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
+# On a tag vX.Y.Z or vX.Y.Z-preview.N: the CI builds and tests everything with the version of the tag, then the CLI
+# binaries and the wheels go to a GitHub Release, the image to ghcr.io/vecturadb/vecturadb, the wheels to PyPI with
+# Trusted Publishing (no tokens). A preview is a GitHub prerelease, its image gets the tag preview, never latest.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]+)?$ ]]; then
+            echo "Tag $TAG is not vX.Y.Z or vX.Y.Z-preview.N"; exit 1
+          fi
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" == *-preview.* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+
+  ci:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+
+  image:
+    needs: [version, ci]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: cli-linux-*
+          merge-multiple: true
+      - name: Context
+        run: |
+          mkdir ctx
+          cp vecturadb/docker/Dockerfile vecturadb/docker/config.yaml ctx/
+          cp chroma-linux-x86_64 ctx/chroma-amd64 && cp chroma-linux-aarch64 ctx/chroma-arm64 && chmod +x ctx/chroma-*
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push amd64 and arm64
+        env:
+          IMAGE: ghcr.io/vecturadb/vecturadb
+          VERSION: ${{ needs.version.outputs.version }}
+          CHANNEL: ${{ needs.version.outputs.prerelease == 'true' && 'preview' || 'latest' }}
+        run: >-
+          docker buildx build --platform linux/amd64,linux/arm64 --build-arg REVISION=${{ github.sha }}
+          -t "$IMAGE:$VERSION" -t "$IMAGE:$CHANNEL" --push ctx
+
+  github-release:
+    needs: [version, ci]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          ls -la dist
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
+          gh release create "$TAG" --repo "${{ github.repository }}" --title "VecturaDB ${{ needs.version.outputs.version }}" --generate-notes "${flags[@]}" dist/*
+
+  pypi:
+    needs: [version, ci]
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/VecturaDB/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
