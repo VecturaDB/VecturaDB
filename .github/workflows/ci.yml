@@ -1,0 +1,239 @@
+# Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
+# Build and test only: nothing is published, no secrets are needed.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      version:
+        description: Version of the wheels, from the release tag. Empty in CI.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  cli-linux:
+    name: CLI Linux ${{ matrix.arch }} (glibc 2.17)
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: CLI version from the release tag
+        if: inputs.version != ''
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: perl -0pi -e 's/^version = ".*"/version = "$ENV{VERSION}"/m' rust/cli/Cargo.toml && grep -m1 '^version' rust/cli/Cargo.toml
+      - uses: ./.github/actions/rust
+        with:
+          github-token: ${{ github.token }}
+          targets: ${{ matrix.arch }}-unknown-linux-gnu
+          install-nextest: "false"
+      - run: pip install "cargo-zigbuild==0.23.4" "ziglang==0.13.0"
+      - run: cargo zigbuild --bin chroma --release --manifest-path rust/cli/Cargo.toml --target ${{ matrix.arch }}-unknown-linux-gnu.2.17
+      - run: cp target/${{ matrix.arch }}-unknown-linux-gnu/release/chroma chroma-linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-linux-${{ matrix.arch }}
+          path: chroma-linux-${{ matrix.arch }}
+
+  cli-windows:
+    name: CLI Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: CLI version from the release tag
+        if: inputs.version != ''
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: perl -0pi -e 's/^version = ".*"/version = "$ENV{VERSION}"/m' rust/cli/Cargo.toml && grep -m1 '^version' rust/cli/Cargo.toml
+      - uses: ./.github/actions/rust
+        with:
+          github-token: ${{ github.token }}
+          install-nextest: "false"
+      - run: cargo build --bin chroma --release --manifest-path rust/cli/Cargo.toml
+      - run: copy target\release\chroma.exe chroma-windows-x64.exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-windows-x64
+          path: chroma-windows-x64.exe
+
+  cli-macos:
+    name: CLI macOS ${{ matrix.name }}
+    strategy:
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, name: arm64 }
+          - { target: x86_64-apple-darwin, name: x64 }
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+      - name: CLI version from the release tag
+        if: inputs.version != ''
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: perl -0pi -e 's/^version = ".*"/version = "$ENV{VERSION}"/m' rust/cli/Cargo.toml && grep -m1 '^version' rust/cli/Cargo.toml
+      - uses: ./.github/actions/rust
+        with:
+          github-token: ${{ github.token }}
+          targets: ${{ matrix.target }}
+          install-nextest: "false"
+      - run: cargo build --bin chroma --release --manifest-path rust/cli/Cargo.toml --target ${{ matrix.target }}
+      - run: cp target/${{ matrix.target }}/release/chroma chroma-macos-${{ matrix.name }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-macos-${{ matrix.name }}
+          path: chroma-macos-${{ matrix.name }}
+
+  wheels:
+    name: Wheel ${{ matrix.os }} ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, runner: ubuntu-24.04, target: x86_64 }
+          - { os: linux, runner: ubuntu-24.04-arm, target: aarch64 }
+          - { os: windows, runner: windows-latest, target: x64 }
+          - { os: macos, runner: macos-14, target: x86_64 }
+          - { os: macos, runner: macos-14, target: aarch64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: CLI version from the release tag
+        if: inputs.version != ''
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: perl -0pi -e 's/^version = ".*"/version = "$ENV{VERSION}"/m' rust/cli/Cargo.toml && grep -m1 '^version' rust/cli/Cargo.toml
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Python protos, as idl/makefile proto_python
+        shell: bash
+        run: |
+          pip install grpcio==1.58.0 grpcio-tools==1.58.0
+          cd idl && python -m grpc_tools.protoc -I ./ --python_out=. --pyi_out=. --grpc_python_out=. ./chromadb/proto/*.proto
+          mv chromadb/proto/*.py ../chromadb/proto/ && mv chromadb/proto/*.pyi ../chromadb/proto/
+      - name: Version in pyproject.toml, as the release of Chroma
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          pip install setuptools_scm toml packaging
+          # PEP 440 form of the tag: 1.0.0-preview.1 becomes 1.0.0rc1
+          version=$(python -c "import sys; from packaging.version import Version; print(Version(sys.argv[1]))" "${VERSION:-$(python -m setuptools_scm)}")
+          python -c "import toml; d = toml.load('pyproject.toml'); d['project']['version'] = '$version'; d['project']['dynamic'] = []; toml.dump(d, open('pyproject.toml', 'w'))"
+          echo "Version: $version"
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist ${{ matrix.os == 'linux' && '--zig --compatibility manylinux2014' || '' }}
+          container: "off"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: dist
+
+  image:
+    name: Docker image (built, not pushed)
+    needs: cli-linux
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: cli-linux-*
+          merge-multiple: true
+      - name: Context
+        run: |
+          mkdir ctx
+          cp vecturadb/docker/Dockerfile vecturadb/docker/config.yaml ctx/
+          cp chroma-linux-x86_64 ctx/chroma-amd64 && cp chroma-linux-aarch64 ctx/chroma-arm64 && chmod +x ctx/chroma-*
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build amd64 and arm64
+        run: docker buildx build --platform linux/amd64,linux/arm64 --build-arg REVISION=${{ github.sha }} -t ghcr.io/vecturadb/vecturadb:ci ctx
+      - name: Load amd64 for the smoke test
+        run: docker buildx build --platform linux/amd64 --build-arg REVISION=${{ github.sha }} --load -t ghcr.io/vecturadb/vecturadb:ci ctx
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: pip install chromadb-client
+      - name: Smoke test with the Python client
+        run: |
+          docker run -d --name vecturadb -p 127.0.0.1:8000:8000 ghcr.io/vecturadb/vecturadb:ci
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8000/api/v2/heartbeat && break; sleep 2; done
+          python vecturadb/smoke.py 8000
+      - if: failure()
+        run: docker logs vecturadb
+
+  rust-tests:
+    name: Rust tests (single-node)
+    runs-on: ubuntu-24.04
+    env:
+      RUST_BACKTRACE: 1
+      RUST_MIN_STACK_SIZE: 8388608
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/rust
+        with:
+          github-token: ${{ github.token }}
+      - name: Test
+        run: >-
+          cargo nextest run --profile ci
+          -p chroma-cli -p chroma-frontend -p frontend-core -p chroma-sqlite -p chroma-sysdb -p chroma-log
+          -p chroma-segment -p chroma-index -p chroma-types -p chroma-distance -p chromadb_rust_bindings
+
+  python-tests:
+    name: Python tests (single-node)
+    needs: wheels
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/python
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v5
+        with:
+          name: wheel-linux-x86_64
+          path: dist
+      - run: pip install --no-index --find-links dist VecturaDB
+      - uses: ./.github/actions/preload-default-onnx-model
+      - name: Test
+        env:
+          CHROMA_RUST_BINDINGS_TEST_ONLY: "1"
+          RUST_BACKTRACE: 1
+        run: >-
+          python -m pytest -x -v --color=yes --durations 10
+          chromadb/test/api chromadb/test/test_api.py chromadb/test/test_client.py
+          chromadb/test/property --ignore-glob chromadb/test/property/test_cross_version_persist.py
+          --ignore chromadb/test/property/test_add_mcmr.py
+      - name: Smoke test with the CLI server
+        run: |
+          chroma run --path ./smoke-data --port 8001 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8001/api/v2/heartbeat && break; sleep 2; done
+          python vecturadb/smoke.py 8001
