@@ -740,6 +740,51 @@ impl Bindings {
         Ok(collection)
     }
 
+    #[pyo3(signature = (collection_id, new_name, tenant = DEFAULT_TENANT.to_string(), database = DEFAULT_DATABASE.to_string()))]
+    fn fork_collection(
+        &self,
+        py: Python<'_>,
+        collection_id: String,
+        new_name: String,
+        tenant: String,
+        database: String,
+    ) -> ChromaPyResult<Collection> {
+        let collection_id = chroma_types::CollectionUuid(
+            uuid::Uuid::parse_str(&collection_id).map_err(WrappedUuidError)?,
+        );
+        let request = chroma_types::ForkCollectionRequest::try_new(
+            tenant,
+            database,
+            collection_id,
+            new_name,
+        )?;
+        let mut frontend = self.frontend.clone();
+        let collection = py.allow_threads(move || {
+            self.runtime
+                .block_on(async { frontend.fork_collection(request).await })
+        })?;
+        Ok(collection)
+    }
+
+    #[pyo3(signature = (collection_id, tenant = DEFAULT_TENANT.to_string(), database = DEFAULT_DATABASE.to_string()))]
+    fn count_forks(
+        &self,
+        collection_id: String,
+        tenant: String,
+        database: String,
+    ) -> ChromaPyResult<usize> {
+        // As the HTTP server, which checks them on the request path: the count reads the lineage by collection id.
+        let _ = (tenant, database);
+        let collection_id = chroma_types::CollectionUuid(
+            uuid::Uuid::parse_str(&collection_id).map_err(WrappedUuidError)?,
+        );
+        let mut frontend = self.frontend.clone();
+        let count = self
+            .runtime
+            .block_on(async { frontend.fork_count(collection_id).await })?;
+        Ok(count)
+    }
+
     #[pyo3(signature = (collection_id, tenant = DEFAULT_TENANT.to_string(), database = DEFAULT_DATABASE.to_string()))]
     fn get_collection_by_id(
         &self,

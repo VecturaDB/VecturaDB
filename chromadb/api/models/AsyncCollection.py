@@ -317,7 +317,6 @@ class AsyncCollection(CollectionCommon["AsyncServerAPI"]):
         new_name: str,
     ) -> "AsyncCollection":
         """Fork the current collection under a new name. The returning collection should contain identical data to the current collection.
-        This only works for Hosted Chroma for now.
 
         Args:
             new_name: The name of the new collection.
@@ -340,7 +339,6 @@ class AsyncCollection(CollectionCommon["AsyncServerAPI"]):
 
     async def fork_count(self) -> int:
         """Get the number of forks that exist for this collection.
-        This only works for Hosted Chroma for now.
 
         Returns:
             int: The number of forks for this collection.
