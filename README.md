@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/vecturadb-mark-dark.svg">
-    <img src="docs/assets/vecturadb-mark.svg" alt="VecturaDB" width="96">
+    <img src="https://raw.githubusercontent.com/VecturaDB/VecturaDB/main/docs/assets/vecturadb-mark-256.png" alt="VecturaDB" width="96">
   </picture>
 </p>
 
@@ -95,4 +95,4 @@ Telemetry is off by default. Setting `ANONYMIZED_TELEMETRY=TRUE` turns on the an
 
 ## License
 
-Apache License 2.0: see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache License 2.0: see [LICENSE](https://github.com/VecturaDB/VecturaDB/blob/main/LICENSE) and [NOTICE](https://github.com/VecturaDB/VecturaDB/blob/main/NOTICE).
