@@ -1,78 +1,25 @@
-![Chroma](./docs/assets/chroma-wordmark-color.png#gh-light-mode-only)
-![Chroma](./docs/assets/chroma-wordmark-white.png#gh-dark-mode-only)
+# VecturaDB
 
-<p align="center">
-    <b>Chroma - the open-source data infrastructure for AI</b>. <br />
-</p>
+VecturaDB was forked from the open-source [Chroma](https://github.com/chroma-core/chroma) project. It is not affiliated with Chroma.
 
-<p align="center">
-  <a href="https://discord.gg/MMeYNTmh3x" target="_blank">
-      <img src="https://img.shields.io/discord/1073293645303795742?cacheSeconds=3600" alt="Discord">
-  </a> |
-  <a href="https://github.com/chroma-core/chroma/blob/master/LICENSE" target="_blank">
-      <img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License">
-  </a> |
-  <a href="https://docs.trychroma.com/" target="_blank">
-      Docs
-  </a> |
-  <a href="https://www.trychroma.com/" target="_blank">
-      Homepage
-  </a>
-</p>
+VecturaDB is an open-source vector database, compatible with the Chroma API. This repository keeps the full git history of Chroma and its Apache 2.0 license.
 
-```bash
-pip install chromadb # python client
-# for javascript, npm install chromadb!
-# for client-server mode, chroma run --path /chroma_db_path
-```
+## Why VecturaDB
 
-## Chroma Cloud
+Chroma Cloud is winding down: it stops accepting writes on 22 November 2026 and stops serving reads on 22 December 2026. Some features of Chroma exist only in Chroma Cloud and in its distributed version: sparse vectors, the BM25 index and hybrid search. VecturaDB brings them to the single-node database, the one that runs with Docker, as a server, or inside a Python application, so that they stay available to everyone, as open source.
 
-Our hosted service, Chroma Cloud, powers serverless vector, hybrid, and full-text search. It's extremely fast, cost-effective, scalable and painless. Create a DB and try it out in under 30 seconds with $5 of free credits.
+Sparse vectors and BM25 are in review in this repository; hybrid search is in progress.
 
-[Get started with Chroma Cloud](https://trychroma.com/signup)
+No package is published yet. The CI of this repository builds the CLI, the Python wheels and the Docker image.
 
-## API
+## Python
 
-The core API is only 4 functions (run our [💡 Google Colab](https://colab.research.google.com/drive/1QEzFyqnoFxq7LUGyP1vzR4iLt9PpCDXv?usp=sharing)):
+When it is published, the `VecturaDB` package will replace `chromadb`: the import name stays `chromadb`, so existing code runs as it is. The two packages install the same modules, so they cannot be installed side by side.
 
-```python
-import chromadb
-# setup Chroma in-memory, for easy prototyping. Can add persistence easily!
-client = chromadb.Client()
+## Telemetry
 
-# Create collection. get_collection, get_or_create_collection, delete_collection also available!
-collection = client.create_collection("all-my-documents")
-
-# Add docs to the collection. Can also update and delete. Row-based API coming soon!
-collection.add(
-    documents=["This is document1", "This is document2"], # we handle tokenization, embedding, and indexing automatically. You can skip that and add your own embeddings as well
-    metadatas=[{"source": "notion"}, {"source": "google-docs"}], # filter on these!
-    ids=["doc1", "doc2"], # unique for each doc
-)
-
-# Query/search 2 most similar results. You can also .get by id
-results = collection.query(
-    query_texts=["This is a query document"],
-    n_results=2,
-    # where={"metadata_field": "is_equal_to_this"}, # optional filter
-    # where_document={"$contains":"search_string"}  # optional filter
-)
-```
-
-Learn about all features on our [Docs](https://docs.trychroma.com)
-
-## Get involved
-
-Chroma is a rapidly developing project. We welcome PR contributors and ideas for how to improve the project.
-- [Join the conversation on Discord](https://discord.com/invite/chromadb) - `#contributing` channel
-- [Review the 🛣️ Roadmap and contribute your ideas](https://docs.trychroma.com/docs/overview/oss#roadmap)
-- [Grab an issue and open a PR](https://github.com/chroma-core/chroma/issues) - [`Good first issue tag`](https://github.com/chroma-core/chroma/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
-- [Read our contributing guide](https://docs.trychroma.com/docs/overview/oss#contributing)
-
-**Release Cadence**
-We currently release new tagged versions of the `pypi` and `npm` packages on Mondays. Hotfixes go out at any time during the week.
+Telemetry is off by default. Setting `ANONYMIZED_TELEMETRY=TRUE` turns on the anonymized telemetry inherited from Chroma (PostHog, Python package only). The server binary sends none.
 
 ## License
 
-[Apache 2.0](./LICENSE)
+Apache License 2.0: see [LICENSE](LICENSE) and [NOTICE](NOTICE).
