@@ -64,7 +64,7 @@ async fn version_check(
         .max()
         .unwrap_or(current_version.clone());
 
-    if latest == current_version {
+    if latest <= current_version {
         term.println(&format!(
             "{}",
             "Your VecturaDB CLI version is up-to-date!".green()

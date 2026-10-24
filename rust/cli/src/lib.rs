@@ -53,7 +53,7 @@ enum Command {
 
 #[derive(Parser, Debug)]
 #[command(name = "chroma")]
-#[command(version = "1.4.4")]
+#[command(version)]
 #[command(about = "VecturaDB, compatible with the Chroma API", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -81,6 +81,8 @@ pub fn chroma_cli(args: Vec<String>) {
     if result.is_err() {
         let error_message = result.err().unwrap().to_string();
         eprintln!("{}", error_message.red());
+        println!();
+        std::process::exit(1);
     }
 
     println!();

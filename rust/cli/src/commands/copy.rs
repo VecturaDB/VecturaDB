@@ -212,7 +212,17 @@ async fn copy_collections(
     term: &mut dyn Terminal,
 ) -> Result<(), CliError> {
     let collections = if all {
-        source.list_collections(10000, None).await?
+        const PAGE: usize = 1000;
+        let mut all_collections = vec![];
+        loop {
+            let page = source.list_collections(PAGE, Some(all_collections.len())).await?;
+            let last = page.len() < PAGE;
+            all_collections.extend(page);
+            if last {
+                break;
+            }
+        }
+        all_collections
     } else {
         let mut source_collections = vec![];
         for collection in collections {
