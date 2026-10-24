@@ -48,12 +48,12 @@ use chroma_types::{
     GetTenantRequest, GetTenantResponse, HealthCheckResponse, HeartbeatError, Include,
     IndexStatusError, IndexStatusResponse, KnnIndex, ListCollectionsRequest,
     ListCollectionsResponse, ListDatabasesError, ListDatabasesRequest, ListDatabasesResponse,
-    Operation, OperationRecord, QueryError, QueryRequest, QueryResponse, ResetError, ResetResponse,
+    MetadataValue, Operation, OperationRecord, QueryError, QueryRequest, QueryResponse, ResetError, ResetResponse,
     Schema, SearchRequest, SearchResponse, SegmentType, UpdateCollectionError,
     UpdateCollectionRecordsError, UpdateCollectionRecordsRequest, UpdateCollectionRecordsResponse,
     UpdateCollectionRequest, UpdateCollectionResponse, UpdateTenantError, UpdateTenantRequest,
     UpdateTenantResponse, UpsertCollectionRecordsError, UpsertCollectionRecordsRequest,
-    UpsertCollectionRecordsResponse, Where,
+    UpsertCollectionRecordsResponse, Where, CHROMA_URI_KEY,
 };
 use opentelemetry::global;
 use opentelemetry::metrics::Counter;
@@ -1762,26 +1762,37 @@ impl ServiceBasedFrontend {
             .schema
             .as_ref()
             .and_then(|schema| schema.cmek.clone());
-        let log_offsets = self
-            .log_client
-            .fork_logs(
+        let mut collection_and_segments = if matches!(self.executor, Executor::Local(_)) {
+            self.fork_local(
                 &tenant_id,
                 database_name,
                 source_collection_id,
                 target_collection_id,
+                target_collection_name,
                 cmek,
             )
-            .await?;
-        let mut collection_and_segments = self
-            .sysdb_client
-            .fork_collection(
-                source_collection_id,
-                log_offsets.compaction_offset,
-                log_offsets.enumeration_offset,
-                target_collection_id,
-                target_collection_name,
-            )
-            .await?;
+            .await?
+        } else {
+            let log_offsets = self
+                .log_client
+                .fork_logs(
+                    &tenant_id,
+                    database_name,
+                    source_collection_id,
+                    target_collection_id,
+                    cmek,
+                )
+                .await?;
+            self.sysdb_client
+                .fork_collection(
+                    source_collection_id,
+                    log_offsets.compaction_offset,
+                    log_offsets.enumeration_offset,
+                    target_collection_id,
+                    target_collection_name,
+                )
+                .await?
+        };
         collection_and_segments
             .collection
             .reconcile_schema_for_read()
@@ -1815,6 +1826,175 @@ impl ServiceBasedFrontend {
         }
 
         Ok(collection)
+    }
+
+    /// The fork on a single node. Distributed Chroma forks the log and shares the segment files of the source (the
+    /// other branch of retryable_fork); a single node has no segment files to share and its log holds only the writes
+    /// not yet applied. So the sysdb copies the collection and its segments, then the records of the source are written
+    /// again into the copy through the local write path, in storage order. If the copy fails, the new collection is
+    /// removed and the fork fails as a whole.
+    async fn fork_local(
+        &mut self,
+        tenant_id: &str,
+        database_name: DatabaseName,
+        source_collection_id: CollectionUuid,
+        target_collection_id: CollectionUuid,
+        target_collection_name: String,
+        cmek: Option<Cmek>,
+    ) -> Result<CollectionAndSegments, ForkCollectionError> {
+        let source = Self::get_collection_with_segments_for_tenant(
+            &mut self.collections_with_segments_provider,
+            Some(database_name.clone()),
+            source_collection_id,
+            tenant_id,
+        )
+        .await
+        .map_err(ForkCollectionError::Internal)?;
+        let target = self
+            .sysdb_client
+            .fork_collection(
+                source_collection_id,
+                0,
+                0,
+                target_collection_id,
+                target_collection_name,
+            )
+            .await?;
+        if let Err(err) = self
+            .copy_records_for_fork(
+                tenant_id,
+                database_name.clone(),
+                source,
+                target_collection_id,
+                cmek,
+            )
+            .await
+        {
+            let segments = [
+                target.metadata_segment.clone(),
+                target.vector_segment.clone(),
+            ];
+            if let Err(cleanup) = self
+                .sysdb_client
+                .delete_collection(
+                    tenant_id.to_string(),
+                    database_name,
+                    target_collection_id,
+                    segments.iter().map(|segment| segment.id).collect(),
+                )
+                .await
+            {
+                tracing::error!(error = %cleanup, "Failed to remove an incomplete fork");
+            }
+            self.collections_with_segments_provider
+                .collections_with_segments_cache
+                .remove(&target_collection_id)
+                .await;
+            if let Err(cleanup) = self.executor.delete_segments(&segments).await {
+                tracing::warn!(error = %cleanup, "incomplete fork removed; index cleanup will retry");
+            }
+            return Err(err);
+        }
+        Ok(target)
+    }
+
+    async fn copy_records_for_fork(
+        &mut self,
+        tenant_id: &str,
+        database_name: DatabaseName,
+        source: CollectionAndSegments,
+        target_collection_id: CollectionUuid,
+        cmek: Option<Cmek>,
+    ) -> Result<(), ForkCollectionError> {
+        const FORK_PAGE_SIZE: usize = 1000;
+        let read = |filter: Filter, proj: Projection| Get {
+            scan: Scan {
+                collection_and_segments: source.clone(),
+                shard_index: 0,
+                num_shards: 1,
+                log_upper_bound_offset: 0,
+            },
+            filter,
+            limit: Limit {
+                offset: 0,
+                limit: None,
+            },
+            proj,
+        };
+        // The ids first, in one read: a write to the source while the pages are copied cannot make a page skip a record.
+        let ids = Box::pin(self.fan_out_get(
+            tenant_id.to_string(),
+            read(Filter::default(), Projection::default()),
+            None,
+        ))
+        .await
+        .map_err(|err| ForkCollectionError::Internal(err.boxed()))?
+        .result
+        .records
+        .into_iter()
+        .map(|record| record.id)
+        .collect::<Vec<_>>();
+        for page in ids.chunks(FORK_PAGE_SIZE) {
+            let records = Box::pin(self.fan_out_get(
+                tenant_id.to_string(),
+                read(
+                    Filter {
+                        query_ids: Some(page.to_vec()),
+                        where_clause: None,
+                    },
+                    Projection {
+                        document: true,
+                        embedding: true,
+                        metadata: true,
+                    },
+                ),
+                None,
+            ))
+            .await
+            .map_err(|err| ForkCollectionError::Internal(err.boxed()))?
+            .result
+            .records;
+            let mut ids = Vec::with_capacity(records.len());
+            let mut embeddings = Vec::with_capacity(records.len());
+            let mut documents = Vec::with_capacity(records.len());
+            let mut uris = Vec::with_capacity(records.len());
+            let mut metadatas = Vec::with_capacity(records.len());
+            for mut record in records {
+                // The URI travels in the metadata, as the write path stores it.
+                let uri = record
+                    .metadata
+                    .as_mut()
+                    .and_then(|metadata| metadata.remove(CHROMA_URI_KEY))
+                    .and_then(|value| match value {
+                        MetadataValue::Str(uri) => Some(uri),
+                        _ => None,
+                    });
+                ids.push(record.id);
+                embeddings.push(record.embedding);
+                documents.push(record.document);
+                uris.push(uri);
+                metadatas.push(record.metadata.filter(|metadata| !metadata.is_empty()));
+            }
+            let (records, _) = to_records(
+                ids,
+                Some(embeddings),
+                Some(documents),
+                Some(uris),
+                Some(metadatas),
+                Operation::Add,
+            )
+            .map_err(|err| ForkCollectionError::Internal(err.boxed()))?;
+            self.retryable_push_logs(
+                tenant_id,
+                database_name.clone(),
+                target_collection_id,
+                records,
+                cmek.clone(),
+            )
+            .await
+            .map_err(|err| ForkCollectionError::Internal(err.boxed()))?;
+        }
+        Ok(())
     }
 
     pub async fn fork_collection(
@@ -4590,6 +4770,130 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(fork_err.code(), ErrorCodes::NotFound);
+    }
+
+    // The fork on a single node, as measured on Chroma Cloud: the records with all their fields, the configuration and
+    // the metadata of the collection, writes that stay on their side, one lineage for the fork count, and the errors.
+    #[tokio::test]
+    async fn local_fork_copies_records_and_stays_independent() {
+        let mut frontend = sqlite_frontend().await;
+        let source = create_collection_for(&mut frontend, TENANT, DATABASE, "fork_source").await;
+        let mut metadata = chroma_types::Metadata::new();
+        metadata.insert("topic".to_string(), MetadataValue::Str("animals".to_string()));
+        metadata.insert("tags".to_string(), MetadataValue::StringArray(vec!["a".to_string()]));
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    source.collection_id,
+                    vec!["a".to_string(), "b".to_string()],
+                    vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+                    Some(vec![Some("first".to_string()), None]),
+                    Some(vec![Some("s3://bucket/a".to_string()), None]),
+                    Some(vec![Some(metadata), None]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let fork = |source: CollectionUuid, name: &str| {
+            ForkCollectionRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                source,
+                name.to_string(),
+            )
+            .unwrap()
+        };
+        let forked = frontend
+            .fork_collection(fork(source.collection_id, "fork_target"))
+            .await
+            .unwrap();
+        assert_ne!(forked.collection_id, source.collection_id);
+        assert_eq!(forked.name, "fork_target");
+        assert_eq!(forked.metadata, source.metadata);
+        assert_eq!(forked.dimension, Some(2));
+
+        let all = |collection_id: CollectionUuid| {
+            GetRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                None,
+                None,
+                None,
+                0,
+                chroma_types::IncludeList(vec![
+                    Include::Document,
+                    Include::Embedding,
+                    Include::Metadata,
+                    Include::Uri,
+                ]),
+            )
+            .unwrap()
+        };
+        let source_records = frontend.get(all(source.collection_id)).await.unwrap();
+        let forked_records = frontend.get(all(forked.collection_id)).await.unwrap();
+        assert_eq!(forked_records.ids, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            serde_json::to_value(&forked_records).unwrap(),
+            serde_json::to_value(&source_records).unwrap()
+        );
+
+        // Writes after the fork stay on their side.
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    forked.collection_id,
+                    Some(vec!["b".to_string()]),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                "test-region".to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            frontend.get(all(source.collection_id)).await.unwrap().ids,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            frontend.get(all(forked.collection_id)).await.unwrap().ids,
+            vec!["a".to_string()]
+        );
+
+        // A fork of the fork belongs to the same lineage, which keeps counting after a deletion.
+        let second = frontend
+            .fork_collection(fork(forked.collection_id, "fork_of_fork"))
+            .await
+            .unwrap();
+        for collection_id in [source.collection_id, forked.collection_id, second.collection_id] {
+            assert_eq!(frontend.fork_count(collection_id).await.unwrap(), 2);
+        }
+
+        let exists = frontend
+            .fork_collection(fork(source.collection_id, "fork_target"))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(exists.code(), ErrorCodes::AlreadyExists);
+        assert_eq!(exists.to_string(), "Collection [fork_target] already exists");
+        let missing = CollectionUuid::new();
+        let not_found = frontend
+            .fork_collection(fork(missing, "fork_of_missing"))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(not_found.code(), ErrorCodes::NotFound);
+        let count_not_found = frontend.fork_count(missing).await.err().unwrap();
+        assert_eq!(
+            count_not_found.to_string(),
+            format!("Collection [{missing}] does not exist")
+        );
     }
 
     #[tokio::test]
