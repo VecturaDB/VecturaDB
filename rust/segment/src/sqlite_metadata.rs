@@ -1361,27 +1361,32 @@ impl SqliteMetadataReader {
             else {
                 return Err(MetadataValueConversionError::InvalidValue.into());
             };
-            let sparse = Alias::new("sparse");
+            // Only the dimensions of the query: a record with none of them is not a candidate.
+            let term = Alias::new("term");
             let mut selection = Query::select();
             selection
                 .columns([
                     (Embeddings::Table, Embeddings::Id),
                     (Embeddings::Table, Embeddings::EmbeddingId),
                 ])
-                .column((sparse.clone(), Alias::new("value")))
+                .column((term.clone(), Alias::new("dim")))
+                .column((term.clone(), Alias::new("value")))
                 .from(Embeddings::Table)
                 .join_as(
                     sea_query::JoinType::InnerJoin,
-                    Alias::new("embedding_metadata_sparse"),
-                    sparse.clone(),
+                    Alias::new("embedding_metadata_sparse_term"),
+                    term.clone(),
                     Expr::col((Embeddings::Table, Embeddings::Id))
-                        .equals((sparse.clone(), Alias::new("id"))),
+                        .equals((term.clone(), Alias::new("id"))),
                 )
                 .and_where(
                     Expr::col((Embeddings::Table, Embeddings::SegmentId))
                         .eq(collection.metadata_segment.id.to_string()),
                 )
-                .and_where(Expr::col((sparse, Alias::new("key"))).eq(key));
+                .and_where(Expr::col((term.clone(), Alias::new("key"))).eq(key))
+                .and_where(Expr::col((term.clone(), Alias::new("dim"))).is_in(query.indices.clone()))
+                .order_by((Embeddings::Table, Embeddings::Id), sea_query::Order::Asc)
+                .order_by((term, Alias::new("dim")), sea_query::Order::Asc);
             if let Some(ids) = &payload.filter.query_ids {
                 selection
                     .and_where(Expr::col((Embeddings::Table, Embeddings::EmbeddingId)).is_in(ids));
@@ -1390,48 +1395,46 @@ impl SqliteMetadataReader {
                 selection.cond_where(sparse_search_filter(filter));
             }
             let (sql, values) = selection.build_sqlx(SqliteQueryBuilder);
+            let weights: HashMap<u32, f32> = query.iter().collect();
             let mut best: BinaryHeap<(RecordMeasure, String)> = BinaryHeap::new();
-            if *candidate_limit > 0 {
+            let mut offer = |offset_id: u32, id: String, dot: f32| {
+                // As the sparse index of distributed Chroma once a collection is compacted: only the records that
+                // share a dimension with the query are candidates, not the disjoint or empty ones with measure 1.
+                let measure = 1.0 - dot;
+                if !measure.is_finite() {
+                    return Err(SqliteMetadataError::NonFiniteSparseScore);
+                }
+                let candidate = (RecordMeasure { offset_id, measure }, id);
+                if best.len() < *candidate_limit as usize {
+                    best.push(candidate);
+                } else if best.peek().is_some_and(|worst| candidate.0 < worst.0) {
+                    best.pop();
+                    best.push(candidate);
+                }
+                Ok(())
+            };
+            if *candidate_limit > 0 && !query.indices.is_empty() {
                 let mut rows = sqlx::query_with(&sql, values).fetch(&mut *conn);
+                let mut current: Option<(u32, String, f32)> = None;
                 while let Some(row) = rows.try_next().await? {
                     let offset_id: u32 = row.try_get(0)?;
                     let id: String = row.try_get(1)?;
-                    let value: String = row.try_get(2)?;
-                    let vector: chroma_types::SparseVector = serde_json::from_str(&value)
-                        .map_err(SqliteMetadataError::SparseMetadataJson)?;
-                    vector.validate()?;
-                    if vector.values.iter().any(|v| !v.is_finite()) {
-                        return Err(MetadataValueConversionError::InvalidValue.into());
-                    }
-                    let (mut left, mut right, mut dot, mut shared) = (0, 0, 0.0_f32, false);
-                    while left < query.indices.len() && right < vector.indices.len() {
-                        match query.indices[left].cmp(&vector.indices[right]) {
-                            std::cmp::Ordering::Less => left += 1,
-                            std::cmp::Ordering::Greater => right += 1,
-                            std::cmp::Ordering::Equal => {
-                                dot += query.values[left] * vector.values[right];
-                                shared = true;
-                                left += 1;
-                                right += 1;
+                    let dim: u32 = row.try_get(2)?;
+                    let value = row.try_get::<f64, _>(3)? as f32;
+                    // Rows come by record, then by dimension: the products add up in the order of the dimensions.
+                    let product = weights.get(&dim).copied().unwrap_or_default() * value;
+                    match current.as_mut() {
+                        Some((current_offset, _, dot)) if *current_offset == offset_id => *dot += product,
+                        _ => {
+                            if let Some((done_offset, done_id, dot)) = current.take() {
+                                offer(done_offset, done_id, dot)?;
                             }
+                            current = Some((offset_id, id, product));
                         }
                     }
-                    // As the sparse index of distributed Chroma once a collection is compacted: only the records that
-                    // share a dimension with the query are candidates, not the disjoint or empty ones with measure 1.
-                    if !shared {
-                        continue;
-                    }
-                    let measure = 1.0 - dot;
-                    if !measure.is_finite() {
-                        return Err(SqliteMetadataError::NonFiniteSparseScore);
-                    }
-                    let candidate = (RecordMeasure { offset_id, measure }, id);
-                    if best.len() < *candidate_limit as usize {
-                        best.push(candidate);
-                    } else if best.peek().is_some_and(|worst| candidate.0 < worst.0) {
-                        best.pop();
-                        best.push(candidate);
-                    }
+                }
+                if let Some((done_offset, done_id, dot)) = current.take() {
+                    offer(done_offset, done_id, dot)?;
                 }
             }
             let winners: Vec<_> = best
@@ -2016,6 +2019,73 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    async fn sparse_terms(db: &chroma_sqlite::db::SqliteDb) -> Vec<(String, u32, f64)> {
+        sqlx::query_as(
+            "SELECT embeddings.embedding_id, term.dim, term.value FROM embedding_metadata_sparse_term AS term \
+             JOIN embeddings ON embeddings.id = term.id ORDER BY embeddings.embedding_id, term.dim",
+        )
+        .fetch_all(db.get_conn())
+        .await
+        .unwrap()
+    }
+
+    // The term table follows every write of the sparse vectors through its triggers, and the search reads from it.
+    #[tokio::test]
+    async fn test_sparse_terms_follow_add_update_delete() {
+        let vector = |pairs: Vec<(u32, f32)>| {
+            Some(UpdateMetadataValue::SparseVector(
+                chroma_types::SparseVector::from_pairs(pairs),
+            ))
+        };
+        let (reader, cas) = setup_with_logs(vec![
+            sparse_log(1, "a", Operation::Add, vector(vec![(1, 0.5), (7, 0.25)])),
+            sparse_log(2, "b", Operation::Add, vector(vec![(2, 1.0)])),
+            sparse_log(3, "c", Operation::Add, vector(vec![])),
+        ])
+        .await;
+        assert_eq!(
+            sparse_terms(&reader.db).await,
+            vec![("a".into(), 1, 0.5), ("a".into(), 7, 0.25), ("b".into(), 2, 1.0)]
+        );
+        let writer = SqliteMetadataWriter {
+            db: reader.db.clone(),
+        };
+        let mut tx = writer.begin().await.unwrap();
+        writer
+            .apply_logs(
+                Chunk::new(
+                    vec![
+                        sparse_log(4, "a", Operation::Update, vector(vec![(7, 2.0)])),
+                        sparse_log(5, "b", Operation::Delete, None),
+                        sparse_log(6, "c", Operation::Upsert, vector(vec![(7, 0.5)])),
+                    ]
+                    .into(),
+                ),
+                cas.metadata_segment.id,
+                cas.collection.schema.clone(),
+                &mut *tx,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            sparse_terms(&reader.db).await,
+            vec![("a".into(), 7, 2.0), ("c".into(), 7, 0.5)]
+        );
+        let result = reader
+            .sparse_search(cas, vec![exact_payload(vec![(7, 1.0)], 10)])
+            .await
+            .unwrap();
+        assert_eq!(
+            result.results[0]
+                .records
+                .iter()
+                .map(|r| (r.id.as_str(), r.score.unwrap()))
+                .collect::<Vec<_>>(),
+            vec![("a", -1.0), ("c", 0.5)]
+        );
     }
 
     #[tokio::test]
