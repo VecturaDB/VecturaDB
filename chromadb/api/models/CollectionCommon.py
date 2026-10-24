@@ -793,7 +793,7 @@ class CollectionCommon(Generic[ClientT]):
         if self._embedding_function is None:
             raise ValueError(
                 "You must provide an embedding function to compute embeddings."
-                "https://github.com/VecturaDB/VecturaDB"
+                "https://vecturadb.org"
             )
         if is_query:
             return self._embedding_function.embed_query(input=input)

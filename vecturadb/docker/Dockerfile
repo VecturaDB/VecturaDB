@@ -7,7 +7,7 @@ ARG REVISION=unknown
 LABEL org.opencontainers.image.title="VecturaDB" \
       org.opencontainers.image.description="VecturaDB, compatible with the Chroma API" \
       org.opencontainers.image.source="https://github.com/VecturaDB/VecturaDB" \
-      org.opencontainers.image.url="https://github.com/VecturaDB/VecturaDB" \
+      org.opencontainers.image.url="https://vecturadb.org" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.revision="${REVISION}"
 RUN apt-get update && apt-get install -y dumb-init libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*

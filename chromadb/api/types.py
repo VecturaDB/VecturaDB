@@ -1003,8 +1003,8 @@ def validate_embedding_function(
     if not function_signature == protocol_signature:
         raise ValueError(
             f"Expected EmbeddingFunction.__call__ to have the following signature: {protocol_signature}, got {function_signature}\n"
-            "Please see https://github.com/VecturaDB/VecturaDB for details of the EmbeddingFunction interface.\n"
-            "Please note the recent change to the EmbeddingFunction interface: https://github.com/VecturaDB/VecturaDB \n"
+            "Please see https://vecturadb.org for details of the EmbeddingFunction interface.\n"
+            "Please note the recent change to the EmbeddingFunction interface: https://vecturadb.org \n"
         )
 
 
@@ -1581,7 +1581,7 @@ def validate_sparse_embedding_function(
     if not function_signature == protocol_signature:
         raise ValueError(
             f"Expected SparseEmbeddingFunction.__call__ to have the following signature: {protocol_signature}, got {function_signature}\n"
-            "Please see https://github.com/VecturaDB/VecturaDB for details of the SparseEmbeddingFunction interface.\n"
+            "Please see https://vecturadb.org for details of the SparseEmbeddingFunction interface.\n"
         )
 
 
