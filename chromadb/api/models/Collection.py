@@ -369,7 +369,6 @@ class Collection(CollectionCommon["ServerAPI"]):
         read_level: ReadLevel = ReadLevel.INDEX_AND_WAL,
     ) -> SearchResult:
         """Perform hybrid search on the collection.
-        This is an experimental API that only works for distributed and hosted Chroma for now.
 
         Args:
             searches: A single Search object or a list of Search objects, each containing:
