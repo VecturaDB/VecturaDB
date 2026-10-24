@@ -1403,17 +1403,23 @@ impl SqliteMetadataReader {
                     if vector.values.iter().any(|v| !v.is_finite()) {
                         return Err(MetadataValueConversionError::InvalidValue.into());
                     }
-                    let (mut left, mut right, mut dot) = (0, 0, 0.0_f32);
+                    let (mut left, mut right, mut dot, mut shared) = (0, 0, 0.0_f32, false);
                     while left < query.indices.len() && right < vector.indices.len() {
                         match query.indices[left].cmp(&vector.indices[right]) {
                             std::cmp::Ordering::Less => left += 1,
                             std::cmp::Ordering::Greater => right += 1,
                             std::cmp::Ordering::Equal => {
                                 dot += query.values[left] * vector.values[right];
+                                shared = true;
                                 left += 1;
                                 right += 1;
                             }
                         }
+                    }
+                    // As the sparse index of distributed Chroma once a collection is compacted: only the records that
+                    // share a dimension with the query are candidates, not the disjoint or empty ones with measure 1.
+                    if !shared {
+                        continue;
                     }
                     let measure = 1.0 - dot;
                     if !measure.is_finite() {
@@ -2068,10 +2074,8 @@ mod tests {
             .iter()
             .map(|row| (row.id.as_str(), row.score.unwrap()))
             .collect();
-        assert_eq!(
-            actual,
-            vec![("d", -1.0), ("e", -1.0), ("b", 1.0), ("c", 1.0), ("a", 3.0)]
-        );
+        // b shares no dimension with the query and c is empty: neither is a candidate.
+        assert_eq!(actual, vec![("d", -1.0), ("e", -1.0), ("a", 3.0)]);
         assert_eq!(
             result.results[0].records[0].document.as_deref(),
             Some("document-d")
@@ -2088,7 +2092,7 @@ mod tests {
                 .iter()
                 .map(|r| r.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["b", "c", "a"]
+            vec!["a"]
         );
         for keys in [
             vec![],
@@ -2139,11 +2143,11 @@ mod tests {
         for (wire_filter, expected) in [
             (
                 serde_json::json!({"#id":{"$in":["a","b","c"]}}),
-                vec!["b", "c", "a"],
+                vec!["a"],
             ),
             (
                 serde_json::json!({"#id":{"$nin":["a","d","e"]}}),
-                vec!["b", "c"],
+                vec![],
             ),
             (serde_json::json!({"#id":{"$eq":"a"}}), vec!["a"]),
             (
@@ -2156,7 +2160,7 @@ mod tests {
             ),
             (
                 serde_json::json!({"#id":{"$ne":"a"}}),
-                vec!["d", "e", "b", "c"],
+                vec!["d", "e"],
             ),
         ] {
             let mut payload = exact_payload(vec![(1, 1.0)], 10);
@@ -2188,7 +2192,7 @@ mod tests {
                 .iter()
                 .map(|r| (r.id.as_str(), r.score.unwrap()))
                 .collect::<Vec<_>>(),
-            vec![("a", -1.0), ("b", 1.0)]
+            vec![("a", -1.0), ("d", 3.0)]
         );
         assert!(reader
             .sparse_search(cas.clone(), vec![exact_payload(vec![], 0)])

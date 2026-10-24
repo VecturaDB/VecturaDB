@@ -48,11 +48,12 @@ def test_sparse_metadata_public_roundtrip(tmp_path: Path) -> None:
             .select(K.SCORE, "sparse")
         )
         result = collection.search(search)
-        assert result["ids"] == [["a", "b"]]
-        assert result["scores"] == [[-3.0, 1.0]]
+        # b is empty: it shares no dimension with the query, so it is not a candidate.
+        assert result["ids"] == [["a"]]
+        assert result["scores"] == [[-3.0]]
         assert result["metadatas"][0][0]["sparse"] == vector
-        assert collection.search(search.where(K.ID.is_in(["b"])))["ids"] == [["b"]]
-        assert collection.search(search.where(K.ID.not_in(["a"])))["ids"] == [["b"]]
+        assert collection.search(search.where(K.ID.is_in(["b"])))["ids"] == [[]]
+        assert collection.search(search.where(K.ID.not_in(["a"])))["ids"] == [[]]
         mixed = search.where({"$and": [{"#id": {"$eq": "a"}}, {"scalar": True}]})
         assert collection.search(mixed)["ids"] == [["a"]]
         with pytest.raises(NotImplementedError, match="Local Search supports"):
@@ -68,9 +69,9 @@ def test_sparse_metadata_public_roundtrip(tmp_path: Path) -> None:
         collection.upsert(
             ids=["b"], embeddings=[[0.0, 1.0]], metadatas=[{"sparse": vector}]
         )
-        assert collection.search(search)["ids"] == [["b", "a"]]
+        assert collection.search(search)["ids"] == [["b"]]
         collection.update(ids=["b"], metadatas=[{"sparse": None}])
-        assert collection.search(search)["ids"] == [["a"]]
+        assert collection.search(search)["ids"] == [[]]
         final = collection.get(ids=["b"])["metadatas"]
         assert final is not None
         assert final[0] is None or "sparse" not in final[0]
