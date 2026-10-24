@@ -1,3 +1,5 @@
+# Changed by VecturaDB contributors for the VecturaDB branding.
+# Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
 import importlib
 import inspect
 import logging
@@ -224,7 +226,8 @@ class Settings(BaseSettings):  # type: ignore
     # Required for backwards compatibility
     chroma_telemetry_impl: str = chroma_product_telemetry_impl
 
-    anonymized_telemetry: bool = True
+    # Off by default in VecturaDB: PostHog sends nothing unless ANONYMIZED_TELEMETRY=TRUE.
+    anonymized_telemetry: bool = False
 
     chroma_otel_collection_endpoint: Optional[str] = ""
     chroma_otel_service_name: Optional[str] = "chromadb"
