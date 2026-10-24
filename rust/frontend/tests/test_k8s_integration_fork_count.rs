@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 //! K8s integration tests for fork count functionality.
 //!
 //! These tests require a deployed Chroma cluster with gRPC sysdb.

@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use super::utils::to_records;
 use crate::{
     config::FrontendConfig, executor::Executor, types::errors::ValidationError,

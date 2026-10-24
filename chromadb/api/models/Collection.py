@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 from typing import TYPE_CHECKING, Optional, Union, List, cast, Dict, Any, Tuple
 
 from chromadb.api.models.CollectionCommon import CollectionCommon
