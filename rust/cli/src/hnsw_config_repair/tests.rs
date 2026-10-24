@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use super::*;
 use chroma_config::{registry::Registry, Configurable};
 use chroma_frontend::{impls::service_based_frontend::ServiceBasedFrontend, FrontendConfig};
