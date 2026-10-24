@@ -207,6 +207,11 @@ jobs:
           cargo nextest run --profile ci
           -p chroma-cli -p chroma-frontend -p frontend-core -p chroma-sqlite -p chroma-sysdb -p chroma-log
           -p chroma-segment -p chroma-index -p chroma-types -p chroma-distance -p chromadb_rust_bindings
+      - name: Worker tests of the operators shared with the single node
+        # rank, ranked_group_by and select call the code moved to chroma-types; the rest of the worker is not single-node
+        run: >-
+          cargo nextest run --profile ci -p worker --lib
+          -E 'test(/^execution::operators::(rank|ranked_group_by|select)::tests::/)'
 
   python-tests:
     name: Python tests (single-node)
