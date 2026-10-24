@@ -1,3 +1,5 @@
+// Changed by VecturaDB contributors for the VecturaDB branding.
+// Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
 use crate::client::dashboard_client::{DashboardClient, DashboardClientError, Team};
 use crate::commands::db::DbError;
 use crate::commands::login::LoginError::BrowserAuthFailed;
@@ -71,8 +73,8 @@ fn set_profile_message(profile_name: &str) -> String {
 
 fn next_steps_message() -> String {
     format!(
-        "Try this next:\n   Create a database\n    {}\n\nFor a full list of commands:\n   {}",
-        "chroma db create <db_name>".yellow(),
+        "Try this next:\n   Copy your collections out of Chroma Cloud\n    {}\n\nFor a full list of commands:\n   {}",
+        "chroma copy --from-cloud --to-local --all".yellow(),
         "chroma --help".yellow()
     )
 }
