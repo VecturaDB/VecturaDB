@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use crate::{
     config::SqliteLogConfig, BackfillMessage, CollectionInfo, CompactionManagerError,
     LocalCompactionManager, PurgeLogsMessage,

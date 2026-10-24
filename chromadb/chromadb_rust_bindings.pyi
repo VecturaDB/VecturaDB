@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 from typing import Any, Dict, List, Optional, Sequence
 from uuid import UUID
 from chromadb import CollectionMetadata, Embeddings, IDs

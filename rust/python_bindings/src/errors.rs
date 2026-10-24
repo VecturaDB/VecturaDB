@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use chroma_api_types::{StaleReadError as ApiStaleReadError, CONDITIONAL_WRITE_CONFLICT_MESSAGE};
 use chroma_error::{source_chain_contains, ChromaError, ErrorCodes};
 use chroma_log::PushLogsError;

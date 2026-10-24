@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use chroma_error::{ChromaError, ErrorCodes};
 use itertools::Itertools;
 use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};

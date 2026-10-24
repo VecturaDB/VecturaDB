@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 from chromadb.api import ClientAPI, ServerAPI
 from chromadb.api.types import (
     Schema,

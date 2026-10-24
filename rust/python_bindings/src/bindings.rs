@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use crate::errors::{ChromaPyResult, InvalidDatabaseNameError, WrappedPyErr, WrappedUuidError};
 use chroma_api_types::{OccReadMode, OccReadToken};
 use chroma_cache::FoyerCacheConfig;

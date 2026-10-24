@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 //! Shared library logic for collection lifecycle operations (currently:
 //! create-collection planning). Both `chroma-frontend`'s HTTP CRUD handlers
 //! and `foundation-api`'s init handler call into this module so the rules
