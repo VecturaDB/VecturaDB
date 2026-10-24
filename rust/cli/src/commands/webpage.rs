@@ -16,7 +16,7 @@ pub enum WebPageCommand {
 impl WebPageCommand {
     fn url(&self) -> &'static str {
         match self {
-            WebPageCommand::Docs => "https://github.com/VecturaDB/VecturaDB",
+            WebPageCommand::Docs => "https://vecturadb.org",
         }
     }
 }

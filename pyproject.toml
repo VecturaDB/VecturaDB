@@ -36,7 +36,7 @@ ignore_errors = true
 chroma = "chromadb.cli.cli:app"
 
 [project.urls]
-"Homepage" = "https://github.com/VecturaDB/VecturaDB"
+"Homepage" = "https://vecturadb.org"
 "Bug Tracker" = "https://github.com/VecturaDB/VecturaDB/issues"
 
 [build-system]
