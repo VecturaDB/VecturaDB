@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use std::{
     collections::{BTreeMap, HashMap},
     num::TryFromIntError,
@@ -48,13 +49,20 @@ pub enum SqliteMetadataError {
     SeaQuery(#[from] sea_query::error::Error),
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
+    #[error("Sparse query produced a non-finite score")]
+    NonFiniteSparseScore,
+    #[error("Could not encode or decode sparse metadata: {0}")]
+    SparseMetadataJson(serde_json::Error),
     #[error("Could not serialize schema: {0}")]
     SerializeSchema(#[from] serde_json::Error),
 }
 
 impl ChromaError for SqliteMetadataError {
     fn code(&self) -> ErrorCodes {
-        ErrorCodes::Internal
+        match self {
+            Self::NonFiniteSparseScore => ErrorCodes::InvalidArgument,
+            _ => ErrorCodes::Internal,
+        }
     }
 }
 
@@ -373,10 +381,70 @@ impl SqliteMetadataWriter {
         tx: &mut C,
         offset_id: u32,
         meta: UpdateMetadata,
+        segment_id: SegmentUuid,
+        sparse_presence: &mut Option<bool>,
     ) -> Result<(), SqliteMetadataError>
     where
         for<'connection> &'connection mut C: sqlx::Executor<'connection, Database = sqlx::Sqlite>,
     {
+        // Preserve the full sparse value (including tokens and empty presence)
+        // in the same transaction as record identity and the replay watermark.
+        let mut meta = meta;
+        let mut sparse = Vec::new();
+        for (key, value) in &meta {
+            if let UpdateMetadataValue::SparseVector(vector) = value {
+                vector.validate()?;
+                if vector.values.iter().any(|value| !value.is_finite()) {
+                    return Err(MetadataValueConversionError::InvalidValue.into());
+                }
+                sparse.push((
+                    key.clone(),
+                    serde_json::to_string(vector)
+                        .map_err(SqliteMetadataError::SparseMetadataJson)?,
+                ));
+            }
+        }
+        // Resolve absence once per apply_logs call, after add/update/upsert has
+        // acquired the write lock. An earlier read in a deferred transaction
+        // would introduce a read-to-write lock upgrade race.
+        if !meta.is_empty() && sparse_presence.is_none() {
+            *sparse_presence = Some(sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM embedding_metadata_sparse AS sparse JOIN embeddings ON embeddings.id = sparse.id WHERE embeddings.segment_id = ?)",
+            ).bind(segment_id.to_string()).fetch_one(&mut *tx).await?);
+        }
+        // A proven-absent segment needs no sparse DELETE per ordinary record.
+        // Once true, remain conservative through later removals in this chunk.
+        if sparse_presence.unwrap_or(false) {
+            // Every explicitly supplied key replaces/removes its prior sparse form.
+            // Omitted keys are untouched. Foreign keys are disabled in local SQLite.
+            let keys: Vec<_> = meta.keys().collect();
+            // Bound parameters independently of record metadata width.
+            for keys in keys.chunks(500) {
+                let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+                    "DELETE FROM embedding_metadata_sparse WHERE id = ",
+                );
+                query.push_bind(offset_id).push(" AND key IN (");
+                let mut values = query.separated(", ");
+                for key in keys {
+                    values.push_bind(*key);
+                }
+                values.push_unseparated(")");
+                query.build().execute(&mut *tx).await?;
+            }
+        }
+        if !sparse.is_empty() {
+            *sparse_presence = Some(true);
+        }
+        for (key, value) in sparse {
+            sqlx::query("INSERT INTO embedding_metadata_sparse (id, key, value) VALUES (?, ?, ?)")
+                .bind(offset_id)
+                .bind(&key)
+                .bind(value)
+                .execute(&mut *tx)
+                .await?;
+            // None clears the old scalar and array representations of this key.
+            meta.insert(key, UpdateMetadataValue::None);
+        }
         let (mut scalars, arrays, deleted_keys) = Self::split_metadata(meta);
 
         // Keys becoming arrays must be removed from the scalar table.
@@ -424,6 +492,7 @@ impl SqliteMetadataWriter {
         }
         let mut schema = schema;
         let mut schema_modified = false;
+        let mut sparse_presence = None;
         let mut max_seq_id = u64::MIN;
         for (
             LogRecord {
@@ -465,7 +534,14 @@ impl SqliteMetadataWriter {
                                     schema_modified = true;
                                 }
                             }
-                            Self::write_metadata(tx, offset_id, meta).await?;
+                            Self::write_metadata(
+                                tx,
+                                offset_id,
+                                meta,
+                                segment_id,
+                                &mut sparse_presence,
+                            )
+                            .await?;
                         }
 
                         if let Some(doc) = document {
@@ -483,7 +559,14 @@ impl SqliteMetadataWriter {
                                     schema_modified = true;
                                 }
                             }
-                            Self::write_metadata(tx, offset_id, meta).await?;
+                            Self::write_metadata(
+                                tx,
+                                offset_id,
+                                meta,
+                                segment_id,
+                                &mut sparse_presence,
+                            )
+                            .await?;
                         }
 
                         if let Some(doc) = document {
@@ -503,7 +586,8 @@ impl SqliteMetadataWriter {
                                 schema_modified = true;
                             }
                         }
-                        Self::write_metadata(tx, offset_id, meta).await?;
+                        Self::write_metadata(tx, offset_id, meta, segment_id, &mut sparse_presence)
+                            .await?;
                     }
 
                     if let Some(doc) = document {
@@ -516,6 +600,10 @@ impl SqliteMetadataWriter {
                     {
                         delete_metadata::<EmbeddingMetadata, _, _>(tx, offset_id).await?;
                         delete_array_metadata(tx, offset_id).await?;
+                        sqlx::query("DELETE FROM embedding_metadata_sparse WHERE id = ?")
+                            .bind(offset_id)
+                            .execute(&mut *tx)
+                            .await?;
                         Self::delete_document(tx, offset_id).await?;
                     }
                 }
@@ -530,12 +618,74 @@ impl SqliteMetadataWriter {
     }
 }
 
+/// Whether the sparse index of a key weights queries by IDF (BM25): the setting of the key, else the default, as the
+/// sparse KNN of distributed Chroma reads it (rust/worker/src/execution/orchestration/sparse_knn.rs:220-240).
+pub fn sparse_bm25_enabled(schema: &Schema, key: &str) -> bool {
+    schema
+        .keys
+        .get(key)
+        .and_then(|types| types.sparse_vector.as_ref())
+        .and_then(|value| value.sparse_vector_index.as_ref())
+        .and_then(|index| index.config.bm25)
+        .unwrap_or_else(|| {
+            schema
+                .defaults
+                .sparse_vector
+                .as_ref()
+                .and_then(|value| value.sparse_vector_index.as_ref())
+                .and_then(|index| index.config.bm25)
+                .unwrap_or(false)
+        })
+}
+
 trait IntoSqliteExpr {
     /// Evaluate to a binary integer (0/1) indicating boolean value
     /// We cannot directly use a boolean value because `Any` and `All` aggregation does not exist
     /// We need to use `Min` and `Max` as a workaround
     /// In SQLite, boolean can be implicitly treated as binary integer
     fn eval(&self) -> SimpleExpr;
+}
+
+// Search reserves #id for the record identifier; ordinary Get metadata evaluation
+// must retain its existing meaning for literal metadata keys.
+fn sparse_search_filter(filter: &Where) -> SimpleExpr {
+    match filter {
+        Where::Composite(composite) => {
+            let and = matches!(composite.operator, BooleanOperator::And);
+            composite
+                .children
+                .iter()
+                .fold(Expr::val(and).into(), |expression, child| {
+                    if and {
+                        Expr::expr(expression).and(sparse_search_filter(child))
+                    } else {
+                        Expr::expr(expression).or(sparse_search_filter(child))
+                    }
+                })
+        }
+        Where::Metadata(metadata) if metadata.key == "#id" => {
+            let id = Expr::col((Embeddings::Table, Embeddings::EmbeddingId));
+            match &metadata.comparison {
+                MetadataComparison::Primitive(
+                    PrimitiveOperator::Equal,
+                    MetadataValue::Str(value),
+                ) => id.eq(value.clone()),
+                MetadataComparison::Primitive(
+                    PrimitiveOperator::NotEqual,
+                    MetadataValue::Str(value),
+                ) => id.ne(value.clone()),
+                MetadataComparison::Set(SetOperator::In, MetadataSetValue::Str(values)) => {
+                    id.is_in(values.clone())
+                }
+                MetadataComparison::Set(SetOperator::NotIn, MetadataSetValue::Str(values)) => {
+                    id.is_not_in(values.clone())
+                }
+                // The executor rejects unsupported ID comparisons before replay.
+                _ => Expr::val(false).into(),
+            }
+        }
+        _ => filter.eval(),
+    }
 }
 
 impl IntoSqliteExpr for Where {
@@ -991,7 +1141,12 @@ impl SqliteMetadataReader {
         })
     }
 
-    pub async fn get(
+    pub async fn get(&self, plan: Get) -> Result<GetResult, SqliteMetadataError> {
+        let mut conn = self.db.get_conn().acquire().await?;
+        self.get_with_connection(plan, &mut conn).await
+    }
+
+    async fn get_with_connection(
         &self,
         Get {
             scan: Scan {
@@ -1007,6 +1162,7 @@ impl SqliteMetadataReader {
                 document, metadata, ..
             },
         }: Get,
+        conn: &mut sqlx::SqliteConnection,
     ) -> Result<GetResult, SqliteMetadataError> {
         let mut filter_limit_query = Query::select();
         filter_limit_query.columns([
@@ -1039,7 +1195,7 @@ impl SqliteMetadataReader {
                 (alias.clone(), Embeddings::Id),
                 (alias.clone(), Embeddings::EmbeddingId),
             ])
-            .from_subquery(filter_limit_query, alias.clone());
+            .from_subquery(filter_limit_query.clone(), alias.clone());
 
         if document || metadata {
             projection_query
@@ -1062,9 +1218,7 @@ impl SqliteMetadataReader {
 
         let (sql, values) = projection_query.build_sqlx(SqliteQueryBuilder);
 
-        let rows = sqlx::query_with(&sql, values)
-            .fetch_all(self.db.get_conn())
-            .await?;
+        let rows = sqlx::query_with(&sql, values).fetch_all(&mut *conn).await?;
 
         let mut records = BTreeMap::new();
 
@@ -1116,7 +1270,7 @@ impl SqliteMetadataReader {
                 .build_sqlx(SqliteQueryBuilder);
 
             let arr_rows = sqlx::query_with(&arr_sql, arr_vals)
-                .fetch_all(self.db.get_conn())
+                .fetch_all(&mut *conn)
                 .await?;
 
             for row in arr_rows {
@@ -1125,6 +1279,40 @@ impl SqliteMetadataReader {
                 if let Some(record) = records.get_mut(&offset_id) {
                     if let Some(md) = record.metadata.as_mut() {
                         Self::accumulate_array_value(md, &key, &row)?;
+                    }
+                }
+            }
+        }
+
+        if metadata && !records.is_empty() {
+            // Reuse the selection subquery instead of binding one parameter
+            // per returned record (Get without a limit may select many rows).
+            let (sql, values) = Query::select()
+                .column((alias.clone(), Embeddings::Id))
+                .column((Alias::new("sparse"), Alias::new("key")))
+                .column((Alias::new("sparse"), Alias::new("value")))
+                .from_subquery(filter_limit_query, alias.clone())
+                .join_as(
+                    sea_query::JoinType::InnerJoin,
+                    Alias::new("embedding_metadata_sparse"),
+                    Alias::new("sparse"),
+                    Expr::col((alias.clone(), Embeddings::Id))
+                        .equals((Alias::new("sparse"), Alias::new("id"))),
+                )
+                .build_sqlx(SqliteQueryBuilder);
+            for row in sqlx::query_with(&sql, values).fetch_all(&mut *conn).await? {
+                let id: u32 = row.try_get(0)?;
+                let key: String = row.try_get(1)?;
+                let value: String = row.try_get(2)?;
+                let vector: chroma_types::SparseVector = serde_json::from_str(&value)
+                    .map_err(SqliteMetadataError::SparseMetadataJson)?;
+                vector.validate()?;
+                if vector.values.iter().any(|value| !value.is_finite()) {
+                    return Err(MetadataValueConversionError::InvalidValue.into());
+                }
+                if let Some(record) = records.get_mut(&id) {
+                    if let Some(metadata) = record.metadata.as_mut() {
+                        metadata.insert(key, MetadataValue::SparseVector(vector));
                     }
                 }
             }
@@ -1149,6 +1337,249 @@ impl SqliteMetadataReader {
                     })
                     .collect(),
             },
+        })
+    }
+    /// Exact sparse ranking and projection share one SQLite read snapshot.
+    /// Callers validate supported expressions before replay or execution.
+    pub async fn sparse_search(
+        &self,
+        collection: chroma_types::CollectionAndSegments,
+        payloads: Vec<chroma_types::plan::SearchPayload>,
+    ) -> Result<chroma_types::operator::SearchResult, SqliteMetadataError> {
+        let mut tx = self.db.get_conn().begin().await?;
+        // The first read fixes the snapshot for every payload and projection.
+        sqlx::query("SELECT seq_id FROM max_seq_id WHERE segment_id = ?")
+            .bind(collection.metadata_segment.id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+        let result = self
+            .sparse_search_with_connection(collection, payloads, &mut tx)
+            .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// The query of a BM25 key weighted as distributed Chroma does (rust/worker/src/execution/operators/idf.rs:84-89,
+    /// 208-231): every weight times ln_1p((n - n_t + 0.5) / (n_t + 0.5)), in f32, where n is the number of records of
+    /// the collection and n_t the number of records whose vector of the key has the dimension, at most n.
+    async fn idf_scaled_query(
+        conn: &mut sqlx::SqliteConnection,
+        segment_id: &str,
+        key: &str,
+        query: &chroma_types::SparseVector,
+    ) -> Result<chroma_types::SparseVector, SqliteMetadataError> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM embeddings WHERE segment_id = ?")
+            .bind(segment_id)
+            .fetch_one(&mut *conn)
+            .await?;
+        let mut counts: HashMap<u32, i64> = HashMap::new();
+        if !query.indices.is_empty() {
+            let mut builder = sqlx::QueryBuilder::<Sqlite>::new(
+                "SELECT term.dim, COUNT(*) FROM embedding_metadata_sparse_term AS term \
+                 JOIN embeddings ON embeddings.id = term.id WHERE embeddings.segment_id = ",
+            );
+            builder
+                .push_bind(segment_id)
+                .push(" AND term.key = ")
+                .push_bind(key)
+                .push(" AND term.dim IN (");
+            {
+                let mut dims = builder.separated(", ");
+                for dim in &query.indices {
+                    dims.push_bind(*dim);
+                }
+                dims.push_unseparated(") GROUP BY term.dim");
+            }
+            let rows: Vec<(u32, i64)> = builder.build_query_as().fetch_all(&mut *conn).await?;
+            counts.extend(rows);
+        }
+        let n = n as f32;
+        let mut scaled = query.clone();
+        for (dim, value) in scaled.indices.iter().zip(scaled.values.iter_mut()) {
+            let nt = (counts.get(dim).copied().unwrap_or_default() as f32).min(n);
+            *value *= ((n - nt + 0.5) / (nt + 0.5)).ln_1p();
+        }
+        Ok(scaled)
+    }
+
+    async fn sparse_search_with_connection(
+        &self,
+        collection: chroma_types::CollectionAndSegments,
+        payloads: Vec<chroma_types::plan::SearchPayload>,
+        conn: &mut sqlx::SqliteConnection,
+    ) -> Result<chroma_types::operator::SearchResult, SqliteMetadataError> {
+        use chroma_types::operator::{
+            Key, QueryVector, RankExpr, RecordMeasure, SearchPayloadResult, SearchRecord,
+            SearchResult,
+        };
+        use futures::TryStreamExt;
+        use std::collections::BinaryHeap;
+        let mut results = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let Some(RankExpr::Knn {
+                query: QueryVector::Sparse(query),
+                key: Key::MetadataField(key),
+                limit: candidate_limit,
+                ..
+            }) = &payload.rank.expr
+            else {
+                return Err(MetadataValueConversionError::InvalidValue.into());
+            };
+            let query = match collection.collection.schema.as_ref() {
+                Some(schema) if sparse_bm25_enabled(schema, key) => {
+                    Self::idf_scaled_query(conn, &collection.metadata_segment.id.to_string(), key, query)
+                        .await?
+                }
+                _ => query.clone(),
+            };
+            // Only the dimensions of the query: a record with none of them is not a candidate.
+            let term = Alias::new("term");
+            let mut selection = Query::select();
+            selection
+                .columns([
+                    (Embeddings::Table, Embeddings::Id),
+                    (Embeddings::Table, Embeddings::EmbeddingId),
+                ])
+                .column((term.clone(), Alias::new("dim")))
+                .column((term.clone(), Alias::new("value")))
+                .from(Embeddings::Table)
+                .join_as(
+                    sea_query::JoinType::InnerJoin,
+                    Alias::new("embedding_metadata_sparse_term"),
+                    term.clone(),
+                    Expr::col((Embeddings::Table, Embeddings::Id))
+                        .equals((term.clone(), Alias::new("id"))),
+                )
+                .and_where(
+                    Expr::col((Embeddings::Table, Embeddings::SegmentId))
+                        .eq(collection.metadata_segment.id.to_string()),
+                )
+                .and_where(Expr::col((term.clone(), Alias::new("key"))).eq(key))
+                .and_where(Expr::col((term.clone(), Alias::new("dim"))).is_in(query.indices.clone()))
+                .order_by((Embeddings::Table, Embeddings::Id), sea_query::Order::Asc)
+                .order_by((term, Alias::new("dim")), sea_query::Order::Asc);
+            if let Some(ids) = &payload.filter.query_ids {
+                selection
+                    .and_where(Expr::col((Embeddings::Table, Embeddings::EmbeddingId)).is_in(ids));
+            }
+            if let Some(filter) = &payload.filter.where_clause {
+                selection.cond_where(sparse_search_filter(filter));
+            }
+            let (sql, values) = selection.build_sqlx(SqliteQueryBuilder);
+            let weights: HashMap<u32, f32> = query.iter().collect();
+            let mut best: BinaryHeap<(RecordMeasure, String)> = BinaryHeap::new();
+            let mut offer = |offset_id: u32, id: String, dot: f32| {
+                // As the sparse index of distributed Chroma once a collection is compacted: only the records that
+                // share a dimension with the query are candidates, not the disjoint or empty ones with measure 1.
+                let measure = 1.0 - dot;
+                if !measure.is_finite() {
+                    return Err(SqliteMetadataError::NonFiniteSparseScore);
+                }
+                let candidate = (RecordMeasure { offset_id, measure }, id);
+                if best.len() < *candidate_limit as usize {
+                    best.push(candidate);
+                } else if best.peek().is_some_and(|worst| candidate.0 < worst.0) {
+                    best.pop();
+                    best.push(candidate);
+                }
+                Ok(())
+            };
+            if *candidate_limit > 0 && !query.indices.is_empty() {
+                let mut rows = sqlx::query_with(&sql, values).fetch(&mut *conn);
+                let mut current: Option<(u32, String, f32)> = None;
+                while let Some(row) = rows.try_next().await? {
+                    let offset_id: u32 = row.try_get(0)?;
+                    let id: String = row.try_get(1)?;
+                    let dim: u32 = row.try_get(2)?;
+                    let value = row.try_get::<f64, _>(3)? as f32;
+                    // Rows come by record, then by dimension: the products add up in the order of the dimensions.
+                    let product = weights.get(&dim).copied().unwrap_or_default() * value;
+                    match current.as_mut() {
+                        Some((current_offset, _, dot)) if *current_offset == offset_id => *dot += product,
+                        _ => {
+                            if let Some((done_offset, done_id, dot)) = current.take() {
+                                offer(done_offset, done_id, dot)?;
+                            }
+                            current = Some((offset_id, id, product));
+                        }
+                    }
+                }
+                if let Some((done_offset, done_id, dot)) = current.take() {
+                    offer(done_offset, done_id, dot)?;
+                }
+            }
+            let winners: Vec<_> = best
+                .into_sorted_vec()
+                .into_iter()
+                .skip(payload.limit.offset as usize)
+                .take(payload.limit.limit.unwrap_or(u32::MAX) as usize)
+                .collect();
+            let want_metadata = payload.select.keys.contains(&Key::Metadata)
+                || payload
+                    .select
+                    .keys
+                    .iter()
+                    .any(|k| matches!(k, Key::MetadataField(_)));
+            let want_document = payload.select.keys.contains(&Key::Document);
+            let mut projected = HashMap::new();
+            for batch in winners.chunks(500) {
+                let get = Get {
+                    scan: Scan {
+                        collection_and_segments: collection.clone(),
+                        shard_index: 0,
+                        num_shards: 1,
+                        log_upper_bound_offset: 0,
+                    },
+                    filter: Filter {
+                        query_ids: Some(batch.iter().map(|(_, id)| id.clone()).collect()),
+                        where_clause: None,
+                    },
+                    limit: Limit {
+                        offset: 0,
+                        limit: None,
+                    },
+                    proj: Projection {
+                        document: want_document,
+                        metadata: want_metadata,
+                        embedding: false,
+                    },
+                };
+                for record in self.get_with_connection(get, conn).await?.result.records {
+                    projected.insert(record.id.clone(), record);
+                }
+            }
+            let mut records = Vec::with_capacity(winners.len());
+            for (measure, id) in winners {
+                let Some(mut record) = projected.remove(&id) else {
+                    return Err(MetadataValueConversionError::InvalidValue.into());
+                };
+                if !payload.select.keys.contains(&Key::Metadata) {
+                    if let Some(metadata) = record.metadata.as_mut() {
+                        metadata.retain(|key, _| {
+                            payload
+                                .select
+                                .keys
+                                .contains(&Key::MetadataField(key.clone()))
+                        });
+                    }
+                }
+                records.push(SearchRecord {
+                    id,
+                    document: if want_document { record.document } else { None },
+                    embedding: None,
+                    metadata: if want_metadata { record.metadata } else { None },
+                    score: payload
+                        .select
+                        .keys
+                        .contains(&Key::Score)
+                        .then_some(measure.measure),
+                });
+            }
+            results.push(SearchPayloadResult { records });
+        }
+        Ok(SearchResult {
+            results,
+            pulled_log_bytes: 0,
         })
     }
 }
@@ -1637,6 +2068,817 @@ mod tests {
                 embedding: false,
                 metadata: true,
             },
+        }
+    }
+
+    fn exact_payload(query: Vec<(u32, f32)>, k: u32) -> chroma_types::plan::SearchPayload {
+        use chroma_types::operator::{Key, QueryVector, Rank, RankExpr, Select};
+        chroma_types::plan::SearchPayload {
+            rank: Rank {
+                expr: Some(RankExpr::Knn {
+                    query: QueryVector::Sparse(chroma_types::SparseVector::from_pairs(query)),
+                    key: Key::MetadataField("sparse".into()),
+                    limit: k,
+                    default: None,
+                    return_rank: false,
+                }),
+            },
+            select: Select {
+                keys: [Key::Metadata, Key::Document, Key::Score]
+                    .into_iter()
+                    .collect(),
+            },
+            ..Default::default()
+        }
+    }
+
+    async fn sparse_terms(db: &chroma_sqlite::db::SqliteDb) -> Vec<(String, u32, f64)> {
+        sqlx::query_as(
+            "SELECT embeddings.embedding_id, term.dim, term.value FROM embedding_metadata_sparse_term AS term \
+             JOIN embeddings ON embeddings.id = term.id ORDER BY embeddings.embedding_id, term.dim",
+        )
+        .fetch_all(db.get_conn())
+        .await
+        .unwrap()
+    }
+
+    // The term table follows every write of the sparse vectors through its triggers, and the search reads from it.
+    #[tokio::test]
+    async fn test_sparse_terms_follow_add_update_delete() {
+        let vector = |pairs: Vec<(u32, f32)>| {
+            Some(UpdateMetadataValue::SparseVector(
+                chroma_types::SparseVector::from_pairs(pairs),
+            ))
+        };
+        let (reader, cas) = setup_with_logs(vec![
+            sparse_log(1, "a", Operation::Add, vector(vec![(1, 0.5), (7, 0.25)])),
+            sparse_log(2, "b", Operation::Add, vector(vec![(2, 1.0)])),
+            sparse_log(3, "c", Operation::Add, vector(vec![])),
+        ])
+        .await;
+        assert_eq!(
+            sparse_terms(&reader.db).await,
+            vec![("a".into(), 1, 0.5), ("a".into(), 7, 0.25), ("b".into(), 2, 1.0)]
+        );
+        let writer = SqliteMetadataWriter {
+            db: reader.db.clone(),
+        };
+        let mut tx = writer.begin().await.unwrap();
+        writer
+            .apply_logs(
+                Chunk::new(
+                    vec![
+                        sparse_log(4, "a", Operation::Update, vector(vec![(7, 2.0)])),
+                        sparse_log(5, "b", Operation::Delete, None),
+                        sparse_log(6, "c", Operation::Upsert, vector(vec![(7, 0.5)])),
+                    ]
+                    .into(),
+                ),
+                cas.metadata_segment.id,
+                cas.collection.schema.clone(),
+                &mut *tx,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            sparse_terms(&reader.db).await,
+            vec![("a".into(), 7, 2.0), ("c".into(), 7, 0.5)]
+        );
+        let result = reader
+            .sparse_search(cas, vec![exact_payload(vec![(7, 1.0)], 10)])
+            .await
+            .unwrap();
+        assert_eq!(
+            result.results[0]
+                .records
+                .iter()
+                .map(|r| (r.id.as_str(), r.score.unwrap()))
+                .collect::<Vec<_>>(),
+            vec![("a", -1.0), ("c", 0.5)]
+        );
+    }
+
+    fn bm25_schema() -> chroma_types::Schema {
+        use chroma_types::{
+            KnnIndex, Schema, SparseIndexAlgorithm, SparseVectorIndexConfig, SparseVectorIndexType,
+            SparseVectorValueType,
+        };
+        let mut schema = Schema::new_default(KnnIndex::Hnsw);
+        schema.keys.entry("sparse".into()).or_default().sparse_vector = Some(SparseVectorValueType {
+            sparse_vector_index: Some(SparseVectorIndexType {
+                enabled: true,
+                config: SparseVectorIndexConfig {
+                    bm25: Some(true),
+                    embedding_function: None,
+                    source_key: None,
+                    algorithm: SparseIndexAlgorithm::Wand,
+                },
+            }),
+        });
+        schema
+    }
+
+    // The BM25 vectors of ChromaBm25EmbeddingFunction (chromadb 1.5.9, k 1.2, b 0.75, avg_doc_length 256) for the
+    // four documents of the Cloud comparison (CLOUD-PROVE.md), and of the query "fox".
+    fn bm25_documents() -> Vec<(&'static str, Vec<(u32, f32)>)> {
+        let doc = |indices: &[u32], value: f32| indices.iter().map(|i| (*i, value)).collect::<Vec<_>>();
+        vec![
+            ("fox1", doc(&[226376294, 741580288, 771291085, 1312749093, 1621867415, 1913189942], 1.6652868)),
+            ("fox2", doc(&[983533787, 1440641117, 1621867415, 1774389278, 1935863057, 2084400053], 1.6652868)),
+            ("ml", doc(&[34379837, 1228389567, 1299890214, 1644170059, 2088942923], 1.6697302)),
+            ("pie", doc(&[207604854, 662344706, 1085451005, 1180591805, 1481737067, 1985449994], 1.6652868)),
+        ]
+    }
+
+    async fn bm25_fox(fillers: u32) -> Vec<(String, f32)> {
+        let mut logs: Vec<_> = bm25_documents()
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, pairs))| {
+                sparse_log(
+                    i as i64 + 1,
+                    id,
+                    Operation::Add,
+                    Some(UpdateMetadataValue::SparseVector(
+                        chroma_types::SparseVector::from_pairs(pairs),
+                    )),
+                )
+            })
+            .collect();
+        // Records without the term, as the 300 fillers of the Cloud test: they change n, not n_t.
+        for f in 0..fillers {
+            logs.push(sparse_log(
+                10 + f as i64,
+                &format!("f{f}"),
+                Operation::Add,
+                Some(UpdateMetadataValue::SparseVector(
+                    chroma_types::SparseVector::from_pairs(vec![(f + 1, 1.0)]),
+                )),
+            ));
+        }
+        let (reader, mut cas) = setup_with_logs(logs).await;
+        cas.collection.schema = Some(bm25_schema());
+        let result = reader
+            .sparse_search(cas, vec![exact_payload(vec![(1621867415, 1.6877435)], 10)])
+            .await
+            .unwrap();
+        result.results[0]
+            .records
+            .iter()
+            .map(|r| (r.id.clone(), r.score.unwrap()))
+            .collect()
+    }
+
+    // BM25 with IDF as on Chroma Cloud once the collection is indexed: only fox1 and fox2, with the score of Cloud.
+    #[tokio::test]
+    async fn test_sparse_bm25_scores_of_chroma_cloud() {
+        // 4 records, n_t 2: the distributed cluster on AKS answered -0.9481 after compaction.
+        let four = bm25_fox(0).await;
+        assert_eq!(four.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), vec!["fox1", "fox2"]);
+        for (_, score) in &four {
+            assert!((score - (-0.9481)).abs() < 5e-5, "{score}");
+        }
+        // 304 records, n_t 2: Chroma Cloud answered -12.50207 (CLOUD-PROVE.md, test B, after indexing).
+        let many = bm25_fox(300).await;
+        assert_eq!(many.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), vec!["fox1", "fox2"]);
+        for (_, score) in &many {
+            assert!((score - (-12.50207)).abs() < 5e-6, "{score}");
+        }
+    }
+
+    // Without bm25 on the key the query is not weighted: 1 - q.d.
+    #[tokio::test]
+    async fn test_sparse_without_bm25_is_not_weighted() {
+        let (reader, cas) = setup_with_logs(
+            bm25_documents()
+                .into_iter()
+                .enumerate()
+                .map(|(i, (id, pairs))| {
+                    sparse_log(
+                        i as i64 + 1,
+                        id,
+                        Operation::Add,
+                        Some(UpdateMetadataValue::SparseVector(
+                            chroma_types::SparseVector::from_pairs(pairs),
+                        )),
+                    )
+                })
+                .collect(),
+        )
+        .await;
+        let result = reader
+            .sparse_search(cas, vec![exact_payload(vec![(1621867415, 1.6877435)], 10)])
+            .await
+            .unwrap();
+        for record in &result.results[0].records {
+            assert_eq!(record.score.unwrap(), 1.0 - 1.6877435_f32 * 1.6652868_f32);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sparse_exact_search_signed_disjoint_empty_and_pagination() {
+        use chroma_types::operator::Key;
+        let docs = [
+            ("a", vec![(1, -2.0)]),
+            ("b", vec![(9, 1.0)]),
+            ("c", vec![]),
+            ("d", vec![(1, 2.0)]),
+            ("e", vec![(1, 2.0)]),
+        ];
+        let mut logs: Vec<_> = docs
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, vector))| {
+                let mut log = sparse_log(
+                    i as i64 + 1,
+                    id,
+                    Operation::Add,
+                    Some(UpdateMetadataValue::SparseVector(
+                        chroma_types::SparseVector::from_pairs(vector),
+                    )),
+                );
+                log.record.document = Some(format!("document-{id}"));
+                log.record
+                    .metadata
+                    .as_mut()
+                    .unwrap()
+                    .insert("label".into(), UpdateMetadataValue::Str(id.into()));
+                log
+            })
+            .collect();
+        logs.push(sparse_log(6, "absent", Operation::Add, None));
+        let (reader, cas) = setup_with_logs(logs).await;
+        let full = exact_payload(vec![(1, 1.0)], 10);
+        let mut page = exact_payload(vec![(1, 1.0)], 2);
+        page.limit = Limit {
+            offset: 1,
+            limit: Some(3),
+        };
+        page.select.keys = [Key::MetadataField("label".into()), Key::Score]
+            .into_iter()
+            .collect();
+        let mut filtered = full.clone();
+        filtered.filter.query_ids = Some(vec!["a".into(), "b".into(), "c".into()]);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.sparse_search(cas.clone(), vec![full, page, filtered]),
+        )
+        .await
+        .expect("single-connection Search must not self-wait")
+        .unwrap();
+        let actual: Vec<_> = result.results[0]
+            .records
+            .iter()
+            .map(|row| (row.id.as_str(), row.score.unwrap()))
+            .collect();
+        // b shares no dimension with the query and c is empty: neither is a candidate.
+        assert_eq!(actual, vec![("d", -1.0), ("e", -1.0), ("a", 3.0)]);
+        assert_eq!(
+            result.results[0].records[0].document.as_deref(),
+            Some("document-d")
+        );
+        let page = &result.results[1].records;
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "e");
+        assert!(page[0].document.is_none());
+        assert_eq!(page[0].metadata.as_ref().unwrap().len(), 1);
+        assert!(page[0].metadata.as_ref().unwrap().contains_key("label"));
+        assert_eq!(
+            result.results[2]
+                .records
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        for keys in [
+            vec![],
+            vec![Key::Metadata],
+            vec![Key::MetadataField("label".into())],
+        ] {
+            let mut projection = exact_payload(vec![(1, 1.0)], 1);
+            projection.select.keys = keys.iter().cloned().collect();
+            let result = reader
+                .sparse_search(cas.clone(), vec![projection])
+                .await
+                .unwrap();
+            let record = &result.results[0].records[0];
+            assert_eq!(record.id, "d");
+            assert!(record.document.is_none());
+            assert!(record.score.is_none());
+            assert!(record.embedding.is_none());
+            if keys.is_empty() {
+                assert!(record.metadata.is_none());
+            } else if keys == vec![Key::Metadata] {
+                assert!(record.metadata.as_ref().unwrap().contains_key("sparse"));
+            } else {
+                assert_eq!(record.metadata.as_ref().unwrap().len(), 1);
+            }
+        }
+        let mut scalar_filtered = exact_payload(vec![(1, 1.0)], 10);
+        scalar_filtered.filter.where_clause = Some(chroma_types::Where::Metadata(
+            chroma_types::MetadataExpression {
+                key: "label".into(),
+                comparison: chroma_types::MetadataComparison::Primitive(
+                    chroma_types::PrimitiveOperator::Equal,
+                    chroma_types::MetadataValue::Str("a".into()),
+                ),
+            },
+        ));
+        let result = reader
+            .sparse_search(cas.clone(), vec![scalar_filtered])
+            .await
+            .unwrap();
+        assert_eq!(
+            result.results[0]
+                .records
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        for (wire_filter, expected) in [
+            (
+                serde_json::json!({"#id":{"$in":["a","b","c"]}}),
+                vec!["a"],
+            ),
+            (
+                serde_json::json!({"#id":{"$nin":["a","d","e"]}}),
+                vec![],
+            ),
+            (serde_json::json!({"#id":{"$eq":"a"}}), vec!["a"]),
+            (
+                serde_json::json!({"$and":[{"#id":{"$in":["a","d"]}},{"label":{"$eq":"a"}}]}),
+                vec!["a"],
+            ),
+            (
+                serde_json::json!({"$or":[{"#id":{"$eq":"a"}},{"label":{"$eq":"d"}}]}),
+                vec!["d", "a"],
+            ),
+            (
+                serde_json::json!({"#id":{"$ne":"a"}}),
+                vec!["d", "e"],
+            ),
+        ] {
+            let mut payload = exact_payload(vec![(1, 1.0)], 10);
+            payload.filter = serde_json::from_value(wire_filter).unwrap();
+            assert!(
+                payload.filter.query_ids.is_none(),
+                "exercise public Search wire filter"
+            );
+            let result = reader
+                .sparse_search(cas.clone(), vec![payload])
+                .await
+                .unwrap();
+            assert_eq!(
+                result.results[0]
+                    .records
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        let negative = reader
+            .sparse_search(cas.clone(), vec![exact_payload(vec![(1, -1.0)], 2)])
+            .await
+            .unwrap();
+        assert_eq!(
+            negative.results[0]
+                .records
+                .iter()
+                .map(|r| (r.id.as_str(), r.score.unwrap()))
+                .collect::<Vec<_>>(),
+            vec![("a", -1.0), ("d", 3.0)]
+        );
+        assert!(reader
+            .sparse_search(cas.clone(), vec![exact_payload(vec![], 0)])
+            .await
+            .unwrap()
+            .results[0]
+            .records
+            .is_empty());
+        let overflow = reader
+            .sparse_search(cas, vec![exact_payload(vec![(1, f32::MAX)], 2)])
+            .await;
+        assert!(
+            overflow.is_err(),
+            "nonfinite accumulated score is not silently serialized"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sparse_exact_search_ephemeral_and_cancelled_connection() {
+        use chroma_config::{registry::Registry, Configurable};
+        use chroma_sqlite::config::{MigrationHash, MigrationMode, SqliteDBConfig};
+        let db = chroma_sqlite::db::SqliteDb::try_from_config(
+            &SqliteDBConfig {
+                url: None,
+                hash_type: MigrationHash::MD5,
+                migration_mode: MigrationMode::Apply,
+            },
+            &Registry::new(),
+        )
+        .await
+        .unwrap();
+        let reader = SqliteMetadataReader { db: db.clone() };
+        let cas = CollectionAndSegments::test(3);
+        let connection = db.get_conn().acquire().await.unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            reader.sparse_search(cas.clone(), vec![exact_payload(vec![], 2)])
+        )
+        .await
+        .is_err());
+        drop(connection);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.sparse_search(cas, vec![exact_payload(vec![], 2)]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.results[0].records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sparse_exact_search_keeps_score_and_projection_in_snapshot() {
+        let mut initial = sparse_log(
+            1,
+            "record",
+            Operation::Add,
+            Some(UpdateMetadataValue::SparseVector(
+                chroma_types::SparseVector::from_pairs(vec![(1, 2.0)]),
+            )),
+        );
+        initial.record.document = Some("old".into());
+        let (reader, cas) = setup_with_logs(vec![initial]).await;
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(reader.db.get_conn())
+            .await
+            .unwrap();
+        let mut snapshot = reader.db.get_conn().begin().await.unwrap();
+        sqlx::query("SELECT seq_id FROM max_seq_id WHERE segment_id = ?")
+            .bind(cas.metadata_segment.id.to_string())
+            .fetch_optional(&mut *snapshot)
+            .await
+            .unwrap();
+        let writer = SqliteMetadataWriter {
+            db: reader.db.clone(),
+        };
+        let mut update = sparse_log(
+            2,
+            "record",
+            Operation::Update,
+            Some(UpdateMetadataValue::SparseVector(
+                chroma_types::SparseVector::from_pairs(vec![(1, -3.0)]),
+            )),
+        );
+        update.record.document = Some("new".into());
+        let mut tx = writer.begin().await.unwrap();
+        writer
+            .apply_logs(
+                Chunk::new(vec![update].into()),
+                cas.metadata_segment.id,
+                cas.collection.schema.clone(),
+                &mut *tx,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let old = reader
+            .sparse_search_with_connection(
+                cas.clone(),
+                vec![exact_payload(vec![(1, 1.0)], 2)],
+                &mut snapshot,
+            )
+            .await
+            .unwrap();
+        assert_eq!(old.results[0].records[0].score, Some(-1.0));
+        assert_eq!(old.results[0].records[0].document.as_deref(), Some("old"));
+        snapshot.commit().await.unwrap();
+        let new = reader
+            .sparse_search(cas, vec![exact_payload(vec![(1, 1.0)], 2)])
+            .await
+            .unwrap();
+        assert_eq!(new.results[0].records[0].score, Some(4.0));
+        assert_eq!(new.results[0].records[0].document.as_deref(), Some("new"));
+    }
+
+    #[tokio::test]
+    async fn test_sparse_presence_guard_tracks_same_chunk_and_committed_transitions() {
+        let sparse = || {
+            UpdateMetadataValue::SparseVector(chroma_types::SparseVector::from_pairs(vec![(
+                1, 2.0,
+            )]))
+        };
+        let (reader, cas) = setup_with_logs(vec![
+            sparse_log(1, "a", Operation::Add, Some(UpdateMetadataValue::Int(1))),
+            sparse_log(2, "a", Operation::Update, Some(sparse())),
+            sparse_log(3, "a", Operation::Update, Some(UpdateMetadataValue::Int(3))),
+            sparse_log(4, "b", Operation::Add, Some(sparse())),
+            sparse_log(5, "b", Operation::Update, Some(UpdateMetadataValue::None)),
+            sparse_log(6, "c", Operation::Add, Some(sparse())),
+            sparse_log(7, "c", Operation::Delete, None),
+            sparse_log(8, "c", Operation::Add, Some(UpdateMetadataValue::Int(4))),
+            sparse_log(9, "a", Operation::Add, Some(sparse())),
+            sparse_log(10, "missing", Operation::Update, Some(sparse())),
+        ])
+        .await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM embedding_metadata_sparse")
+            .fetch_one(reader.db.get_conn())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let records = reader
+            .get(make_get_plan(&cas, None))
+            .await
+            .unwrap()
+            .result
+            .records;
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records
+                .iter()
+                .find(|row| row.id == "a")
+                .unwrap()
+                .metadata
+                .as_ref()
+                .unwrap()["sparse"],
+            MetadataValue::Int(3)
+        );
+        assert_eq!(
+            records
+                .iter()
+                .find(|row| row.id == "c")
+                .unwrap()
+                .metadata
+                .as_ref()
+                .unwrap()["sparse"],
+            MetadataValue::Int(4)
+        );
+        let writer = SqliteMetadataWriter {
+            db: reader.db.clone(),
+        };
+        for (seq, value) in [
+            (11, sparse()),
+            (12, UpdateMetadataValue::Str("scalar".into())),
+        ] {
+            let mut tx = writer.begin().await.unwrap();
+            writer
+                .apply_logs(
+                    Chunk::new(vec![sparse_log(seq, "a", Operation::Update, Some(value))].into()),
+                    cas.metadata_segment.id,
+                    cas.collection.schema.clone(),
+                    &mut *tx,
+                )
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM embedding_metadata_sparse")
+            .fetch_one(reader.db.get_conn())
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a new chunk must discover previously committed sparse values"
+        );
+    }
+
+    fn sparse_log(
+        seq: i64,
+        id: &str,
+        operation: Operation,
+        value: Option<UpdateMetadataValue>,
+    ) -> LogRecord {
+        LogRecord {
+            log_offset: seq,
+            record: OperationRecord {
+                id: id.to_string(),
+                metadata: value.map(|value| HashMap::from([("sparse".to_string(), value)])),
+                document: None,
+                operation,
+                embedding: None,
+                encoding: None,
+            },
+        }
+    }
+
+    fn sparse_value(weight: f32) -> UpdateMetadataValue {
+        UpdateMetadataValue::SparseVector(
+            chroma_types::SparseVector::new_with_tokens(
+                vec![1, 4],
+                vec![weight, 0.0],
+                vec!["token one".to_string(), "λ".to_string()],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_sparse_metadata_roundtrip_tokens_and_empty() {
+        let empty = UpdateMetadataValue::SparseVector(
+            chroma_types::SparseVector::new(vec![], vec![]).unwrap(),
+        );
+        let (reader, cas) = setup_with_logs(vec![
+            sparse_log(1, "tokens", Operation::Add, Some(sparse_value(-2.0))),
+            sparse_log(2, "empty", Operation::Add, Some(empty.clone())),
+        ])
+        .await;
+        let result = reader.get(make_get_plan(&cas, None)).await.unwrap();
+        assert_eq!(result.result.records.len(), 2);
+        assert_eq!(
+            result.result.records[0].metadata.as_ref().unwrap()["sparse"],
+            MetadataValue::try_from(&sparse_value(-2.0)).unwrap()
+        );
+        assert_eq!(
+            result.result.records[1].metadata.as_ref().unwrap()["sparse"],
+            MetadataValue::try_from(&empty).unwrap()
+        );
+        let mut without_metadata = make_get_plan(&cas, None);
+        without_metadata.proj.metadata = false;
+        assert!(reader
+            .get(without_metadata)
+            .await
+            .unwrap()
+            .result
+            .records
+            .iter()
+            .all(|record| record.metadata.is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_sparse_metadata_operations_and_transitions() {
+        let (reader, cas) = setup_with_logs(vec![sparse_log(
+            1,
+            "row",
+            Operation::Add,
+            Some(sparse_value(1.0)),
+        )])
+        .await;
+        let writer = SqliteMetadataWriter::new(reader.db.clone());
+        let stages = vec![
+            (
+                Operation::Add,
+                Some(sparse_value(9.0)),
+                Some(sparse_value(1.0)),
+            ), // duplicate Add unchanged
+            (Operation::Update, None, Some(sparse_value(1.0))), // omitted key unchanged
+            (
+                Operation::Update,
+                Some(UpdateMetadataValue::Str("scalar".into())),
+                Some(UpdateMetadataValue::Str("scalar".into())),
+            ),
+            (
+                Operation::Update,
+                Some(sparse_value(2.0)),
+                Some(sparse_value(2.0)),
+            ),
+            (
+                Operation::Upsert,
+                Some(UpdateMetadataValue::IntArray(vec![1, 2])),
+                Some(UpdateMetadataValue::IntArray(vec![1, 2])),
+            ),
+            (
+                Operation::Upsert,
+                Some(sparse_value(3.0)),
+                Some(sparse_value(3.0)),
+            ),
+            (Operation::Update, Some(UpdateMetadataValue::None), None),
+            (
+                Operation::Upsert,
+                Some(sparse_value(4.0)),
+                Some(sparse_value(4.0)),
+            ),
+        ];
+        for (i, (op, value, expected)) in stages.into_iter().enumerate() {
+            let mut tx = writer.begin().await.unwrap();
+            writer
+                .apply_logs(
+                    Chunk::new(vec![sparse_log(i as i64 + 2, "row", op, value)].into()),
+                    cas.metadata_segment.id,
+                    None,
+                    &mut *tx,
+                )
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            let records = reader
+                .get(make_get_plan(&cas, None))
+                .await
+                .unwrap()
+                .result
+                .records;
+            let actual = records[0]
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("sparse"))
+                .cloned();
+            assert_eq!(
+                actual,
+                expected.map(|value| MetadataValue::try_from(&value).unwrap())
+            );
+            let sparse_rows: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM embedding_metadata_sparse")
+                    .fetch_one(reader.db.get_conn())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                sparse_rows,
+                i64::from(matches!(actual, Some(MetadataValue::SparseVector(_))))
+            );
+        }
+        let mut tx = writer.begin().await.unwrap();
+        writer
+            .apply_logs(
+                Chunk::new(
+                    vec![
+                        sparse_log(20, "missing", Operation::Update, Some(sparse_value(5.0))),
+                        sparse_log(21, "row", Operation::Delete, None),
+                    ]
+                    .into(),
+                ),
+                cas.metadata_segment.id,
+                None,
+                &mut *tx,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(reader
+            .get(make_get_plan(&cas, None))
+            .await
+            .unwrap()
+            .result
+            .records
+            .is_empty());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM embedding_metadata_sparse")
+            .fetch_one(reader.db.get_conn())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let mut tx = writer.begin().await.unwrap();
+        writer
+            .apply_logs(
+                Chunk::new(
+                    vec![sparse_log(
+                        22,
+                        "row",
+                        Operation::Upsert,
+                        Some(sparse_value(6.0)),
+                    )]
+                    .into(),
+                ),
+                cas.metadata_segment.id,
+                None,
+                &mut *tx,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            reader
+                .get(make_get_plan(&cas, None))
+                .await
+                .unwrap()
+                .result
+                .records[0]
+                .metadata
+                .as_ref()
+                .unwrap()["sparse"],
+            MetadataValue::try_from(&sparse_value(6.0)).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sparse_metadata_failure_rolls_back_batch_and_watermark() {
+        let writer = SqliteMetadataWriter::new(get_new_sqlite_db().await);
+        let cas = CollectionAndSegments::test(3);
+        let mut tx = writer.begin().await.unwrap();
+        let result = writer
+            .apply_logs(
+                Chunk::new(
+                    vec![
+                        sparse_log(1, "valid", Operation::Add, Some(sparse_value(1.0))),
+                        sparse_log(2, "invalid", Operation::Add, Some(sparse_value(f32::NAN))),
+                    ]
+                    .into(),
+                ),
+                cas.metadata_segment.id,
+                None,
+                &mut *tx,
+            )
+            .await;
+        assert!(result.is_err());
+        tx.rollback().await.unwrap();
+        for table in ["embeddings", "embedding_metadata_sparse", "max_seq_id"] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(writer.db.get_conn())
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "rollback left rows in {table}");
         }
     }
 

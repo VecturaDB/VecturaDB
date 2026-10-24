@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 from typing import Any, Dict, List, Optional, Sequence
 from uuid import UUID
 from chromadb import CollectionMetadata, Embeddings, IDs
@@ -255,6 +256,13 @@ class Bindings:
         tenant: str = DEFAULT_TENANT,
         database: str = DEFAULT_DATABASE,
     ) -> None: ...
+    def search(
+        self,
+        collection_id: str,
+        payload_json: str,
+        tenant: str = ...,
+        database: str = ...,
+    ) -> str: ...
     def count(
         self,
         collection_id: str,

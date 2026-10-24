@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use chroma_api_types::{StaleReadError as ApiStaleReadError, CONDITIONAL_WRITE_CONFLICT_MESSAGE};
 use chroma_error::{source_chain_contains, ChromaError, ErrorCodes};
 use chroma_log::PushLogsError;
@@ -70,6 +71,7 @@ impl From<ChromaPyError> for PyErr {
             ErrorCodes::PermissionDenied => AuthorizationError::new_err(message),
             ErrorCodes::NotFound => NotFoundError::new_err(message),
             ErrorCodes::Internal => InternalError::new_err(message),
+            ErrorCodes::Unimplemented => pyo3::exceptions::PyNotImplementedError::new_err(message),
             _ => InternalError::new_err(message),
         }
     }
