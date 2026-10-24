@@ -7,6 +7,8 @@
 
 # VecturaDB
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/VecturaDB/VecturaDB/badge)](https://scorecard.dev/viewer/?uri=github.com/VecturaDB/VecturaDB)
+
 VecturaDB was forked from the open-source [Chroma](https://github.com/chroma-core/chroma) project. It is not affiliated with Chroma.
 
 VecturaDB is an open-source vector database, compatible with the Chroma API. This repository keeps the full git history of Chroma and its Apache 2.0 license.
