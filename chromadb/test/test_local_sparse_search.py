@@ -56,15 +56,17 @@ def test_sparse_metadata_public_roundtrip(tmp_path: Path) -> None:
         assert collection.search(search.where(K.ID.not_in(["a"])))["ids"] == [[]]
         mixed = search.where({"$and": [{"#id": {"$eq": "a"}}, {"scalar": True}]})
         assert collection.search(mixed)["ids"] == [["a"]]
-        with pytest.raises(NotImplementedError, match="Local Search supports"):
-            collection.search(search.where({"#score": {"$eq": 0}}))
-        unsupported_filters: list[dict[str, Any]] = [
-            {"#id": {"$gt": "a"}},
+        # As in distributed Chroma, #id is the record id only for equality with a string, and #score is not a
+        # metadata key: these filters match no record.
+        no_match_filters: list[dict[str, Any]] = [
+            {"#score": {"$eq": 0}},
             {"#id": {"$eq": 1}},
         ]
-        for unsupported_filter in unsupported_filters:
-            with pytest.raises((ValueError, InvalidArgumentError, NotImplementedError)):
-                collection.search(search.where(unsupported_filter))
+        for no_match_filter in no_match_filters:
+            assert collection.search(search.where(no_match_filter))["ids"] == [[]]
+        # The parsing of the request, shared with distributed Chroma, rejects $gt on a string.
+        with pytest.raises(InvalidArgumentError, match="Invalid where clause"):
+            collection.search(search.where({"#id": {"$gt": "a"}}))
         collection.update(ids=["a"], metadatas=[{"sparse": empty}])
         collection.upsert(
             ids=["b"], embeddings=[[0.0, 1.0]], metadatas=[{"sparse": vector}]

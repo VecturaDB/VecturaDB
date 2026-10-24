@@ -403,86 +403,24 @@ impl LocalExecutor {
         F: Fn(tonic::Code) -> Fut,
         Fut: Future<Output = Result<Search, Box<dyn ChromaError>>>,
     {
-        use chroma_types::operator::{Key, QueryVector, RankExpr};
-        let unsupported = || {
-            ExecutorError::NotImplemented("Local Search supports one configured sparse KNN leaf, scalar filters, metadata/document/score projection and INDEX_AND_WAL only".to_string())
-        };
-        fn scalar_filter(filter: &chroma_types::Where) -> bool {
-            use chroma_types::{MetadataComparison, MetadataValue, Where};
-            match filter {
-                Where::Composite(expr) => expr.children.iter().all(scalar_filter),
-                Where::Document(_) => false,
-                Where::Metadata(expr) if expr.key == "#id" => matches!(
-                    &expr.comparison,
-                    MetadataComparison::Primitive(
-                        chroma_types::PrimitiveOperator::Equal
-                            | chroma_types::PrimitiveOperator::NotEqual,
-                        MetadataValue::Str(_)
-                    ) | MetadataComparison::Set(_, chroma_types::MetadataSetValue::Str(_))
-                ),
-                Where::Metadata(expr) if expr.key.starts_with('#') => false,
-                Where::Metadata(expr) => match &expr.comparison {
-                    MetadataComparison::Primitive(_, value) => matches!(
-                        value,
-                        MetadataValue::Bool(_)
-                            | MetadataValue::Int(_)
-                            | MetadataValue::Float(_)
-                            | MetadataValue::Str(_)
-                    ),
-                    MetadataComparison::Set(_, _) => true,
-                    MetadataComparison::ArrayContains(_, _) => false,
-                },
-            }
-        }
-        if plan.read_level != chroma_types::plan::ReadLevel::IndexAndWal {
-            return Err(unsupported());
-        }
-        let mut selected_key: Option<&str> = None;
-        for payload in &plan.payloads {
-            if !payload.group_by.keys.is_empty()
-                || payload.group_by.aggregate.is_some()
-                || payload.select.keys.contains(&Key::Embedding)
-                || payload
-                    .filter
-                    .where_clause
-                    .as_ref()
-                    .is_some_and(|filter| !scalar_filter(filter))
-            {
-                return Err(unsupported());
-            }
-            let Some(RankExpr::Knn {
-                query: QueryVector::Sparse(vector),
-                key: Key::MetadataField(key),
-                default: None,
-                return_rank: false,
-                ..
-            }) = &payload.rank.expr
-            else {
-                return Err(unsupported());
-            };
-            vector
-                .validate()
-                .map_err(|error| ExecutorError::Internal(Box::new(error)))?;
-            if vector.values.iter().any(|value| !value.is_finite()) {
-                return Err(unsupported());
-            }
-            if selected_key.is_some_and(|selected| selected != key) {
-                return Err(unsupported());
-            }
-            selected_key = Some(key);
-            let Some(schema) = &plan.scan.collection_and_segments.collection.schema else {
-                return Err(unsupported());
-            };
-            schema
-                .is_knn_key_indexing_enabled(key, &QueryVector::Sparse(vector.clone()))
-                .map_err(|error| ExecutorError::Internal(Box::new(error)))?;
-        }
-        // Validate every payload before replay; one unsupported payload must not
-        // execute a supported prefix of the request.
-        self.try_backfill_collection(&plan.scan.collection_and_segments)
+        // Every read level reads the same records: the local writes reach the indexes before they are acknowledged,
+        // and the replay below applies any write a previous process left in the log.
+        let hnsw_reader = self
+            .try_backfill_collection(&plan.scan.collection_and_segments)
             .await?;
+        // As distributed Chroma (rust/worker/src/server.rs:697-701): an uninitialized collection has no results.
+        if plan.scan.collection_and_segments.is_uninitialized() {
+            return Ok(SearchResult {
+                results: vec![Default::default(); plan.payloads.len()],
+                pulled_log_bytes: 0,
+            });
+        }
         self.metadata_reader
-            .sparse_search(plan.scan.collection_and_segments, plan.payloads)
+            .search(
+                plan.scan.collection_and_segments,
+                hnsw_reader.as_ref(),
+                plan.payloads,
+            )
             .await
             .map_err(|error| ExecutorError::Internal(Box::new(error)))
     }
