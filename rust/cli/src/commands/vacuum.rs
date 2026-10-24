@@ -29,19 +29,19 @@ use tokio::time::timeout;
 pub enum VacuumError {
     #[error("Path {0} does not exist")]
     PathDoesNotExist(String),
-    #[error("Failed to get size of of your Chroma directory")]
+    #[error("Failed to get size of of your VecturaDB directory")]
     DirSizeFailed,
-    #[error("Not a Chroma path: {0}")]
+    #[error("Not a VecturaDB path: {0}")]
     NotAChromaPath(String),
-    #[error("Cannot find Sqlite config for Chroma")]
+    #[error("Cannot find Sqlite config for VecturaDB")]
     SqliteConfigNotFound,
-    #[error("Failed to vacuum Chroma")]
+    #[error("Failed to vacuum VecturaDB")]
     VacuumFailed,
 }
 
 #[derive(Parser, Debug)]
 pub struct VacuumArgs {
-    #[clap(long, help = "The path of your Chroma DB")]
+    #[clap(long, help = "The path of your VecturaDB database")]
     path: Option<String>,
     #[clap(long, default_value_t = false, help = "Skip vacuum confirmation")]
     force: bool,
@@ -272,7 +272,7 @@ pub fn vacuum(args: VacuumArgs) -> Result<(), CliError> {
         None => return Err(VacuumError::SqliteConfigNotFound.into()),
     };
 
-    let runtime = tokio::runtime::Runtime::new().expect("Failed to start Chroma");
+    let runtime = tokio::runtime::Runtime::new().expect("Failed to start VecturaDB");
 
     let res = if let Some(secs) = args.timeout {
         runtime.block_on(async {

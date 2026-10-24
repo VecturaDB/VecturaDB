@@ -101,7 +101,7 @@ class FastAPI(BaseHTTPClient, ServerAPI):
         self._header["User-Agent"] = (
             "Chroma Python Client v"
             + __version__
-            + " (https://github.com/chroma-core/chroma)"
+            + " (https://github.com/VecturaDB/VecturaDB)"
         )
 
         if self._header is not None:

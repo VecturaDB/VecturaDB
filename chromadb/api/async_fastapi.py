@@ -135,7 +135,7 @@ class AsyncFastAPI(BaseHTTPClient, AsyncServerAPI):
             headers["User-Agent"] = (
                 "Chroma Python Client v"
                 + __version__
-                + " (https://github.com/chroma-core/chroma)"
+                + " (https://github.com/VecturaDB/VecturaDB)"
             )
 
             self._clients[loop_hash] = httpx.AsyncClient(

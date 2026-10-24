@@ -1,9 +1,9 @@
 [project]
-name = "chromadb"
+name = "VecturaDB"
 dynamic = ["version"]
 
 authors = [{ name = "Jeff Huber", email = "jeff@trychroma.com" }, { name = "Anton Troynikov", email = "anton@trychroma.com" }]
-description = "Chroma."
+description = "VecturaDB, compatible with the Chroma API."
 readme = "README.md"
 requires-python = ">=3.9"
 classifiers = ["Programming Language :: Python :: 3", "License :: OSI Approved :: Apache Software License", "Operating System :: OS Independent"]
@@ -34,8 +34,8 @@ ignore_errors = true
 chroma = "chromadb.cli.cli:app"
 
 [project.urls]
-"Homepage" = "https://github.com/chroma-core/chroma"
-"Bug Tracker" = "https://github.com/chroma-core/chroma/issues"
+"Homepage" = "https://github.com/VecturaDB/VecturaDB"
+"Bug Tracker" = "https://github.com/VecturaDB/VecturaDB/issues"
 
 [build-system]
 requires = ["setuptools>=61.0", "setuptools_scm[toml]>=6.2", "maturin>=1.0,<2.0"]

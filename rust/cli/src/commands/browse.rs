@@ -16,7 +16,7 @@ pub struct BrowseArgs {
     collection_name: String,
     #[clap(long = "db", help = "The Chroma Cloud DB name with your collection")]
     db_name: Option<String>,
-    #[clap(long, help = "Find this collection on a local Chroma server")]
+    #[clap(long, help = "Find this collection on a local VecturaDB server")]
     local: bool,
     #[clap(long, help = "Dark or Light theme for the collection browser")]
     theme: Option<Theme>,

@@ -2,12 +2,11 @@
 set -e
 
 # ----------------------------------------------
-# Chroma CLI Installer Script
+# VecturaDB CLI Installer Script
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/chroma-core/chroma/main/rust/cli/install/install.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/VecturaDB/VecturaDB/main/rust/cli/install/install.sh | bash
 # ----------------------------------------------
-REPO="chroma-core/chroma"
-RELEASE="cli-1.4.4"
+REPO="VecturaDB/VecturaDB"
 
 OS=$(uname -s)
 ARCH=$(uname -m)
@@ -15,17 +14,21 @@ ASSET=""
 
 case "$OS" in
   Linux*)
-    ASSET="chroma-linux"
+    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+      ASSET="chroma-linux-aarch64"
+    else
+      ASSET="chroma-linux-x86_64"
+    fi
     ;;
   Darwin*)
     if [ "$ARCH" = "arm64" ]; then
       ASSET="chroma-macos-arm64"
     else
-      ASSET="chroma-macos-intel"
+      ASSET="chroma-macos-x64"
     fi
     ;;
   MINGW*|MSYS*|CYGWIN*)
-    ASSET="chroma-windows.exe"
+    ASSET="chroma-windows-x64.exe"
     ;;
   *)
     echo "Unsupported OS: $OS"
@@ -33,7 +36,12 @@ case "$OS" in
     ;;
 esac
 
-DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${RELEASE}/${ASSET}"
+TAG=$(curl -sSL "https://api.github.com/repos/${REPO}/releases?per_page=1" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+if [ -z "$TAG" ]; then
+  echo "No release found in ${REPO}"
+  exit 1
+fi
+DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
 echo "Downloading ${ASSET} from ${DOWNLOAD_URL}..."
 curl -L "$DOWNLOAD_URL" -o chroma
 

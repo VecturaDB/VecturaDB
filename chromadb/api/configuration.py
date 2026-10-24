@@ -321,7 +321,7 @@ class HNSWConfigurationInternal(ConfigurationInternal):
 # about that and instead get a clean constructor with default arguments.
 class HNSWConfigurationInterface(HNSWConfigurationInternal):
     """HNSW index configuration parameters.
-    See https://docs.trychroma.com/guides#changing-the-distance-function for more information.
+    See https://github.com/VecturaDB/VecturaDB for more information.
     """
 
     def __init__(

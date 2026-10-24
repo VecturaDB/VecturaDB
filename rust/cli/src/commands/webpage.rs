@@ -8,15 +8,13 @@ pub enum WebPageError {
 }
 
 pub enum WebPageCommand {
-    Discord,
     Docs,
 }
 
 impl WebPageCommand {
     fn url(&self) -> &'static str {
         match self {
-            WebPageCommand::Discord => "https://discord.gg/MMeYNTmh3x",
-            WebPageCommand::Docs => "https://docs.trychroma.com",
+            WebPageCommand::Docs => "https://github.com/VecturaDB/VecturaDB",
         }
     }
 }

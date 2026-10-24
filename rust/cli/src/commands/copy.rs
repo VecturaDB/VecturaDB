@@ -58,7 +58,7 @@ pub struct CopyArgs {
     #[clap(
         long = "from-local",
         conflicts_with_all = ["from_cloud", "to_local"],
-        help = "Copy from a local Chroma server"
+        help = "Copy from a local VecturaDB server"
     )]
     from_local: bool,
     #[clap(long = "from-cloud", conflicts_with_all = ["to_cloud", "from_local"], help = "Copy from Chroma Cloud")]
@@ -66,16 +66,16 @@ pub struct CopyArgs {
     #[clap(
         long = "to-local",
         conflicts_with = "to_cloud",
-        help = "Copy to a local Chroma server"
+        help = "Copy to a local VecturaDB server"
     )]
     to_local: bool,
     #[clap(long = "to-cloud", help = "Copy to Chroma Cloud")]
     to_cloud: bool,
     #[clap(long = "db", help = "Chroma Cloud DB with the collections to copy")]
     db: Option<String>,
-    #[clap(long = "host", conflicts_with_all = ["path"], help = "Local Chroma server host")]
+    #[clap(long = "host", conflicts_with_all = ["path"], help = "Local VecturaDB server host")]
     host: Option<String>,
-    #[clap(long = "path", help = "Data path for your local Chroma server")]
+    #[clap(long = "path", help = "Data path for your local VecturaDB server")]
     path: Option<String>,
     #[clap(
         long = "batch",
@@ -94,7 +94,7 @@ pub struct CopyArgs {
 }
 
 fn select_chroma_server_prompt() -> &'static str {
-    "What Chroma server has the collection(s) you want to copy?"
+    "What server has the collection(s) you want to copy?"
 }
 
 fn select_db_prompt(from: bool) -> String {

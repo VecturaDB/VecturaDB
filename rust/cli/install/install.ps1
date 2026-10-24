@@ -1,22 +1,23 @@
-# Chroma CLI Installer Script for Windows (PowerShell)
+# VecturaDB CLI Installer Script for Windows (PowerShell)
 # Usage:
-#   iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/chroma-core/chroma/main/rust/cli/install/install.ps1'))
+#   iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/VecturaDB/VecturaDB/main/rust/cli/install/install.ps1'))
 
 $ErrorActionPreference = 'Stop'
 
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
 if ($isAdmin) {
-    $expectedInstallDir = Join-Path $env:ProgramFiles "Chroma"
+    $expectedInstallDir = Join-Path $env:ProgramFiles "VecturaDB"
 } else {
     $expectedInstallDir = Join-Path $env:USERPROFILE "bin"
 }
 $expectedInstallPath = Join-Path $expectedInstallDir "chroma.exe"
 
-$repo    = "chroma-core/chroma"
-$release = "cli-1.4.4"
-$asset   = "chroma-windows.exe"
+$repo    = "VecturaDB/VecturaDB"
+$asset   = "chroma-windows-x64.exe"
 
-$downloadUrl = "https://github.com/$repo/releases/download/$release/$asset"
+$tag = @(Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=1" -Headers @{ "User-Agent" = "VecturaDB-installer" })[0].tag_name
+if (-not $tag) { throw "No release found in $repo" }
+$downloadUrl = "https://github.com/$repo/releases/download/$tag/$asset"
 Write-Host "Downloading $asset from $downloadUrl ..."
 
 $tempFile = Join-Path $env:TEMP "chroma.exe"
@@ -28,7 +29,7 @@ if (-not (Test-Path $expectedInstallDir)) {
 
 Move-Item -Path $tempFile -Destination $expectedInstallPath -Force
 
-Write-Host "Chroma has been installed to: $expectedInstallPath"
+Write-Host "VecturaDB has been installed to: $expectedInstallPath"
 
 $pathDirs = $env:PATH -split ';'
 if ($pathDirs -notcontains $expectedInstallDir) {

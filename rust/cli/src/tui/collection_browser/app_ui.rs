@@ -161,7 +161,7 @@ impl AppUI {
     // ======= Main Screen ========
 
     fn main_title(&self, app_state: &AppState, max_visible_rows: usize) -> String {
-        let title = format!(" Browsing Chroma Collection: {}", app_state.collection_name);
+        let title = format!(" Browsing Collection: {}", app_state.collection_name);
 
         if app_state.records.is_empty() {
             return title;

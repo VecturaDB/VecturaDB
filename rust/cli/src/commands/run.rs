@@ -16,7 +16,7 @@ pub enum RunError {
     ConfigFileNotFound(String),
     #[error("Address {0}:{1} is not available")]
     AddressUnavailable(String, u16),
-    #[error("Failed to start a Chroma server")]
+    #[error("Failed to start a VecturaDB server")]
     ServerStartFailed,
 }
 
@@ -25,14 +25,14 @@ pub struct RunArgs {
     #[clap(
         index = 1,
         conflicts_with_all = &["path", "host", "port"],
-        help = "The path to the Chroma config file"
+        help = "The path to the VecturaDB config file"
     )]
     config_path: Option<String>,
 
     #[clap(
         long,
         conflicts_with = "config_path",
-        help = "The persistence path to your Chroma DB"
+        help = "The persistence path to your VecturaDB database"
     )]
     path: Option<String>,
 
@@ -90,21 +90,16 @@ fn display_run_message(config: &FrontendServerConfig, term: &mut dyn Terminal) {
 
     term.println(&format!("Saving data to: {}", config.persist_path.bold()));
     term.println(&format!(
-        "Connect to Chroma at: {}",
+        "Connect to VecturaDB at: {}",
         format!("http://localhost:{}", config.port)
             .underline()
             .blue()
     ));
     term.println(&format!(
         "Getting started guide: {}",
-        "https://docs.trychroma.com/docs/overview/getting-started\n"
+        "https://github.com/VecturaDB/VecturaDB\n"
             .underline()
             .blue()
-    ));
-    term.println(&format!(
-        "☁️ To deploy your DB - try Chroma Cloud!\n- Sign up: {}\n- Copy your data to Cloud: {}\n",
-        "https://trychroma.com/signup".underline().blue(),
-        "chroma copy --to-cloud --all".yellow()
     ));
 }
 
@@ -168,7 +163,7 @@ mod tests {
         display_run_message(&config, &mut term);
 
         let output = term.output.join("\n");
-        assert!(output.contains("Connect to Chroma at"));
+        assert!(output.contains("Connect to VecturaDB at"));
         assert!(output.contains("Saving data to"));
     }
 }

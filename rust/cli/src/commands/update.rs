@@ -7,17 +7,17 @@ use serde::Deserialize;
 use std::error::Error;
 use thiserror::Error;
 
-const GITHUB_RELEASES_URL: &str = "https://api.github.com/repos/chroma-core/chroma/releases";
-const UNIX_CURL: &str = "curl -sSL https://raw.githubusercontent.com/chroma-core/chroma/main/rust/cli/install/install.sh | bash";
-const WINDOWS_CURL: &str = "iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/chroma-core/chroma/main/rust/cli/install/install.ps1'))";
+const GITHUB_RELEASES_URL: &str = "https://api.github.com/repos/VecturaDB/VecturaDB/releases";
+const UNIX_CURL: &str = "curl -sSL https://raw.githubusercontent.com/VecturaDB/VecturaDB/main/rust/cli/install/install.sh | bash";
+const WINDOWS_CURL: &str = "iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/VecturaDB/VecturaDB/main/rust/cli/install/install.ps1'))";
 
 #[derive(Debug, Error)]
 pub enum UpdateError {
-    #[error("Failed to fetch the latest Chroma CLI version")]
+    #[error("Failed to fetch the latest VecturaDB CLI version")]
     FailedVersionFetch,
-    #[error("Failed to get the current Chroma CLI version")]
+    #[error("Failed to get the current VecturaDB CLI version")]
     CurrentVersionUndetected,
-    #[error("Failed to update the Chroma CLI")]
+    #[error("Failed to update the VecturaDB CLI")]
     UpdateFailed,
 }
 
@@ -39,7 +39,7 @@ async fn version_check(
         .json::<Vec<Release>>()
         .await?;
 
-    let cli_version_pattern = Regex::new(r"^cli-(\d+\.\d+\.\d+)$")?;
+    let cli_version_pattern = Regex::new(r"^v(\d+\.\d+\.\d+(?:-preview\.\d+)?)$")?;
     let mut cli_versions = Vec::new();
 
     for release in releases {
@@ -65,11 +65,11 @@ async fn version_check(
     if latest == current_version {
         term.println(&format!(
             "{}",
-            "Your Chroma CLI version is up-to-date!".green()
+            "Your VecturaDB CLI version is up-to-date!".green()
         ));
     } else {
         term.println(&format!(
-            "A new version of the Chroma CLI is available! To upgrade to version {} run",
+            "A new version of the VecturaDB CLI is available! To upgrade to version {} run",
             latest
         ));
         if cfg!(target_os = "windows") {
