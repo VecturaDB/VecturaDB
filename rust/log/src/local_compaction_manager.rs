@@ -1,3 +1,5 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
+use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 
 use crate::Log;
@@ -31,7 +33,16 @@ pub struct LocalCompactionManager {
     hnsw_segment_manager: LocalSegmentManager,
     sysdb: SysDb,
     metrics: LocalCompactionMetrics,
+    // Collections with nothing left to purge when last checked. The watermarks that bound a purge move when a
+    // backfill applies logs, or when an index loads a newer checkpoint: a new instance, which replays through a
+    // backfill before a read or a write goes on. Each backfill forgets its collection, any other purge request
+    // skips SQLite. A change missed here only delays a purge, which never decides what a read returns.
+    purged: HashSet<CollectionUuid>,
 }
+
+// Forgetting a collection costs one more check, so the set is emptied instead of growing with every collection
+// a long-running server has read.
+const MAX_PURGED_COLLECTIONS: usize = 65_536;
 
 /// Counters for expensive local recovery work, with an injectable meter for tests.
 #[derive(Clone)]
@@ -84,6 +95,7 @@ impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
             hnsw_segment_manager,
             sysdb,
             metrics: registry.get::<LocalCompactionMetrics>().unwrap_or_default(),
+            purged: HashSet::new(),
         };
         registry.register(res.clone());
         Ok(res)
@@ -173,6 +185,8 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
         message: BackfillMessage,
         _: &ComponentContext<LocalCompactionManager>,
     ) -> Self::Result {
+        // Applying logs moves the watermarks, even when the backfill fails part way.
+        self.purged.remove(&message.collection_id);
         self.metrics.replay_attempts.add(1, &[]);
         let mut collection_and_segments = self
             .sysdb
@@ -316,9 +330,27 @@ impl Handler<PurgeLogsMessage> for LocalCompactionManager {
         message: PurgeLogsMessage,
         _: &ComponentContext<LocalCompactionManager>,
     ) -> Self::Result {
+        // Every read asks for a purge, to retry one that failed: one that succeeded holds until a backfill.
+        if self.purged.contains(&message.collection_id) {
+            return Ok(());
+        }
+        self.purge_logs(message.collection_id).await?;
+        if self.purged.len() >= MAX_PURGED_COLLECTIONS {
+            self.purged.clear();
+        }
+        self.purged.insert(message.collection_id);
+        Ok(())
+    }
+}
+
+impl LocalCompactionManager {
+    async fn purge_logs(
+        &mut self,
+        collection_id: CollectionUuid,
+    ) -> Result<(), CompactionManagerError> {
         let collection_segments = self
             .sysdb
-            .get_collection_with_segments(None, message.collection_id)
+            .get_collection_with_segments(None, collection_id)
             .await?;
         // Read durable watermarks without loading HNSW, but do not trust a
         // watermark when its checkpoint has since become unusable.
@@ -330,7 +362,7 @@ impl Handler<PurgeLogsMessage> for LocalCompactionManager {
         .await?;
         if let Log::Sqlite(log) = &mut self.log {
             if !log
-                .has_purge_work(message.collection_id, max_seq_id)
+                .has_purge_work(collection_id, max_seq_id)
                 .await
                 .map_err(|_| CompactionManagerError::PurgeLogsFailure)?
             {
@@ -345,7 +377,7 @@ impl Handler<PurgeLogsMessage> for LocalCompactionManager {
                 .map_err(CompactionManagerError::UnsafeHnswCheckpoint)?;
         }
         self.log
-            .purge_logs(message.collection_id, max_seq_id)
+            .purge_logs(collection_id, max_seq_id)
             .await
             .map_err(|_| CompactionManagerError::PurgeLogsFailure)
     }

@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use super::*;
 use crate::sqlite_log::{LegacyEmbeddingsQueueConfig, SqliteLog, SqlitePushLogsError};
 use chroma_segment::local_segment_manager::LocalSegmentManagerConfig;
@@ -87,6 +88,7 @@ impl Fixture {
             hnsw_segment_manager: manager.clone(),
             metrics: LocalCompactionMetrics::default(),
             sysdb: SysDb::Test(sysdb.clone()),
+            purged: HashSet::new(),
         });
         Self {
             db,
@@ -216,6 +218,7 @@ impl Fixture {
             hnsw_segment_manager: manager.clone(),
             metrics: LocalCompactionMetrics::default(),
             sysdb: SysDb::Test(self.sysdb.clone()),
+            purged: HashSet::new(),
         });
     }
 
@@ -326,6 +329,119 @@ async fn purge_disabled_preserves_all_records() {
         .unwrap();
     f.purge().await.unwrap();
     assert_records(f.records().await, original);
+    f.stop().await;
+}
+
+// Hides the tables a purge reads, so that any purge which reads SQLite fails.
+async fn hide_purge_tables(db: &SqliteDb, hide: bool) {
+    for table in ["max_seq_id", "embeddings_queue", "embeddings_queue_config"] {
+        let (from, to) = if hide {
+            (table.to_string(), format!("hidden_{table}"))
+        } else {
+            (format!("hidden_{table}"), table.to_string())
+        };
+        sqlx::query(&format!("ALTER TABLE {from} RENAME TO {to}"))
+            .execute(db.get_conn())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn purge_without_backfill_since_the_last_check_reads_nothing() {
+    let mut f = Fixture::new().await;
+    let original = f.seed().await;
+    f.checkpoint().await;
+    f.watermark(f.metadata, 3).await;
+    f.watermark(f.vector, 3).await;
+    f.purge().await.unwrap();
+    let expected: Vec<_> = original.into_iter().filter(|r| r.log_offset >= 3).collect();
+    assert_records(f.records().await, expected.clone());
+    // Every read asks for a purge: with nothing applied since the last check, there is nothing to read.
+    hide_purge_tables(&f.db, true).await;
+    let repeated = f.purge().await;
+    hide_purge_tables(&f.db, false).await;
+    assert!(repeated.is_ok(), "{repeated:?}");
+    assert_records(f.records().await, expected);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn failed_purge_is_checked_again_by_the_next_request() {
+    let mut f = Fixture::new().await;
+    let original = f.seed().await;
+    f.checkpoint().await;
+    f.watermark(f.metadata, 3).await;
+    f.watermark(f.vector, 3).await;
+    hide_purge_tables(&f.db, true).await;
+    let failed = f.purge().await;
+    hide_purge_tables(&f.db, false).await;
+    assert!(failed.is_err());
+    assert_records(f.records().await, original.clone());
+    f.purge().await.unwrap();
+    assert_records(
+        f.records().await,
+        original.into_iter().filter(|r| r.log_offset >= 3).collect(),
+    );
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn backfill_makes_the_next_purge_check_again() {
+    let mut f = Fixture::new().await;
+    let original = f.seed().await;
+    f.checkpoint().await;
+    f.watermark(f.metadata, 3).await;
+    f.watermark(f.vector, 3).await;
+    f.purge().await.unwrap();
+    // As a write: the backfill moves the watermarks, the next purge deletes what they now allow.
+    f.watermark(f.metadata, 5).await;
+    f.watermark(f.vector, 5).await;
+    f.handle
+        .request(
+            BackfillMessage {
+                collection_id: f.collection.collection_id,
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    f.purge().await.unwrap();
+    assert_records(
+        f.records().await,
+        original.into_iter().filter(|r| r.log_offset >= 5).collect(),
+    );
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn failed_backfill_still_makes_the_next_purge_check_again() {
+    let mut f = Fixture::new().await;
+    let original = f.seed().await;
+    f.checkpoint().await;
+    f.watermark(f.metadata, 3).await;
+    f.watermark(f.vector, 3).await;
+    f.purge().await.unwrap();
+    f.watermark(f.metadata, 5).await;
+    f.watermark(f.vector, 5).await;
+    f.break_collection_configuration();
+    let backfill = f
+        .handle
+        .request(
+            BackfillMessage {
+                collection_id: f.collection.collection_id,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(backfill.is_err(), "{backfill:?}");
+    f.purge().await.unwrap();
+    assert_records(
+        f.records().await,
+        original.into_iter().filter(|r| r.log_offset >= 5).collect(),
+    );
     f.stop().await;
 }
 
