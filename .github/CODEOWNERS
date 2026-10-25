@@ -1,4 +1,3 @@
-# CODEOWNERS for Rust components
-rust/error/ @codetheweb @rescrv
-rust/api_types/ @codetheweb @rescrv
-rust/chroma/ @codetheweb @rescrv
+# Changed from the original Chroma file; see the git history for the changes and their authors.
+# The maintainers of VecturaDB review every change.
+* @VecturaDB/maintainers
