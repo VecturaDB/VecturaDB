@@ -34,7 +34,7 @@ jobs:
         arch: [x86_64, aarch64]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: CLI version from the release tag
         if: inputs.version != ''
         shell: bash
@@ -49,7 +49,7 @@ jobs:
       - run: pip install "cargo-zigbuild==0.23.4" "ziglang==0.13.0"
       - run: cargo zigbuild --bin chroma --release --manifest-path rust/cli/Cargo.toml --target ${{ matrix.arch }}-unknown-linux-gnu.2.17
       - run: cp target/${{ matrix.arch }}-unknown-linux-gnu/release/chroma chroma-linux-${{ matrix.arch }}
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cli-linux-${{ matrix.arch }}
           path: chroma-linux-${{ matrix.arch }}
@@ -58,7 +58,7 @@ jobs:
     name: CLI Windows x64
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: CLI version from the release tag
         if: inputs.version != ''
         shell: bash
@@ -71,7 +71,7 @@ jobs:
           install-nextest: "false"
       - run: cargo build --bin chroma --release --manifest-path rust/cli/Cargo.toml
       - run: copy target\release\chroma.exe chroma-windows-x64.exe
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cli-windows-x64
           path: chroma-windows-x64.exe
@@ -85,7 +85,7 @@ jobs:
           - { target: x86_64-apple-darwin, name: x64 }
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: CLI version from the release tag
         if: inputs.version != ''
         shell: bash
@@ -99,7 +99,7 @@ jobs:
           install-nextest: "false"
       - run: cargo build --bin chroma --release --manifest-path rust/cli/Cargo.toml --target ${{ matrix.target }}
       - run: cp target/${{ matrix.target }}/release/chroma chroma-macos-${{ matrix.name }}
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cli-macos-${{ matrix.name }}
           path: chroma-macos-${{ matrix.name }}
@@ -117,7 +117,7 @@ jobs:
           - { os: macos, runner: macos-14, target: aarch64 }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
       - name: CLI version from the release tag
@@ -126,7 +126,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: perl -0pi -e 's/^version = ".*"/version = "$ENV{VERSION}"/m' rust/cli/Cargo.toml && grep -m1 '^version' rust/cli/Cargo.toml
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
       - name: Python protos, as idl/makefile proto_python
@@ -145,15 +145,15 @@ jobs:
           version=$(python -c "import sys; from packaging.version import Version; print(Version(sys.argv[1]))" "${VERSION:-$(python -m setuptools_scm)}")
           python -c "import toml; d = toml.load('pyproject.toml'); d['project']['version'] = '$version'; d['project']['dynamic'] = []; toml.dump(d, open('pyproject.toml', 'w'))"
           echo "Version: $version"
-      - uses: arduino/setup-protoc@v3
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ github.token }}
-      - uses: PyO3/maturin-action@v1
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.target }}
           args: --release --out dist ${{ matrix.os == 'linux' && '--zig --compatibility manylinux2014' || '' }}
           container: "off"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheel-${{ matrix.os }}-${{ matrix.target }}
           path: dist
@@ -163,8 +163,8 @@ jobs:
     needs: cli-linux
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           pattern: cli-linux-*
           merge-multiple: true
@@ -173,13 +173,13 @@ jobs:
           mkdir ctx
           cp vecturadb/docker/Dockerfile vecturadb/docker/config.yaml ctx/
           cp chroma-linux-x86_64 ctx/chroma-amd64 && cp chroma-linux-aarch64 ctx/chroma-arm64 && chmod +x ctx/chroma-*
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Build amd64 and arm64
         run: docker buildx build --platform linux/amd64,linux/arm64 --build-arg REVISION=${{ github.sha }} -t ghcr.io/vecturadb/vecturadb:ci ctx
       - name: Load amd64 for the smoke test
         run: docker buildx build --platform linux/amd64 --build-arg REVISION=${{ github.sha }} --load -t ghcr.io/vecturadb/vecturadb:ci ctx
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
       - run: pip install chromadb-client
@@ -198,7 +198,7 @@ jobs:
       RUST_BACKTRACE: 1
       RUST_MIN_STACK_SIZE: 8388608
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust
         with:
           github-token: ${{ github.token }}
@@ -218,11 +218,11 @@ jobs:
     needs: wheels
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/python
         with:
           python-version: "3.11"
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: wheel-linux-x86_64
           path: dist
