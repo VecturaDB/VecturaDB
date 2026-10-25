@@ -28,7 +28,7 @@ pip uninstall -y chromadb
 pip install VecturaDB
 ```
 
-The `VecturaDB` package replaces `chromadb`: the import name stays `chromadb`, so existing code runs as it is.
+The `VecturaDB` package keeps the import name `chromadb`, so existing code runs as it is.
 
 ```python
 import chromadb
