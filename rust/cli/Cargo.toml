@@ -2,7 +2,7 @@
 # Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
 [package]
 name = "chroma-cli"
-version = "1.0.0-preview.2"
+version = "1.0.0-preview.4"
 edition = "2021"
 
 [dependencies]
