@@ -1,12 +1,18 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
+use chroma_blockstore::{config::BlockfileProviderConfig, provider::BlockfileProvider};
 use chroma_cache::{AysncPartitionedMutex, Cache, CacheConfig, CacheError, FoyerCacheConfig};
 use chroma_config::{
     registry::{Injectable, Registry},
     Configurable,
 };
 use chroma_error::{ChromaError, ErrorCodes};
-use chroma_index::IndexUuid;
+use chroma_index::{
+    config::{HnswProviderConfig, SpannProviderConfig},
+    hnsw_provider::HnswIndexProvider,
+    IndexUuid,
+};
 use chroma_sqlite::db::SqliteDb;
+use chroma_storage::{local::LocalStorage, Storage};
 use chroma_types::{Collection, Segment, SegmentUuid};
 use sea_query_binder::SqlxBinder;
 use serde::{Deserialize, Serialize};
@@ -22,6 +28,7 @@ use crate::local_hnsw::{
     validate_checkpoint, Inner, LocalHnswIndex, LocalHnswSegmentReader,
     LocalHnswSegmentReaderError, LocalHnswSegmentWriter, LocalHnswSegmentWriterError,
 };
+use crate::spann_provider::SpannProvider;
 
 fn default_hnsw_index_pool_cache_config() -> CacheConfig {
     CacheConfig::Memory(FoyerCacheConfig {
@@ -51,6 +58,56 @@ pub struct LocalSegmentManager {
     cleanup_task: Option<Arc<CleanupTask>>,
     sqlite: SqliteDb,
     persist_root: Option<String>,
+    spann_provider: Option<SpannProvider>,
+}
+
+#[derive(Error, Debug)]
+#[error("Error reading the defaults of the SPANN providers: {0}")]
+struct SpannDefaultsError(serde_json::Error);
+
+impl ChromaError for SpannDefaultsError {
+    fn code(&self) -> ErrorCodes {
+        ErrorCodes::Internal
+    }
+}
+
+// The providers of the SPANN index, as the worker of distributed Chroma builds them with the defaults of its
+// configuration, on local storage at the data path: the blockfiles, and the HNSW index of the centers.
+async fn local_spann_provider(
+    persist_path: &str,
+    registry: &Registry,
+) -> Result<SpannProvider, Box<dyn ChromaError>> {
+    let storage = Storage::Local(LocalStorage::new(persist_path));
+    let blockfile_provider = BlockfileProvider::try_from_config(
+        &(BlockfileProviderConfig::default(), storage.clone()),
+        registry,
+    )
+    .await?;
+    let defaults = |e| -> Box<dyn ChromaError> { Box::new(SpannDefaultsError(e)) };
+    let mut hnsw_config: HnswProviderConfig = serde_json::from_str("{}").map_err(defaults)?;
+    hnsw_config.hnsw_cache_config = CacheConfig::Memory(FoyerCacheConfig {
+        capacity: 64,
+        ..Default::default()
+    });
+    let hnsw_provider =
+        HnswIndexProvider::try_from_config(&(hnsw_config, storage.clone()), registry).await?;
+    let spann_config: SpannProviderConfig = serde_json::from_str("{}").map_err(defaults)?;
+    #[cfg(not(feature = "usearch"))]
+    let config = (hnsw_provider, blockfile_provider, spann_config);
+    #[cfg(feature = "usearch")]
+    let config = {
+        let usearch_cache =
+            chroma_cache::from_config(&spann_config.usearch_provider.cache_config).await?;
+        let usearch_provider =
+            chroma_index::usearch::USearchIndexProvider::new(storage, usearch_cache);
+        (
+            hnsw_provider,
+            blockfile_provider,
+            spann_config,
+            usearch_provider,
+        )
+    };
+    SpannProvider::try_from_config(&config, registry).await
 }
 
 #[derive(Debug)]
@@ -82,6 +139,10 @@ impl Configurable<LocalSegmentManagerConfig> for LocalSegmentManager {
                 index.close().await;
             }
         });
+        let spann_provider = match &config.persist_path {
+            Some(persist_path) => Some(local_spann_provider(persist_path, registry).await?),
+            None => None,
+        };
         let mut res = Self {
             hnsw_index_pool: hnsw_index_pool.into(),
             live_indexes: AysncPartitionedMutex::with_parallelism(16, HashMap::new()),
@@ -89,6 +150,7 @@ impl Configurable<LocalSegmentManagerConfig> for LocalSegmentManager {
             cleanup_task: None,
             sqlite: sqldb,
             persist_root: config.persist_path.clone(),
+            spann_provider,
         };
         if res.persist_root.is_some() {
             let cleaner = res.clone();
@@ -216,6 +278,11 @@ impl LocalSegmentManager {
             .insert(index_uuid, reader.index.clone())
             .await;
         Ok(reader)
+    }
+
+    /// The providers of SPANN segments, on the data path; none without one.
+    pub fn spann_provider(&self) -> Option<&SpannProvider> {
+        self.spann_provider.as_ref()
     }
 
     pub async fn get_hnsw_writer(
@@ -394,6 +461,134 @@ mod tests {
         Chunk, KnnIndex, LogRecord, Operation, OperationRecord, Schema, SegmentScope, SegmentType,
         SegmentUuid,
     };
+
+    // The SPANN index of distributed Chroma on the data path of the single node: written and flushed with the
+    // providers of one manager, read back from the files by those of the next one.
+    #[tokio::test]
+    async fn spann_segments_are_written_on_the_data_path_and_read_after_a_restart() {
+        use crate::{
+            blockfile_record::RecordSegmentReaderOptions,
+            distributed_spann::SpannSegmentReaderShard, types::materialize_logs,
+        };
+        use chroma_types::{
+            InternalCollectionConfiguration, InternalSpannConfiguration, SegmentShard,
+            VectorIndexConfiguration,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let config = LocalSegmentManagerConfig {
+            hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
+            persist_path: Some(root.path().to_str().unwrap().to_string()),
+        };
+        let open = || async {
+            let registry = Registry::new();
+            registry.register(get_new_sqlite_db().await);
+            LocalSegmentManager::try_from_config(&config, &registry)
+                .await
+                .unwrap()
+        };
+        let mut collection = Collection {
+            config: InternalCollectionConfiguration {
+                vector_index: VectorIndexConfiguration::Spann(InternalSpannConfiguration::default()),
+                embedding_function: None,
+            },
+            ..Collection::test_collection(3)
+        };
+        collection.schema = Some(Schema::try_from(&collection.config).unwrap());
+        let mut segment = Segment {
+            id: SegmentUuid::new(),
+            r#type: SegmentType::Spann,
+            scope: SegmentScope::VECTOR,
+            collection: collection.collection_id,
+            metadata: None,
+            file_path: HashMap::new(),
+        };
+
+        let first = open().await;
+        let writer = first
+            .spann_provider()
+            .unwrap()
+            .write(
+                &collection,
+                &SegmentShard::try_from((&segment, 0)).unwrap(),
+                3,
+                None,
+            )
+            .await
+            .unwrap();
+        let record = |id: &str, embedding: Vec<f32>, log_offset| LogRecord {
+            log_offset,
+            record: OperationRecord {
+                id: id.to_string(),
+                embedding: Some(embedding),
+                encoding: None,
+                metadata: None,
+                document: None,
+                operation: Operation::Add,
+            },
+        };
+        let logs = Chunk::new(
+            vec![
+                record("a", vec![1.0, 2.0, 3.0], 1),
+                record("b", vec![4.0, 5.0, 6.0], 2),
+            ]
+            .into(),
+        );
+        let materialized =
+            materialize_logs(&None, logs, None, &RecordSegmentReaderOptions::default())
+                .await
+                .unwrap();
+        writer
+            .apply_materialized_log_chunk(&None, &materialized)
+            .await
+            .unwrap();
+        segment.file_path = writer.commit().await.unwrap().flush().await.unwrap();
+        assert_eq!(segment.file_path.len(), 4);
+        drop(first);
+
+        let second = open().await;
+        let provider = second.spann_provider().unwrap();
+        let reader = SpannSegmentReaderShard::from_segment(
+            &collection,
+            &SegmentShard::try_from((&segment, 0)).unwrap(),
+            &provider.blockfile_provider,
+            &provider.hnsw_provider,
+            3,
+            true,
+        )
+        .await
+        .unwrap();
+        let posting_lists = reader
+            .index_reader
+            .posting_lists
+            .get_range(.., ..)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert_eq!(posting_lists.len(), 1);
+        assert_eq!(
+            posting_lists[0].2.doc_embeddings,
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+        // No temporary file of the writes is left on the data path.
+        let mut left = vec![root.path().to_path_buf()];
+        while let Some(dir) = left.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                assert!(
+                    !path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".tmp"),
+                    "{path:?}"
+                );
+                if path.is_dir() {
+                    left.push(path);
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn one_sweep_takes_out_the_rows_of_every_index_whose_files_are_gone() {
