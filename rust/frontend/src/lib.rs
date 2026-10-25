@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use std::{path::Path, sync::Arc};
 
 pub mod config;
@@ -7,6 +8,7 @@ pub mod get_collection_with_segments_provider;
 pub mod impls;
 pub mod quota;
 pub mod server;
+pub mod token_auth;
 mod types;
 
 // Re-export scaffolding from frontend-core so that internal modules can keep

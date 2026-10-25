@@ -3,8 +3,10 @@
 use crate::terminal::{SystemTerminal, Terminal};
 use crate::ui_utils::{HOLIDAY_LOGO, LOGO};
 use crate::utils::CliError;
+use chroma_frontend::auth::AuthenticateAndAuthorize;
 use chroma_frontend::config::FrontendServerConfig;
 use chroma_frontend::frontend_service_entrypoint_with_config;
+use chroma_frontend::token_auth::TokenAuthentication;
 use chrono::{Datelike, Local};
 use clap::Parser;
 use colored::Colorize;
@@ -74,6 +76,17 @@ fn override_default_config_with_args(args: RunArgs) -> Result<FrontendServerConf
         config.listen_address = host;
     }
 
+    // As `chroma run` in Chroma 0.5, the API keys come from the environment.
+    if let Ok(path) = std::env::var("CHROMA_SERVER_AUTHN_CREDENTIALS_FILE") {
+        config.server_authn_credentials_file = Some(path);
+    }
+    if let Ok(key) = std::env::var("CHROMA_SERVER_AUTHN_CREDENTIALS") {
+        config.server_authn_credentials = Some(key);
+    }
+    if let Ok(header) = std::env::var("CHROMA_AUTH_TOKEN_TRANSPORT_HEADER") {
+        config.auth_token_transport_header = Some(header);
+    }
+
     if !validate_host(&config.listen_address, config.port) {
         return Err(RunError::AddressUnavailable(config.listen_address, config.port).into());
     }
@@ -133,9 +146,18 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
 
     display_run_message(&config, &mut term);
 
+    let auth: Arc<dyn AuthenticateAndAuthorize> = match TokenAuthentication::from_config(&config) {
+        Ok(Some(keys)) => Arc::new(keys),
+        Ok(None) => Arc::new(()),
+        Err(err) => {
+            eprintln!("Could not load the API keys: {err}");
+            return Err(RunError::ServerStartFailed.into());
+        }
+    };
+
     let runtime = tokio::runtime::Runtime::new().map_err(|_| RunError::ServerStartFailed)?;
     runtime.block_on(async {
-        frontend_service_entrypoint_with_config(Arc::new(()), Arc::new(()), &config, true).await;
+        frontend_service_entrypoint_with_config(auth, Arc::new(()), &config, true).await;
     });
     Ok(())
 }

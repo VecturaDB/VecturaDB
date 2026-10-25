@@ -3,6 +3,8 @@ title: Running Chroma in Client-Server Mode
 sidebarTitle: Client Server Mode
 ---
 
+{/* Changed from the original Chroma file; see the git history for the changes and their authors. */}
+
 <Tabs>
 
 <Tab title="Python" icon="python">
@@ -85,3 +87,36 @@ let client = ChromaHttpClient::new(Default::default());
 </Tab>
 
 </Tabs>
+
+## API keys
+
+Without further configuration the server accepts every request. To require API keys, give `chroma run` a file of users and their keys, in the format of Chroma 0.5:
+
+```yaml
+users:
+  - id: admin              # no tenant: every tenant
+    tokens:
+      - admin-key
+  - id: team-a
+    tenant: team_a         # this tenant only
+    tokens:
+      - team-a-key
+  - id: team-a-reports
+    tenant: team_a
+    databases:             # these databases only
+      - reports
+    tokens:
+      - team-a-reports-key
+```
+
+Name the file with `server_authn_credentials_file` in the configuration file, or with the `CHROMA_SERVER_AUTHN_CREDENTIALS_FILE` environment variable. A single key for every tenant can be given with `server_authn_credentials` (`CHROMA_SERVER_AUTHN_CREDENTIALS`) instead of a file.
+
+The server then answers as Chroma Cloud does:
+
+- The key travels in the `x-chroma-token` header. Set `auth_token_transport_header: Authorization` (`CHROMA_AUTH_TOKEN_TRANSPORT_HEADER`) to take it from `Authorization: Bearer <key>` instead.
+- Without a valid key a request gets `401`; with a key outside its tenant or its databases, `403`.
+- A key with a tenant sees that tenant only. A key with databases sees those databases only, may list the databases of its tenant, and cannot create or delete a database.
+- A key without a tenant sees every tenant, and only such a key may create tenants or reset the server.
+- `/api/v2/auth/identity` returns the id, the tenant and the databases of the key; heartbeat, version, healthcheck and pre-flight checks need no key.
+
+Clients send the key as they do to Chroma Cloud, for example `chromadb.HttpClient(headers={"x-chroma-token": "team-a-key"}, ...)`, or `chromadb.CloudClient(api_key="team-a-key", cloud_host="localhost", cloud_port=8000, enable_ssl=False)`. The server does not serve HTTPS: put a TLS proxy in front of it to expose it beyond your machine.
