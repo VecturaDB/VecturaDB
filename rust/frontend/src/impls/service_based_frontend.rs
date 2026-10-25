@@ -3028,6 +3028,38 @@ impl ServiceBasedFrontend {
             .get_cached_collection_for_tenant(database_name.clone(), collection_id, &tenant_id)
             .await?;
 
+        // The single node indexes every write before it answers: nothing waits. Its log does not count the
+        // operations of a collection, so the operations it reports are the records.
+        if matches!(self.executor, Executor::Local(_)) {
+            let collection_and_segments = Self::get_collection_with_segments_for_tenant(
+                &mut self.collections_with_segments_provider,
+                Some(database_name),
+                collection_id,
+                &tenant_id,
+            )
+            .await
+            .map_err(IndexStatusError::Internal)?;
+            let records = Box::pin(self.fan_out_count(
+                tenant_id,
+                collection_and_segments,
+                chroma_types::plan::ReadLevel::default(),
+                0,
+            ))
+            .await
+            .map_err(|err| IndexStatusError::Internal(Box::new(err)))?
+            .count as u64;
+            chroma_metering::with_current(|context| {
+                context.latest_collection_logical_size_bytes(0);
+                context.finish_request(Instant::now());
+            });
+            return Ok(IndexStatusResponse {
+                op_indexing_progress: 1.0,
+                num_unindexed_ops: 0,
+                num_indexed_ops: records,
+                total_ops: records,
+            });
+        }
+
         let num_indexed_ops = collection.log_position.try_into().map_err(|_| {
             IndexStatusError::Internal(Box::new(chroma_error::TonicError(tonic::Status::internal(
                 "Invalid log_position value: must be >= 0 and convertible to u64",
@@ -4846,6 +4878,52 @@ mod tests {
             .unwrap();
         assert_eq!(search_err.code(), ErrorCodes::InvalidArgument);
         assert_eq!(search_err.to_string(), query_err.to_string());
+    }
+
+    #[tokio::test]
+    async fn indexing_status_on_a_single_node_has_nothing_waiting() {
+        async fn status(
+            frontend: &mut ServiceBasedFrontend,
+            collection_id: CollectionUuid,
+        ) -> Result<IndexStatusResponse, IndexStatusError> {
+            frontend
+                .indexing_status(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    collection_id,
+                )
+                .await
+        }
+        let (mut frontend, collection) = seeded_collection().await;
+        let seeded = status(&mut frontend, collection.collection_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                seeded.op_indexing_progress,
+                seeded.num_unindexed_ops,
+                seeded.num_indexed_ops,
+                seeded.total_ops
+            ),
+            (1.0, 0, 1, 1)
+        );
+        // An empty collection answers as on Chroma Cloud.
+        let empty = create_collection_for(&mut frontend, TENANT, DATABASE, "nothing_yet").await;
+        let empty = status(&mut frontend, empty.collection_id).await.unwrap();
+        assert_eq!(
+            (
+                empty.op_indexing_progress,
+                empty.num_unindexed_ops,
+                empty.num_indexed_ops,
+                empty.total_ops
+            ),
+            (1.0, 0, 0, 0)
+        );
+        let missing = status(&mut frontend, CollectionUuid::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(missing.code(), ErrorCodes::NotFound);
     }
 
     #[tokio::test]
