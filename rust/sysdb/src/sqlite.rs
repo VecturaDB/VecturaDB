@@ -12,10 +12,11 @@ use chroma_types::{
     CreateCollectionError, CreateCollectionResponse, CreateDatabaseError, CreateDatabaseResponse,
     CreateTenantError, CreateTenantResponse, Database, DatabaseUuid, DeleteCollectionError,
     DeleteDatabaseError, DeleteDatabaseResponse, ForkCollectionError, GetCollectionWithSegmentsError,
-    GetCollectionsError, GetDatabaseError, GetSegmentsError, GetTenantError, GetTenantResponse,
-    InternalCollectionConfiguration, InternalUpdateCollectionConfiguration, ListDatabasesError,
-    Metadata, MetadataValue, ResetError, ResetResponse, Schema, SchemaError, Segment, SegmentScope,
-    SegmentType, SegmentUuid, UpdateCollectionError, UpdateTenantError, UpdateTenantResponse,
+    GetCollectionsError, GetDatabaseError, GetSegmentsError,
+    GetTenantError, GetTenantResponse, InternalCollectionConfiguration,
+    InternalUpdateCollectionConfiguration, ListDatabasesError, Metadata, MetadataValue, ResetError,
+    ResetResponse, Schema, SchemaError, Segment, SegmentScope, SegmentType, SegmentUuid,
+    UpdateCollectionError, UpdateTenantError, UpdateTenantResponse,
 };
 use thiserror::Error;
 
@@ -302,7 +303,7 @@ impl SqliteSysDb {
     }
 
     pub(crate) async fn get_tenant(&self, name: &str) -> Result<GetTenantResponse, GetTenantError> {
-        sqlx::query("SELECT id FROM tenants WHERE id = $1")
+        sqlx::query("SELECT id, resource_name FROM tenants WHERE id = $1")
             .bind(name)
             .fetch_one(self.db.get_conn())
             .await
@@ -312,15 +313,45 @@ impl SqliteSysDb {
             })
             .map(|row| GetTenantResponse {
                 name: row.get(0),
-                resource_name: None,
+                resource_name: row.get(1),
             })
     }
 
+    // As SetTenantResourceName of distributed Chroma: a tenant gets its resource name once, and no other tenant has it.
     pub(crate) async fn update_tenant(
         &self,
-        _tenant_id: String,
-        _resource_name: String,
+        tenant_id: String,
+        resource_name: String,
     ) -> Result<UpdateTenantResponse, UpdateTenantError> {
+        let failed = |message: &str| {
+            UpdateTenantError::FailedToSetResourceName(tonic::Status::already_exists(message))
+        };
+        let updated = sqlx::query(
+            "UPDATE tenants SET resource_name = $1 WHERE id = $2 AND resource_name IS NULL",
+        )
+        .bind(&resource_name)
+        .bind(&tenant_id)
+        .execute(self.db.get_conn())
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref db_err) if db_err.kind() == ErrorKind::UniqueViolation => {
+                failed("resource name is used by another tenant")
+            }
+            _ => UpdateTenantError::Internal(e.into()),
+        })?;
+        if updated.rows_affected() == 0 {
+            let exists = sqlx::query("SELECT 1 FROM tenants WHERE id = $1")
+                .bind(&tenant_id)
+                .fetch_optional(self.db.get_conn())
+                .await
+                .map_err(|e| UpdateTenantError::Internal(e.into()))?
+                .is_some();
+            return Err(if exists {
+                failed("tenant resource name is already set")
+            } else {
+                UpdateTenantError::NotFound(tenant_id)
+            });
+        }
         Ok(UpdateTenantResponse {})
     }
 
@@ -1718,7 +1749,46 @@ mod tests {
         // Get tenant
         let tenant = sysdb.get_tenant("new_tenant").await.unwrap();
         assert_eq!(tenant.name, "new_tenant");
-        assert_eq!(tenant.resource_name, None);
+        assert_eq!(tenant.resource_name, Some("new_resource_name".to_string()));
+
+        // As distributed Chroma, the resource name is set once, and a tenant that is not there is not found.
+        let again = sysdb
+            .update_tenant("new_tenant".to_string(), "other_resource_name".to_string())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(again, UpdateTenantError::FailedToSetResourceName(_)),
+            "{again:?}"
+        );
+        let tenant = sysdb.get_tenant("new_tenant").await.unwrap();
+        assert_eq!(tenant.resource_name, Some("new_resource_name".to_string()));
+        let missing = sysdb
+            .update_tenant("no_tenant".to_string(), "missing_resource_name".to_string())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(missing, UpdateTenantError::NotFound(_)),
+            "{missing:?}"
+        );
+
+        // No two tenants have the same resource name.
+        sysdb
+            .create_tenant("other_tenant".to_string())
+            .await
+            .unwrap();
+        let taken = sysdb
+            .update_tenant("other_tenant".to_string(), "new_resource_name".to_string())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(taken, UpdateTenantError::FailedToSetResourceName(_)),
+            "{taken:?}"
+        );
+        let other = sysdb.get_tenant("other_tenant").await.unwrap();
+        assert_eq!(other.resource_name, None);
     }
 
     #[tokio::test]
