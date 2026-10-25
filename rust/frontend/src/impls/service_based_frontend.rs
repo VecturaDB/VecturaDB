@@ -3367,6 +3367,27 @@ impl ServiceBasedFrontend {
         )
         .await
         .map_err(QueryError::Other)?;
+        // As the query: a dense KNN on the embeddings has the dimension of the collection, or a 400.
+        if let Some(expected) = collection_and_segments.collection.dimension {
+            for payload in &request.searches {
+                for knn in payload.rank.knn_queries() {
+                    if let (
+                        chroma_types::operator::Key::Embedding,
+                        chroma_types::operator::QueryVector::Dense(vector),
+                    ) = (&knn.key, &knn.query)
+                    {
+                        if vector.len() != expected as usize {
+                            return Err(QueryError::Other(Box::new(
+                                ValidationError::DimensionMismatch(
+                                    expected as u32,
+                                    vector.len() as u32,
+                                ),
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         if self.enable_schema {
             if let Some(ref schema) = collection_and_segments.collection.schema {
                 for payload in &request.searches {
@@ -4774,6 +4795,57 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(count_err.code(), ErrorCodes::NotFound);
+    }
+
+    #[tokio::test]
+    async fn search_with_a_dense_query_of_another_dimension_answers_as_the_query() {
+        let (mut frontend, collection) = seeded_collection().await;
+        let query_err = frontend
+            .query(
+                QueryRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    None,
+                    None,
+                    vec![vec![1.0, 2.0, 3.0]],
+                    10,
+                    chroma_types::IncludeList::default_query(),
+                )
+                .unwrap(),
+            )
+            .await
+            .err()
+            .unwrap();
+        let search_err = frontend
+            .search(
+                SearchRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    vec![SearchPayload {
+                        rank: chroma_types::operator::Rank {
+                            expr: Some(chroma_types::operator::RankExpr::Knn {
+                                query: chroma_types::operator::QueryVector::Dense(vec![
+                                    1.0, 2.0, 3.0,
+                                ]),
+                                key: chroma_types::operator::Key::Embedding,
+                                limit: 10,
+                                default: None,
+                                return_rank: false,
+                            }),
+                        },
+                        ..Default::default()
+                    }],
+                    chroma_types::plan::ReadLevel::default(),
+                )
+                .unwrap(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(search_err.code(), ErrorCodes::InvalidArgument);
+        assert_eq!(search_err.to_string(), query_err.to_string());
     }
 
     #[tokio::test]
