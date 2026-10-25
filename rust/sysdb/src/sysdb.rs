@@ -275,12 +275,11 @@ impl SysDb {
                 grpc.get_collection_by_crn(tenant_resource_name, database, name)
                     .await
             }
-            SysDb::Sqlite(_) => Err(GetCollectionByCrnError::Internal(
-                tonic::Status::unimplemented(
-                    "get_collection_by_crn is not supported in SqliteSysDb",
-                )
-                .into(),
-            )),
+            SysDb::Sqlite(sqlite) => {
+                sqlite
+                    .get_collection_by_crn(tenant_resource_name, database, name)
+                    .await
+            }
             SysDb::Test(test) => {
                 test.get_collection_by_crn(tenant_resource_name, database, name)
                     .await

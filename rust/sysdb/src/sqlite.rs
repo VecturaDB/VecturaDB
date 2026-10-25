@@ -11,8 +11,8 @@ use chroma_types::{
     Collection, CollectionAndSegments, CollectionMetadataUpdate, CollectionUuid, CountForksError,
     CreateCollectionError, CreateCollectionResponse, CreateDatabaseError, CreateDatabaseResponse,
     CreateTenantError, CreateTenantResponse, Database, DatabaseUuid, DeleteCollectionError,
-    DeleteDatabaseError, DeleteDatabaseResponse, ForkCollectionError, GetCollectionWithSegmentsError,
-    GetCollectionsError, GetDatabaseError, GetSegmentsError,
+    DeleteDatabaseError, DeleteDatabaseResponse, ForkCollectionError, GetCollectionByCrnError,
+    GetCollectionWithSegmentsError, GetCollectionsError, GetDatabaseError, GetSegmentsError,
     GetTenantError, GetTenantResponse, InternalCollectionConfiguration,
     InternalUpdateCollectionConfiguration, ListDatabasesError, Metadata, MetadataValue, ResetError,
     ResetResponse, Schema, SchemaError, Segment, SegmentScope, SegmentType, SegmentUuid,
@@ -711,6 +711,42 @@ impl SqliteSysDb {
             offset,
         )
         .await
+    }
+
+    // As GetCollectionByResourceName of distributed Chroma: the tenant of the resource name, then the collection by
+    // database and name.
+    pub(crate) async fn get_collection_by_crn(
+        &self,
+        tenant_resource_name: String,
+        database: String,
+        name: String,
+    ) -> Result<Collection, GetCollectionByCrnError> {
+        let not_found = || {
+            GetCollectionByCrnError::NotFound(format!("{tenant_resource_name}:{database}:{name}"))
+        };
+        let Some(tenant) = sqlx::query("SELECT id FROM tenants WHERE resource_name = $1")
+            .bind(&tenant_resource_name)
+            .fetch_optional(self.db.get_conn())
+            .await
+            .map_err(|e| GetCollectionByCrnError::Internal(e.into()))?
+            .map(|row| row.get::<String, _>(0))
+        else {
+            return Err(not_found());
+        };
+        self.get_collections_with_conn(
+            self.db.get_conn(),
+            None,
+            Some(name.clone()),
+            Some(tenant),
+            Some(database.clone()),
+            Some(1),
+            0,
+        )
+        .await
+        .map_err(|e| GetCollectionByCrnError::Internal(e.boxed()))?
+        .into_iter()
+        .next()
+        .ok_or_else(not_found)
     }
 
     pub(crate) async fn delete_collection(
