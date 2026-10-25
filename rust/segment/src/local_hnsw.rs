@@ -1397,7 +1397,11 @@ async fn persist(
             buffered_file.flush()?;
         }
         file.as_file().sync_all()?;
-        file.persist(metadata_file_path).map_err(|err| err.error)?;
+        // std::fs::rename, unlike persist of tempfile, takes long paths on Windows: the ID map then reaches the data
+        // paths that hnswlib reaches.
+        let temp_path = file.into_temp_path();
+        std::fs::rename(&temp_path, &metadata_file_path)?;
+        let _ = temp_path.keep();
         sync_dir(Path::new(path))?;
         if let Some(parent) = Path::new(path).parent() {
             sync_dir(parent)?;
