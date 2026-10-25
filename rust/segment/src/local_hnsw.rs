@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 mod persistence;
 pub(crate) use persistence::validate_checkpoint;
 use persistence::{validate_checkpoint_seq_id, CheckpointFingerprint, VerifiedCheckpoint};
