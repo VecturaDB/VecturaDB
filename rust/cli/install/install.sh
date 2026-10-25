@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Changed by VecturaDB contributors for the VecturaDB branding.
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 # Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
 set -e
 
@@ -50,7 +50,7 @@ curl -L "$DOWNLOAD_URL" -o chroma
 chmod +x chroma
 
 if [ -w /usr/local/bin ]; then
-  sudo mv chroma /usr/local/bin/chroma
+  mv chroma /usr/local/bin/chroma
 else
   mkdir -p "$HOME/.local/bin"
   mv chroma "$HOME/.local/bin/chroma"
