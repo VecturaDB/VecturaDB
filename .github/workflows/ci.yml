@@ -43,7 +43,7 @@ jobs:
             macOS) sysctl -n machdep.cpu.brand_string; sysctl hw.physicalcpu hw.logicalcpu ;;
             Windows) powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors" ;;
           esac
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: CLI version from the release tag
         if: inputs.version != ''
         shell: bash
@@ -76,7 +76,7 @@ jobs:
             macOS) sysctl -n machdep.cpu.brand_string; sysctl hw.physicalcpu hw.logicalcpu ;;
             Windows) powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors" ;;
           esac
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: CLI version from the release tag
         if: inputs.version != ''
         shell: bash
@@ -112,7 +112,7 @@ jobs:
             macOS) sysctl -n machdep.cpu.brand_string; sysctl hw.physicalcpu hw.logicalcpu ;;
             Windows) powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors" ;;
           esac
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: CLI version from the release tag
         if: inputs.version != ''
         shell: bash
@@ -144,7 +144,7 @@ jobs:
           - { os: macos, runner: macos-14, target: aarch64 }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: CLI version from the release tag
@@ -153,7 +153,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: perl -0pi -e 's/^version = ".*"/version = "$ENV{VERSION}"/m' rust/cli/Cargo.toml && grep -m1 '^version' rust/cli/Cargo.toml
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
       - name: Python protos, as idl/makefile proto_python
@@ -190,8 +190,8 @@ jobs:
     needs: cli-linux
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: cli-linux-*
           merge-multiple: true
@@ -200,13 +200,13 @@ jobs:
           mkdir ctx
           cp vecturadb/docker/Dockerfile vecturadb/docker/config.yaml ctx/
           cp chroma-linux-x86_64 ctx/chroma-amd64 && cp chroma-linux-aarch64 ctx/chroma-arm64 && chmod +x ctx/chroma-*
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build amd64 and arm64
         run: docker buildx build --platform linux/amd64,linux/arm64 --build-arg REVISION=${{ github.sha }} -t ghcr.io/vecturadb/vecturadb:ci ctx
       - name: Load amd64 for the smoke test
         run: docker buildx build --platform linux/amd64 --build-arg REVISION=${{ github.sha }} --load -t ghcr.io/vecturadb/vecturadb:ci ctx
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
       - run: pip install chromadb-client
@@ -234,7 +234,7 @@ jobs:
             macOS) sysctl -n machdep.cpu.brand_string; sysctl hw.physicalcpu hw.logicalcpu ;;
             Windows) powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors" ;;
           esac
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/rust
         with:
           github-token: ${{ github.token }}
@@ -254,11 +254,11 @@ jobs:
     needs: wheels
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/python
         with:
           python-version: "3.11"
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: wheel-linux-x86_64
           path: dist
