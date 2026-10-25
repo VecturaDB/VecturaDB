@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use super::config::StorageConfig;
 use super::StorageConfigError;
 use async_trait::async_trait;
