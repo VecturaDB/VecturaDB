@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::{extract::Request, middleware::Next, response::Response, Json};
@@ -16,6 +17,20 @@ pub async fn default_json_content_type_middleware(mut req: Request, next: Next) 
         );
     }
     next.run(req).await
+}
+
+/// Answers of the API depend on the key of the request, which travels in a header that shared caches do not look
+/// at, such as `x-chroma-token`: no cache may keep them.
+pub async fn no_store_middleware(req: Request, next: Next) -> Response {
+    let api = req.uri().path().starts_with("/api/v2");
+    let mut res = next.run(req).await;
+    if api {
+        res.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    res
 }
 
 /// Axum occasionally returns generic errors as plain text. Chroma clients expect that JSON errors will always be returned, so this middleware converts plain text errors to JSON.

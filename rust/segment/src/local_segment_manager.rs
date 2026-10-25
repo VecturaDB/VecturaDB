@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use chroma_cache::{AysncPartitionedMutex, Cache, CacheConfig, CacheError, FoyerCacheConfig};
 use chroma_config::{
     registry::{Injectable, Registry},
@@ -7,6 +8,7 @@ use chroma_error::{ChromaError, ErrorCodes};
 use chroma_index::IndexUuid;
 use chroma_sqlite::db::SqliteDb;
 use chroma_types::{Collection, Segment, SegmentUuid};
+use sea_query_binder::SqlxBinder;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -274,10 +276,22 @@ impl LocalSegmentManager {
         &self,
         segment_id: SegmentUuid,
     ) -> Result<(), LocalSegmentManagerError> {
+        if self.delete_hnsw_index_files(segment_id).await? {
+            self.forget_deleted_hnsw_indexes(&[segment_id]).await?;
+        }
+        Ok(())
+    }
+
+    /// The files of a deleted index, removed: true when they were queued in index_cleanup, whose row stays until
+    /// forget_deleted_hnsw_indexes.
+    pub async fn delete_hnsw_index_files(
+        &self,
+        segment_id: SegmentUuid,
+    ) -> Result<bool, LocalSegmentManagerError> {
         let id = IndexUuid(segment_id.0);
         let live = self.live_indexes.lock(&id).await;
         if self.segment_exists(segment_id).await? {
-            return Ok(());
+            return Ok(false);
         }
         let authorized: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM index_cleanup WHERE segment_id = ?)")
@@ -285,7 +299,7 @@ impl LocalSegmentManager {
                 .fetch_one(self.sqlite.get_conn())
                 .await?;
         if !authorized {
-            return Ok(());
+            return Ok(false);
         }
         let inner = live.get(&id).and_then(Weak::upgrade);
         // The committed catalog deletion prevents a new load of this segment.
@@ -304,11 +318,32 @@ impl LocalSegmentManager {
                 Err(err) => return Err(err.into()),
             }
         }
-        sqlx::query("DELETE FROM index_cleanup WHERE segment_id = ?")
-            .bind(segment_id.to_string())
-            .execute(self.sqlite.get_conn())
-            .await?;
+        Ok(true)
+    }
+
+    /// Takes deleted indexes whose files are gone out of index_cleanup, with one statement per 500.
+    pub async fn forget_deleted_hnsw_indexes(
+        &self,
+        segment_ids: &[SegmentUuid],
+    ) -> Result<(), LocalSegmentManagerError> {
+        for batch in segment_ids.chunks(500) {
+            let (sql, values) = sea_query::Query::delete()
+                .from_table(sea_query::Alias::new("index_cleanup"))
+                .and_where(
+                    sea_query::Expr::col(sea_query::Alias::new("segment_id"))
+                        .is_in(batch.iter().map(|segment_id| segment_id.to_string())),
+                )
+                .build_sqlx(sea_query::SqliteQueryBuilder);
+            sqlx::query_with(&sql, values)
+                .execute(self.sqlite.get_conn())
+                .await?;
+        }
         Ok(())
+    }
+
+    /// Whether the indexes are files, which the sweep at startup and every hour removes once deleted.
+    pub fn persists(&self) -> bool {
+        self.persist_root.is_some()
     }
 
     /// Retry queued index deletions on startup and periodically.
@@ -318,19 +353,29 @@ impl LocalSegmentManager {
                 .fetch_all(self.sqlite.get_conn())
                 .await?;
         let mut first_error = None;
+        let mut removed = Vec::new();
         for id in pending {
             let result = match uuid::Uuid::parse_str(&id) {
-                Ok(uuid) => self.delete_hnsw_index(SegmentUuid(uuid)).await,
+                Ok(uuid) => self
+                    .delete_hnsw_index_files(SegmentUuid(uuid))
+                    .await
+                    .map(|gone| gone.then_some(SegmentUuid(uuid))),
                 Err(err) => Err(io::Error::new(io::ErrorKind::InvalidData, err).into()),
             };
-            if let Err(err) = result {
-                tracing::warn!(segment_id = %id, error = %err, "index cleanup failed; will retry");
-                first_error.get_or_insert(err);
+            match result {
+                Ok(Some(segment_id)) => removed.push(segment_id),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(segment_id = %id, error = %err, "index cleanup failed; will retry");
+                    first_error.get_or_insert(err);
+                }
             }
         }
+        // The rows that collection deletions leave wait for this sweep: one statement per 500 of them.
+        let forgotten = self.forget_deleted_hnsw_indexes(&removed).await;
         match first_error {
             Some(err) => Err(err),
-            None => Ok(()),
+            None => forgotten,
         }
     }
 
@@ -349,6 +394,42 @@ mod tests {
         Chunk, KnnIndex, LogRecord, Operation, OperationRecord, Schema, SegmentScope, SegmentType,
         SegmentUuid,
     };
+
+    #[tokio::test]
+    async fn one_sweep_takes_out_the_rows_of_every_index_whose_files_are_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        registry.register(get_new_sqlite_db().await);
+        let mut manager = LocalSegmentManager::try_from_config(
+            &LocalSegmentManagerConfig {
+                hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
+                persist_path: Some(root.path().to_str().unwrap().to_string()),
+            },
+            &registry,
+        )
+        .await
+        .unwrap();
+        manager.cleanup_task.take().unwrap().0.abort();
+        // More rows than one statement takes; half of them with their files still there.
+        for n in 1..=600u128 {
+            let id = uuid::Uuid::from_u128(n).to_string();
+            if n % 2 == 0 {
+                tokio::fs::create_dir(root.path().join(&id)).await.unwrap();
+            }
+            sqlx::query("INSERT INTO index_cleanup (segment_id) VALUES (?)")
+                .bind(&id)
+                .execute(manager.sqlite.get_conn())
+                .await
+                .unwrap();
+        }
+        manager.cleanup_deleted_indexes().await.unwrap();
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM index_cleanup")
+            .fetch_one(manager.sqlite.get_conn())
+            .await
+            .unwrap();
+        assert_eq!(pending, 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
 
     #[tokio::test]
     async fn cleanup_continues_after_entry_failure() {

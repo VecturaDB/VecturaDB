@@ -49,8 +49,8 @@ use chroma_types::{
     GetTenantRequest, GetTenantResponse, HealthCheckResponse, HeartbeatError, Include,
     IndexStatusError, IndexStatusResponse, KnnIndex, ListCollectionsRequest,
     ListCollectionsResponse, ListDatabasesError, ListDatabasesRequest, ListDatabasesResponse,
-    MetadataValue, Operation, OperationRecord, QueryError, QueryRequest, QueryResponse, ResetError, ResetResponse,
-    Schema, SearchRequest, SearchResponse, SegmentType, UpdateCollectionError,
+    MetadataValue, Operation, OperationRecord, QueryError, QueryRequest, QueryResponse, ResetError,
+    ResetResponse, Schema, SearchRequest, SearchResponse, SegmentType, UpdateCollectionError,
     UpdateCollectionRecordsError, UpdateCollectionRecordsRequest, UpdateCollectionRecordsResponse,
     UpdateCollectionRequest, UpdateCollectionResponse, UpdateTenantError, UpdateTenantRequest,
     UpdateTenantResponse, UpsertCollectionRecordsError, UpsertCollectionRecordsRequest,
@@ -1730,7 +1730,9 @@ impl ServiceBasedFrontend {
             .remove(&collection.collection_id)
             .await;
 
-        if let Err(err) = self.executor.delete_segments(&segments).await {
+        // The index files go before the answer. Their rows in index_cleanup wait for the sweep at startup and every
+        // hour, which takes out the rows of the indexes whose files are gone together, one statement per 500.
+        if let Err(err) = self.executor.delete_segment_files(&segments).await {
             tracing::warn!(error = %err, "collection deleted; index cleanup will retry");
         }
         Ok(DeleteCollectionResponse {})
@@ -4421,6 +4423,13 @@ mod tests {
                 .await
                 .unwrap();
             assert!(pending > 0);
+            // A sweep that cannot take the rows out keeps them for the next one.
+            assert!(frontend.executor.cleanup_deleted_indexes().await.is_err());
+            let still: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM index_cleanup")
+                .fetch_one(db.get_conn())
+                .await
+                .unwrap();
+            assert_eq!(still, pending);
             sqlx::query("DROP TRIGGER fail_cleanup")
                 .execute(db.get_conn())
                 .await
@@ -4432,6 +4441,164 @@ mod tests {
                 .unwrap();
             assert_eq!(pending, 0);
         }
+    }
+
+    // A frontend with its HNSW indexes in files under `root`, and its SQLite database there too, as `chroma run`.
+    async fn persistent_frontend(root: &std::path::Path) -> ServiceBasedFrontend {
+        let mut config = FrontendConfig::sqlite_in_memory();
+        config.sqlitedb = Some(chroma_sqlite::config::SqliteDBConfig {
+            url: Some(root.join("chroma.sqlite3").to_str().unwrap().to_string()),
+            ..Default::default()
+        });
+        if let Some(segment_manager) = config.segment_manager.as_mut() {
+            segment_manager.persist_path = Some(root.to_str().unwrap().to_string());
+        }
+        ServiceBasedFrontend::try_from_config(&(config, System::new()), &Registry::new())
+            .await
+            .unwrap()
+    }
+
+    async fn add_record(frontend: &mut ServiceBasedFrontend, collection: &Collection, id: &str) {
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    vec![id.to_string()],
+                    vec![vec![1.0, 2.0]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn count_records(frontend: &mut ServiceBasedFrontend, collection: &Collection) -> u32 {
+        frontend
+            .count(
+                CountRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    chroma_types::plan::ReadLevel::default(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn index_folders(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut folders: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
+            .collect();
+        folders.sort();
+        folders
+    }
+
+    // The rows of index_cleanup, read with a connection of its own to the database file of the test.
+    fn pending_cleanups(root: &std::path::Path) -> i64 {
+        let path = root.join("chroma.sqlite3");
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    use sqlx::Connection;
+                    let options = sqlx::sqlite::SqliteConnectOptions::new()
+                        .filename(path)
+                        .busy_timeout(std::time::Duration::from_secs(5));
+                    let mut connection = sqlx::SqliteConnection::connect_with(&options)
+                        .await
+                        .unwrap();
+                    sqlx::query_scalar("SELECT COUNT(*) FROM index_cleanup")
+                        .fetch_one(&mut connection)
+                        .await
+                        .unwrap()
+                })
+        })
+        .join()
+        .unwrap()
+    }
+
+    fn delete_collection_request(name: &str) -> DeleteCollectionRequest {
+        DeleteCollectionRequest::try_new(TENANT.into(), DATABASE.into(), name.to_string()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn collection_deletion_removes_files_and_leaves_its_row_to_the_sweep() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = persistent_frontend(root.path()).await;
+        let collection = create_collection_for(&mut frontend, TENANT, DATABASE, "answers").await;
+        add_record(&mut frontend, &collection, "a").await;
+        let folders = index_folders(root.path());
+        assert_eq!(folders.len(), 1);
+        frontend
+            .delete_collection(delete_collection_request("answers"))
+            .await
+            .unwrap();
+        // The files are gone before the answer, the row that queued them is not: no write of its own.
+        assert!(!folders[0].exists());
+        assert_eq!(pending_cleanups(root.path()), 1);
+        frontend.executor.cleanup_deleted_indexes().await.unwrap();
+        assert_eq!(pending_cleanups(root.path()), 0);
+    }
+
+    #[tokio::test]
+    async fn a_restart_sweeps_the_rows_of_deleted_collections() {
+        let root = tempfile::tempdir().unwrap();
+        {
+            let mut frontend = persistent_frontend(root.path()).await;
+            let collection =
+                create_collection_for(&mut frontend, TENANT, DATABASE, "restarted").await;
+            add_record(&mut frontend, &collection, "a").await;
+            assert_eq!(index_folders(root.path()).len(), 1);
+            frontend
+                .delete_collection(delete_collection_request("restarted"))
+                .await
+                .unwrap();
+        }
+        assert!(index_folders(root.path()).is_empty());
+        assert_eq!(pending_cleanups(root.path()), 1);
+        let _frontend = persistent_frontend(root.path()).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while pending_cleanups(root.path()) > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the sweep at startup must take the row out");
+    }
+
+    #[tokio::test]
+    async fn a_collection_created_again_before_the_sweep_is_new_and_works() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = persistent_frontend(root.path()).await;
+        let old = create_collection_for(&mut frontend, TENANT, DATABASE, "again").await;
+        add_record(&mut frontend, &old, "old").await;
+        assert_eq!(index_folders(root.path()).len(), 1);
+        frontend
+            .delete_collection(delete_collection_request("again"))
+            .await
+            .unwrap();
+        assert_eq!(pending_cleanups(root.path()), 1);
+        let new = create_collection_for(&mut frontend, TENANT, DATABASE, "again").await;
+        assert_ne!(new.collection_id, old.collection_id);
+        assert_eq!(count_records(&mut frontend, &new).await, 0);
+        add_record(&mut frontend, &new, "new").await;
+        // The sweep takes out the row of the old collection and leaves the files of the new one.
+        frontend.executor.cleanup_deleted_indexes().await.unwrap();
+        assert_eq!(pending_cleanups(root.path()), 0);
+        assert_eq!(index_folders(root.path()).len(), 1);
+        add_record(&mut frontend, &new, "newer").await;
+        assert_eq!(count_records(&mut frontend, &new).await, 2);
     }
 
     async fn create_collection_for(
@@ -4780,8 +4947,14 @@ mod tests {
         let mut frontend = sqlite_frontend().await;
         let source = create_collection_for(&mut frontend, TENANT, DATABASE, "fork_source").await;
         let mut metadata = chroma_types::Metadata::new();
-        metadata.insert("topic".to_string(), MetadataValue::Str("animals".to_string()));
-        metadata.insert("tags".to_string(), MetadataValue::StringArray(vec!["a".to_string()]));
+        metadata.insert(
+            "topic".to_string(),
+            MetadataValue::Str("animals".to_string()),
+        );
+        metadata.insert(
+            "tags".to_string(),
+            MetadataValue::StringArray(vec!["a".to_string()]),
+        );
         frontend
             .add(
                 AddCollectionRecordsRequest::try_new(
@@ -4872,7 +5045,11 @@ mod tests {
             .fork_collection(fork(forked.collection_id, "fork_of_fork"))
             .await
             .unwrap();
-        for collection_id in [source.collection_id, forked.collection_id, second.collection_id] {
+        for collection_id in [
+            source.collection_id,
+            forked.collection_id,
+            second.collection_id,
+        ] {
             assert_eq!(frontend.fork_count(collection_id).await.unwrap(), 2);
         }
 
@@ -4882,7 +5059,10 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(exists.code(), ErrorCodes::AlreadyExists);
-        assert_eq!(exists.to_string(), "Collection [fork_target] already exists");
+        assert_eq!(
+            exists.to_string(),
+            "Collection [fork_target] already exists"
+        );
         let missing = CollectionUuid::new();
         let not_found = frontend
             .fork_collection(fork(missing, "fork_of_missing"))

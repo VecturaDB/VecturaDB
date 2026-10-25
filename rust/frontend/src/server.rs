@@ -68,7 +68,9 @@ use crate::{
     auth::{AuthenticateAndAuthorize, AuthzAction, AuthzResource},
     config::FrontendServerConfig,
     quota::{Action, QuotaEnforcer, QuotaPayload},
-    server_middleware::{always_json_errors_middleware, default_json_content_type_middleware},
+    server_middleware::{
+        always_json_errors_middleware, default_json_content_type_middleware, no_store_middleware,
+    },
     traced_json::TracedJson,
     types::errors::{ErrorResponse, ServerError, ValidationError},
     Frontend,
@@ -439,6 +441,8 @@ impl FrontendServer {
 
             app = app.layer(cors_builder);
         }
+        // Outermost, so that it also covers the answers of the layers above.
+        let app = app.layer(axum::middleware::from_fn(no_store_middleware));
 
         let addr = format!("{}:{}", listen_address, port);
         tracing::info!(%addr, "Frontend server listening on address");
@@ -4256,6 +4260,59 @@ mod tests {
                     "features": ["api_keys"],
                 },
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_answers_are_never_cached() {
+        let mut config = FrontendServerConfig::single_node_default();
+        config.server_authn_credentials = Some("key-a".to_string());
+        let auth = crate::token_auth::TokenAuthentication::from_config(&config)
+            .unwrap()
+            .unwrap();
+        let port = test_server_with_auth(config, Arc::new(auth)).await;
+        // With and without a key, and for an error: every answer depends on the key.
+        for (path, key) in [
+            ("/api/v2/auth/identity", Some("key-a")),
+            ("/api/v2/auth/identity", None),
+            ("/api/v2/pre-flight-checks", Some("key-a")),
+            ("/api/v2/pre-flight-checks", None),
+            ("/api/v2/heartbeat", None),
+            ("/api/v2/no-such-route", None),
+        ] {
+            let mut request = Client::new().get(format!("http://127.0.0.1:{port}{path}"));
+            if let Some(key) = key {
+                request = request.header("x-chroma-token", key);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(
+                response.headers()[reqwest::header::CACHE_CONTROL],
+                "no-store",
+                "{path} with key {key:?}, status {}",
+                response.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collection_by_crn_is_not_supported_on_a_single_node() {
+        let port = test_server(FrontendServerConfig::single_node_default()).await;
+        let response = Client::new()
+            .get(format!(
+                "http://127.0.0.1:{port}/api/v2/collections/resource:default_database:missing"
+            ))
+            .send()
+            .await
+            .expect("an answer, not a closed connection");
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = response.json::<serde_json::Value>().await.unwrap();
+        // As the other calls that the SQLite sysdb does not support, through its tonic status.
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("get_collection_by_crn is not supported in SqliteSysDb"),
+            "{body}"
         );
     }
 

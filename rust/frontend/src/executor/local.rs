@@ -17,7 +17,7 @@ use chroma_types::{
         Limit, Projection, ProjectionRecord, RecordMeasure, SearchResult,
     },
     plan::{Count, Get, Knn, Search},
-    CollectionAndSegments, ExecutorError, Segment, SegmentType, Space,
+    CollectionAndSegments, ExecutorError, Segment, SegmentType, SegmentUuid, Space,
 };
 use std::{collections::HashMap, future::Future};
 
@@ -69,6 +69,30 @@ impl LocalExecutor {
         &mut self,
         segments: &[Segment],
     ) -> Result<(), Box<dyn ChromaError>> {
+        let (removed, failure) = self.remove_segment_files(segments).await;
+        self.forget_deleted_indexes(&removed).await?;
+        failure.map_or(Ok(()), Err)
+    }
+    /// The index files of deleted segments, removed. Their rows in index_cleanup wait for the sweep of
+    /// cleanup_deleted_indexes, or go at once for indexes in memory, which no sweep visits.
+    pub async fn delete_segment_files(
+        &mut self,
+        segments: &[Segment],
+    ) -> Result<(), Box<dyn ChromaError>> {
+        let (removed, failure) = self.remove_segment_files(segments).await;
+        if !self.hnsw_manager.persists() {
+            self.forget_deleted_indexes(&removed).await?;
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    // Every segment is tried, so one that fails leaves the others removed.
+    async fn remove_segment_files(
+        &mut self,
+        segments: &[Segment],
+    ) -> (Vec<SegmentUuid>, Option<Box<dyn ChromaError>>) {
+        let mut removed = Vec::new();
+        let mut failure = None;
         for segment in segments {
             if !matches!(
                 segment.r#type,
@@ -76,13 +100,27 @@ impl LocalExecutor {
             ) {
                 continue;
             }
-            self.hnsw_manager
-                .delete_hnsw_index(segment.id)
-                .await
-                .map_err(|err| err.boxed())?;
+            match self.hnsw_manager.delete_hnsw_index_files(segment.id).await {
+                Ok(true) => removed.push(segment.id),
+                Ok(false) => {}
+                Err(err) => {
+                    failure.get_or_insert(err.boxed());
+                }
+            }
         }
-        Ok(())
+        (removed, failure)
     }
+
+    pub async fn forget_deleted_indexes(
+        &self,
+        segments: &[SegmentUuid],
+    ) -> Result<(), Box<dyn ChromaError>> {
+        self.hnsw_manager
+            .forget_deleted_hnsw_indexes(segments)
+            .await
+            .map_err(|err| err.boxed())
+    }
+
     pub async fn cleanup_deleted_indexes(&self) -> Result<(), Box<dyn ChromaError>> {
         self.hnsw_manager
             .cleanup_deleted_indexes()
