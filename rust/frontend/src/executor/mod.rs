@@ -126,6 +126,19 @@ impl Executor {
         }
     }
 
+    pub async fn delete_segment_files(
+        &mut self,
+        segments: &[Segment],
+    ) -> Result<(), ExecutorError> {
+        match self {
+            Executor::Distributed(_) => Ok(()),
+            Executor::Local(local_executor) => local_executor
+                .delete_segment_files(segments)
+                .await
+                .map_err(ExecutorError::Internal),
+        }
+    }
+
     pub async fn cleanup_deleted_indexes(&self) -> Result<(), ExecutorError> {
         match self {
             Executor::Distributed(_) => Ok(()),
