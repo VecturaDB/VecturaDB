@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use crate::client::dashboard_client::DashboardClientError;
 use crate::commands::browse::BrowseError;
 use crate::commands::copy::CopyError;
