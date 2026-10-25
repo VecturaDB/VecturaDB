@@ -1,5 +1,6 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 name: Installation Issue
-description: Request for install help with Chroma
+description: Request for install help with VecturaDB
 title: "[Install issue]: "
 labels: ["installation trouble"]
 body:
@@ -20,8 +21,8 @@ body:
     id: versions
     attributes:
       label: Versions
-      description: We need your Chroma, Python, and OS versions, as well as whatever else you think relevant.
-      placeholder: Chroma v0.3.14, Python 3.9.6, MacOS 12.5
+      description: We need your VecturaDB, Python, and OS versions, as well as whatever else you think relevant.
+      placeholder: VecturaDB 1.0.0-preview.1, Python 3.12, macOS 15
 #       value: "A bug happened!"
     validations:
       required: true
