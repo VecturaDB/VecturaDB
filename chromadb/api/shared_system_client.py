@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 from typing import ClassVar, Dict, Optional
 import logging
 import threading
@@ -184,10 +185,10 @@ class SharedSystemClient:
         if not api_keys:
             return None
 
-        # log if multiple viable api keys found
+        # log if multiple viable api keys found, without any part of the keys
         if len(api_keys) > 1:
             logger.info(
-                f"Multiple Chroma Cloud clients found, using API key starting with {api_keys[0][:8]}..."
+                "Multiple Chroma Cloud clients found, using the API key of the first one."
             )
 
         return api_keys[0]

@@ -1,3 +1,5 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
+import logging
 import pytest
 from unittest.mock import MagicMock
 from chromadb.api.shared_system_client import SharedSystemClient
@@ -178,3 +180,24 @@ def test_multiple_clients_returns_one_key() -> None:
     api_key = SharedSystemClient.get_chroma_cloud_api_key_from_clients()
 
     assert api_key in ["key-1", "key-2"]
+
+
+def test_multiple_clients_log_no_part_of_the_keys(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mock_api_1 = create_mock_http_client(
+        api_url="https://api.trychroma.com/api/v2",
+        headers={"X-Chroma-Token": "ck-1234567890-first"},
+    )
+    mock_api_2 = create_mock_http_client(
+        api_url="https://api.trychroma.com/api/v2",
+        headers={"X-Chroma-Token": "ck-0987654321-second"},
+    )
+    register_mock_system("id-1", mock_api_1)
+    register_mock_system("id-2", mock_api_2)
+
+    with caplog.at_level(logging.INFO):
+        SharedSystemClient.get_chroma_cloud_api_key_from_clients()
+
+    assert "Multiple Chroma Cloud clients found" in caplog.text
+    assert "ck-" not in caplog.text
