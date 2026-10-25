@@ -7,6 +7,7 @@ use chroma_config::Configurable;
 use chroma_error::ChromaError;
 use futures::{Stream, StreamExt};
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::{hash::DefaultHasher, path::Path};
@@ -81,18 +82,52 @@ impl LocalStorage {
     ) -> Result<Option<ETag>, StorageError> {
         // TODO: Handle options
         let file_path = self.path_for_key(key);
-        std::fs::create_dir_all(
-            file_path
-                .parent()
-                .expect("Parent should be present for the file path"),
-        )
-        .unwrap();
-        let res = std::fs::write(&file_path, bytes);
-        match res {
-            Ok(_) => Ok(None),
-            Err(e) => Err(StorageError::Generic {
-                source: Arc::new(e),
-            }),
+        let parent = file_path
+            .parent()
+            .expect("Parent should be present for the file path");
+        Self::write_durably(parent, &file_path, bytes).map_err(|e| StorageError::Generic {
+            source: Arc::new(e),
+        })?;
+        Ok(None)
+    }
+
+    // A file written in full next to its key, synced, then renamed over the key: a crash leaves the old file or the
+    // new one, never a part of one, and the bytes are on disk before the caller records the key.
+    // The file gets the permissions that std::fs::write gave it, 0666 less the umask, not the 0600 of a temporary file.
+    fn write_durably(parent: &Path, file_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        std::fs::create_dir_all(parent)?;
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o666));
+        }
+        let mut file = builder.tempfile_in(parent)?;
+        file.write_all(bytes)?;
+        file.as_file().sync_all()?;
+        let temp_path = file.into_temp_path();
+        std::fs::rename(&temp_path, file_path)?;
+        let _ = temp_path.keep();
+        #[cfg(unix)]
+        Self::folder_synced(std::fs::File::open(parent)?.sync_all())?;
+        Ok(())
+    }
+
+    // The sync of the folder makes the rename survive a crash. Some file systems refuse to sync a folder, with EINVAL or
+    // ENOTSUP (some FUSE, network and CIFS mounts, vboxsf): the file is already in place, so, as in SQLite, that is not
+    // an error. Any other error is.
+    fn folder_synced(result: std::io::Result<()>) -> std::io::Result<()> {
+        match result {
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                tracing::warn!(error = %err, "the file system does not sync folders");
+                Ok(())
+            }
+            other => other,
         }
     }
 
@@ -252,5 +287,41 @@ impl Configurable<StorageConfig> for LocalStorage {
             }
             _ => Err(Box::new(StorageConfigError::InvalidStorageConfig)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A folder that cannot be synced does not fail a write whose file is in place; any other error does.
+    #[test]
+    fn a_folder_that_cannot_be_synced_does_not_fail_the_write() {
+        for refused in [
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::Unsupported,
+        ] {
+            assert!(LocalStorage::folder_synced(Err(refused.into())).is_ok());
+        }
+        assert!(LocalStorage::folder_synced(Err(std::io::ErrorKind::Other.into())).is_err());
+        assert!(LocalStorage::folder_synced(Ok(())).is_ok());
+    }
+
+    // The files of a key get the permissions of std::fs::write, as before the writes went through a temporary file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_key_gets_the_permissions_of_a_plain_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let storage = LocalStorage::new(root.path().to_str().unwrap());
+        storage
+            .put_bytes("block/key", b"bytes", PutOptions::default())
+            .await
+            .unwrap();
+        let plain = root.path().join("plain");
+        std::fs::write(&plain, b"bytes").unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root.path().join("block/key")), mode(&plain));
+        assert_eq!(std::fs::read(root.path().join("block/key")).unwrap(), b"bytes");
     }
 }
