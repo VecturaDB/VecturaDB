@@ -188,6 +188,17 @@ pub struct FrontendServerConfig {
     pub enable_span_indexing: bool,
     #[serde(default = "default_region")]
     pub region: String,
+    /// The users and their API keys, in the file format of Chroma 0.5 (`chroma_server_authn_credentials_file`).
+    /// Without it, and without `server_authn_credentials`, every request is allowed.
+    #[serde(default)]
+    pub server_authn_credentials_file: Option<String>,
+    /// A single API key, for every tenant (`chroma_server_authn_credentials` in Chroma 0.5).
+    #[serde(default)]
+    pub server_authn_credentials: Option<String>,
+    /// The header of the API key: `X-Chroma-Token` by default, as on Chroma Cloud, or `Authorization` for
+    /// `Bearer <key>` (`chroma_auth_token_transport_header` in Chroma 0.5).
+    #[serde(default)]
+    pub auth_token_transport_header: Option<String>,
 }
 
 const DEFAULT_CONFIG_PATH: &str = "sample_configs/distributed.yaml";
