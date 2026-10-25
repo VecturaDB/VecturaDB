@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 //! K8s integration tests for fork count functionality.
 //!
 //! These tests require a deployed Chroma cluster with gRPC sysdb.
@@ -44,7 +45,7 @@ async fn setup_k8s() -> Option<Frontend> {
     Some(frontend)
 }
 
-/// Setup a frontend with SQLite for local testing (fork_count will return error).
+/// Setup a frontend with SQLite for local testing.
 async fn setup_local() -> Frontend {
     let system = System::new();
     let registry = Registry::new();
@@ -104,21 +105,34 @@ async fn add_records(
         .expect("Failed to add records");
 }
 
-/// Test that fork_count returns an error in local/SQLite mode.
-/// This is expected behavior since fork functionality requires the distributed sysdb.
+/// Test that fork_count counts the forks in local/SQLite mode, as with the distributed sysdb.
 #[tokio::test]
-async fn test_fork_count_local_returns_error() {
+async fn test_fork_count_local_counts_forks() {
     let mut frontend = setup_local().await;
     let collection = create_test_collection(&mut frontend, "test_fork_count_local").await;
+    add_records(&mut frontend, &collection, vec!["doc1"]).await;
 
     let result = frontend.fork_count(collection.collection_id).await;
+    assert!(matches!(result, Ok(0)), "Expected 0 forks, got {:?}", result);
 
-    // In local SQLite mode, fork_count should return a Local error
-    assert!(
-        matches!(result, Err(CountForksError::Local)),
-        "Expected CountForksError::Local, got {:?}",
-        result
-    );
+    let forked = frontend
+        .fork_collection(
+            ForkCollectionRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection.collection_id,
+                "test_fork_count_local_fork".to_string(),
+            )
+            .expect("Failed to create fork request"),
+        )
+        .await
+        .expect("Failed to fork collection");
+
+    // The source and the fork share the lineage.
+    for collection_id in [collection.collection_id, forked.collection_id] {
+        let result = frontend.fork_count(collection_id).await;
+        assert!(matches!(result, Ok(1)), "Expected 1 fork, got {:?}", result);
+    }
 }
 
 /// Test that fork_count returns 0 for a collection with no forks.

@@ -362,8 +362,18 @@ class RustBindingsAPI(ServerAPI):
         tenant: str = DEFAULT_TENANT,
         database: str = DEFAULT_DATABASE,
     ) -> CollectionModel:
-        raise NotImplementedError(
-            "Collection forking is not implemented for Local Chroma"
+        collection = self.bindings.fork_collection(
+            str(collection_id), new_name, tenant, database
+        )
+        return CollectionModel(
+            id=collection.id,
+            name=collection.name,
+            configuration_json=collection.configuration,
+            serialized_schema=collection.schema,
+            metadata=collection.metadata,
+            dimension=collection.dimension,
+            tenant=collection.tenant,
+            database=collection.database,
         )
 
     @override
@@ -373,7 +383,7 @@ class RustBindingsAPI(ServerAPI):
         tenant: str = DEFAULT_TENANT,
         database: str = DEFAULT_DATABASE,
     ) -> int:
-        raise NotImplementedError("Fork count is not implemented for Local Chroma")
+        return self.bindings.count_forks(str(collection_id), tenant, database)
 
     @override
     def _get_indexing_status(

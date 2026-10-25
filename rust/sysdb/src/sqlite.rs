@@ -8,10 +8,10 @@ use chroma_sqlite::db::SqliteDb;
 use chroma_sqlite::helpers::{delete_metadata, get_embeddings_queue_topic_name, update_metadata};
 use chroma_sqlite::table;
 use chroma_types::{
-    Collection, CollectionAndSegments, CollectionMetadataUpdate, CollectionUuid,
+    Collection, CollectionAndSegments, CollectionMetadataUpdate, CollectionUuid, CountForksError,
     CreateCollectionError, CreateCollectionResponse, CreateDatabaseError, CreateDatabaseResponse,
     CreateTenantError, CreateTenantResponse, Database, DatabaseUuid, DeleteCollectionError,
-    DeleteDatabaseError, DeleteDatabaseResponse, GetCollectionWithSegmentsError,
+    DeleteDatabaseError, DeleteDatabaseResponse, ForkCollectionError, GetCollectionWithSegmentsError,
     GetCollectionsError, GetDatabaseError, GetSegmentsError, GetTenantError, GetTenantResponse,
     InternalCollectionConfiguration, InternalUpdateCollectionConfiguration, ListDatabasesError,
     Metadata, MetadataValue, ResetError, ResetResponse, Schema, SchemaError, Segment, SegmentScope,
@@ -768,6 +768,165 @@ impl SqliteSysDb {
             vector_segment: vector_segment.clone(),
             record_segment: metadata_segment.clone(), // single node Chroma does not have a record segment
         })
+    }
+
+    /// The fork of a collection, as the sysdb of distributed Chroma makes it
+    /// (go/pkg/sysdb/coordinator/table_catalog.go:1053-1248): a new collection in the database of the source with its
+    /// stored configuration, schema, dimension and metadata, new segments of the same type, scope and metadata, and
+    /// one more fork in the lineage of the root. The records are copied by the caller.
+    pub(crate) async fn fork_collection(
+        &self,
+        source_collection_id: CollectionUuid,
+        target_collection_id: CollectionUuid,
+        target_collection_name: String,
+    ) -> Result<CollectionAndSegments, ForkCollectionError> {
+        let mut tx = self
+            .db
+            .get_conn()
+            .begin()
+            .await
+            .map_err(|e| ForkCollectionError::Internal(e.into()))?;
+        self.db
+            .begin_immediate(&mut *tx)
+            .await
+            .map_err(|e| ForkCollectionError::Internal(e.into()))?;
+
+        let source = self
+            .get_collections_with_conn(&mut *tx, Some(source_collection_id), None, None, None, None, 0)
+            .await
+            .map_err(|e| ForkCollectionError::Internal(e.boxed()))?
+            .pop()
+            .ok_or_else(|| ForkCollectionError::NotFound(source_collection_id.to_string()))?;
+        let existing = self
+            .get_collections_with_conn(
+                &mut *tx,
+                None,
+                Some(target_collection_name.clone()),
+                Some(source.tenant.clone()),
+                Some(source.database.clone()),
+                None,
+                0,
+            )
+            .await
+            .map_err(|e| ForkCollectionError::Internal(e.boxed()))?;
+        if !existing.is_empty() {
+            return Err(ForkCollectionError::AlreadyExists(target_collection_name));
+        }
+
+        // The configuration, schema and metadata as stored, not as they read back.
+        sqlx::query(
+            "INSERT INTO collections (id, name, config_json_str, schema_str, dimension, database_id) \
+             SELECT $1, $2, config_json_str, schema_str, dimension, database_id FROM collections WHERE id = $3",
+        )
+        .bind(target_collection_id.to_string())
+        .bind(&target_collection_name)
+        .bind(source_collection_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ForkCollectionError::Internal(e.into()))?;
+        sqlx::query(
+            "INSERT INTO collection_metadata (collection_id, key, str_value, int_value, float_value, bool_value) \
+             SELECT $1, key, str_value, int_value, float_value, bool_value FROM collection_metadata \
+             WHERE collection_id = $2",
+        )
+        .bind(target_collection_id.to_string())
+        .bind(source_collection_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ForkCollectionError::Internal(e.into()))?;
+
+        let source_segments = self
+            .get_segments_with_conn(&mut *tx, source_collection_id, None, None, None)
+            .await
+            .map_err(|e| ForkCollectionError::Internal(e.boxed()))?;
+        for segment in source_segments {
+            let segment_id = SegmentUuid::new();
+            sqlx::query(
+                "INSERT INTO segments (id, type, scope, collection) \
+                 SELECT $1, type, scope, $2 FROM segments WHERE id = $3",
+            )
+            .bind(segment_id.to_string())
+            .bind(target_collection_id.to_string())
+            .bind(segment.id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ForkCollectionError::Internal(e.into()))?;
+            sqlx::query(
+                "INSERT INTO segment_metadata (segment_id, key, str_value, int_value, float_value, bool_value) \
+                 SELECT $1, key, str_value, int_value, float_value, bool_value FROM segment_metadata \
+                 WHERE segment_id = $2",
+            )
+            .bind(segment_id.to_string())
+            .bind(segment.id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ForkCollectionError::Internal(e.into()))?;
+        }
+
+        // A fork of a fork belongs to the lineage of the first source.
+        let root_collection_id: Option<String> = sqlx::query_scalar(
+            "SELECT root_collection_id FROM collection_forks WHERE target_collection_id = $1",
+        )
+        .bind(source_collection_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ForkCollectionError::Internal(e.into()))?;
+        sqlx::query(
+            "INSERT INTO collection_forks (target_collection_id, source_collection_id, root_collection_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(target_collection_id.to_string())
+        .bind(source_collection_id.to_string())
+        .bind(root_collection_id.unwrap_or_else(|| source_collection_id.to_string()))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ForkCollectionError::Internal(e.into()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ForkCollectionError::Internal(e.into()))?;
+
+        self.get_collection_with_segments(target_collection_id)
+            .await
+            .map_err(|e| ForkCollectionError::Internal(e.boxed()))
+    }
+
+    /// The number of forks in the lineage of a collection, as distributed Chroma counts them
+    /// (go/pkg/sysdb/coordinator/table_catalog.go:1251-1292): the forks of its root and of every collection forked
+    /// from it, deleted or not. When the root is deleted the lineage cannot be read.
+    pub(crate) async fn count_forks(
+        &self,
+        collection_id: CollectionUuid,
+    ) -> Result<usize, CountForksError> {
+        let exists = |id: String| async move {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM collections WHERE id = $1")
+                .bind(id)
+                .fetch_one(self.db.get_conn())
+                .await
+                .map(|count| count > 0)
+                .map_err(|e| CountForksError::Internal(e.into()))
+        };
+        if !exists(collection_id.to_string()).await? {
+            return Err(CountForksError::NotFound(collection_id.to_string()));
+        }
+        let root_collection_id: String = sqlx::query_scalar(
+            "SELECT root_collection_id FROM collection_forks WHERE target_collection_id = $1",
+        )
+        .bind(collection_id.to_string())
+        .fetch_optional(self.db.get_conn())
+        .await
+        .map_err(|e| CountForksError::Internal(e.into()))?
+        .unwrap_or_else(|| collection_id.to_string());
+        if !exists(root_collection_id.clone()).await? {
+            return Err(CountForksError::NotFound(collection_id.to_string()));
+        }
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM collection_forks WHERE root_collection_id = $1")
+                .bind(root_collection_id)
+                .fetch_one(self.db.get_conn())
+                .await
+                .map_err(|e| CountForksError::Internal(e.into()))?;
+        Ok(count as usize)
     }
 
     pub(crate) async fn reset(&self) -> Result<ResetResponse, ResetError> {

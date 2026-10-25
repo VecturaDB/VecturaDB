@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 from typing import TYPE_CHECKING, Optional, Union, List, cast, Dict, Any, Tuple
 
 from chromadb.api.models.CollectionCommon import CollectionCommon
@@ -331,7 +332,6 @@ class Collection(CollectionCommon["ServerAPI"]):
         new_name: str,
     ) -> "Collection":
         """Fork the current collection under a new name. The returning collection should contain identical data to the current collection.
-        This only works for Hosted Chroma for now.
 
         Args:
             new_name: The name of the new collection.
@@ -354,7 +354,6 @@ class Collection(CollectionCommon["ServerAPI"]):
 
     def fork_count(self) -> int:
         """Get the number of forks that exist for this collection.
-        This only works for Hosted Chroma for now.
 
         Returns:
             int: The number of forks for this collection.
@@ -371,7 +370,6 @@ class Collection(CollectionCommon["ServerAPI"]):
         read_level: ReadLevel = ReadLevel.INDEX_AND_WAL,
     ) -> SearchResult:
         """Perform hybrid search on the collection.
-        This is an experimental API that only works for distributed and hosted Chroma for now.
 
         Args:
             searches: A single Search object or a list of Search objects, each containing:

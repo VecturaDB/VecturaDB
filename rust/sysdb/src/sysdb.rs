@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use super::test_sysdb::TestSysDb;
 use crate::sqlite::SqliteSysDb;
 use crate::{DatabaseOrTopology, GetCollectionsOptions, GrpcSysDbConfig};
@@ -497,7 +498,16 @@ impl SysDb {
                     )
                     .await
             }
-            SysDb::Sqlite(_) => Err(ForkCollectionError::Local),
+            // A single node has no log offsets to carry: its writes are applied before they are acknowledged.
+            SysDb::Sqlite(sqlite) => {
+                sqlite
+                    .fork_collection(
+                        source_collection_id,
+                        target_collection_id,
+                        target_collection_name,
+                    )
+                    .await
+            }
             SysDb::Test(_) => Err(ForkCollectionError::Local),
         }
     }
@@ -508,7 +518,7 @@ impl SysDb {
     ) -> Result<usize, CountForksError> {
         match self {
             SysDb::Grpc(grpc) => grpc.count_forks(source_collection_id).await,
-            SysDb::Sqlite(_) => Err(CountForksError::Local),
+            SysDb::Sqlite(sqlite) => sqlite.count_forks(source_collection_id).await,
             SysDb::Test(test) => test.count_forks(source_collection_id).await,
         }
     }

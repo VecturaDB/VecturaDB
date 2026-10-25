@@ -3,12 +3,14 @@ title: "Collection Forking"
 description: "Instant copy-on-write collection forking in Chroma Cloud."
 ---
 
+{/* Changed from the original Chroma file; see the git history for the changes and their authors. */}
+
 import { Callout } from '/snippets/callout.mdx';
 
 Forking lets you create a new collection from an existing one instantly, using copy-on-write under the hood. The forked collection initially shares its data with the source and only incurs additional storage for incremental changes you make afterward.
 
 <Callout>
-**Forking is available in Chroma Cloud only.** The storage engine on single-node Chroma does not support forking.
+**Forking is available in Chroma Cloud and on single-node Chroma.** On a single node the fork is a full copy rather than copy-on-write; see [On single-node Chroma](#on-single-node-chroma).
 </Callout>
 
 ## How it works
@@ -92,6 +94,12 @@ If you exceed the limit, the request returns a quota error for the NUM\_FORKS ru
 
 - **Data versioning/checkpointing**: Maintain consistent snapshots as your data evolves.
 - **Git-like workflows**: For example, index a branch by forking from its divergence point, then apply the diff to the fork. This saves both write and storage costs compared to re-ingesting the entire dataset.
+
+## On single-node Chroma
+
+`PersistentClient`, `EphemeralClient` and the single-node server (`chroma run`) fork with the same API and the same results: the fork has the records, configuration, schema and metadata of the source, writes to either side stay on that side, and `fork_count` counts the forks of the whole tree, deleted ones included.
+
+The single-node storage engine has no immutable data blocks to share, so the fork writes the records of the source again into the new collection. It takes time and storage in proportion to the size of the source, and the HNSW index of the fork is built anew from the current records. The limit on fork edges is a Chroma Cloud quota and does not apply.
 
 ## Notes
 

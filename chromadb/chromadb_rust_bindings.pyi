@@ -195,6 +195,19 @@ class Bindings:
         tenant: str = DEFAULT_TENANT,
         database: str = DEFAULT_DATABASE,
     ) -> CollectionModel: ...
+    def fork_collection(
+        self,
+        collection_id: str,
+        new_name: str,
+        tenant: str = DEFAULT_TENANT,
+        database: str = DEFAULT_DATABASE,
+    ) -> CollectionModel: ...
+    def count_forks(
+        self,
+        collection_id: str,
+        tenant: str = DEFAULT_TENANT,
+        database: str = DEFAULT_DATABASE,
+    ) -> int: ...
     def get_collection_by_id(
         self,
         collection_id: str,

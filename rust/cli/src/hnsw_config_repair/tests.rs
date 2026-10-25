@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use super::*;
 use chroma_config::{registry::Registry, Configurable};
 use chroma_frontend::{impls::service_based_frontend::ServiceBasedFrontend, FrontendConfig};
@@ -269,6 +270,10 @@ async fn repairs_legacy_construction_settings_and_preserves_records_and_logs() {
                 .await
                 .unwrap();
             sqlx::query("DROP TABLE index_cleanup")
+                .execute(&mut db)
+                .await
+                .unwrap();
+            sqlx::query("DROP TABLE collection_forks")
                 .execute(&mut db)
                 .await
                 .unwrap();
