@@ -34,6 +34,15 @@ jobs:
         arch: [x86_64, aarch64]
     runs-on: ubuntu-24.04
     steps:
+      - name: Machine
+        shell: bash
+        continue-on-error: true
+        run: |
+          case "$RUNNER_OS" in
+            Linux) lscpu | grep -E '^(Model name|CPU\(s\)|Thread\(s\) per core|Core\(s\) per socket|Socket\(s\)):' ;;
+            macOS) sysctl -n machdep.cpu.brand_string; sysctl hw.physicalcpu hw.logicalcpu ;;
+            Windows) powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors" ;;
+          esac
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: CLI version from the release tag
         if: inputs.version != ''
@@ -58,6 +67,15 @@ jobs:
     name: CLI Windows x64
     runs-on: windows-latest
     steps:
+      - name: Machine
+        shell: bash
+        continue-on-error: true
+        run: |
+          case "$RUNNER_OS" in
+            Linux) lscpu | grep -E '^(Model name|CPU\(s\)|Thread\(s\) per core|Core\(s\) per socket|Socket\(s\)):' ;;
+            macOS) sysctl -n machdep.cpu.brand_string; sysctl hw.physicalcpu hw.logicalcpu ;;
+            Windows) powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors" ;;
+          esac
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: CLI version from the release tag
         if: inputs.version != ''
@@ -85,6 +103,15 @@ jobs:
           - { target: x86_64-apple-darwin, name: x64 }
     runs-on: macos-14
     steps:
+      - name: Machine
+        shell: bash
+        continue-on-error: true
+        run: |
+          case "$RUNNER_OS" in
+            Linux) lscpu | grep -E '^(Model name|CPU\(s\)|Thread\(s\) per core|Core\(s\) per socket|Socket\(s\)):' ;;
+            macOS) sysctl -n machdep.cpu.brand_string; sysctl hw.physicalcpu hw.logicalcpu ;;
+            Windows) powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors" ;;
+          esac
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: CLI version from the release tag
         if: inputs.version != ''
@@ -198,6 +225,15 @@ jobs:
       RUST_BACKTRACE: 1
       RUST_MIN_STACK_SIZE: 8388608
     steps:
+      - name: Machine
+        shell: bash
+        continue-on-error: true
+        run: |
+          case "$RUNNER_OS" in
+            Linux) lscpu | grep -E '^(Model name|CPU\(s\)|Thread\(s\) per core|Core\(s\) per socket|Socket\(s\)):' ;;
+            macOS) sysctl -n machdep.cpu.brand_string; sysctl hw.physicalcpu hw.logicalcpu ;;
+            Windows) powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors" ;;
+          esac
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust
         with:
