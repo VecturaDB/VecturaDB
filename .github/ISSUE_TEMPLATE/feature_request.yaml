@@ -1,5 +1,6 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 name: 🚀 Feature request
-description: Suggest an idea for Chroma
+description: Suggest an idea for VecturaDB
 title: "[Feature Request]: "
 labels: ["enhancement"]
 body:
@@ -36,7 +37,7 @@ body:
       options:
         - nice to have
         - would make my life easier
-        - i cannot use Chroma without it
+        - i cannot use VecturaDB without it
     validations:
       required: true
   - type: textarea

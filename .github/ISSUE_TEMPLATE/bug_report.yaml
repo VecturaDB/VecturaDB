@@ -1,5 +1,6 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 name: 🐛 Bug Report
-description: File a bug report to help us improve Chroma
+description: File a bug report to help us improve VecturaDB
 title: "[Bug]: "
 labels: ["bug", "triage"]
 # assignees:
@@ -22,8 +23,8 @@ body:
     id: versions
     attributes:
       label: Versions
-      description: Your Chroma, Python, and OS versions, as well as whatever else you think relevant. Check that you have [the latest Chroma](https://github.com/chroma-core/chroma/pkgs/container/chroma) as we are a fast moving pre v1.0 project.
-      placeholder: Chroma v0.3.22, Python 3.9.6, MacOS 12.5
+      description: Your VecturaDB, Python, and OS versions, how you run VecturaDB (Python package, Docker image or CLI), and whatever else you think relevant. Check that you have [the latest release](https://github.com/VecturaDB/VecturaDB/releases).
+      placeholder: VecturaDB 1.0.0-preview.1, Python 3.12, macOS 15, Docker image
 #       value: "A bug happened!"
     validations:
       required: true

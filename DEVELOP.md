@@ -1,3 +1,5 @@
+<!-- Changed from the original Chroma file; see the git history for the changes and their authors. -->
+
 # Development Instructions
 
 This project uses the testing, build and release standards specified
@@ -20,7 +22,7 @@ pre-commit install # install the precommit hooks
 Install protobuf:
 for MacOS `brew install protobuf`
 
-You can also install `chromadb` the `pypi` package locally and in editable mode with `pip install -e .`.
+You can also install the `VecturaDB` package (import name `chromadb`) locally and in editable mode with `pip install -e .`.
 
 ## Local dev setup for distributed chroma
 
@@ -85,27 +87,14 @@ Not yet implemented.
 
 ## Versioning
 
-This project uses PyPA's `setuptools_scm` module to determine the
-version number for build artifacts, meaning the version number is
-derived from Git rather than hardcoded in the repository. For full
-details, see the
-[documentation for setuptools_scm](https://github.com/pypa/setuptools_scm/).
+A release takes its version from its tag, as [RELEASE_PROCESS.md](RELEASE_PROCESS.md) describes: `vX.Y.Z`, or `vX.Y.Z-preview.N` for a preview. The CLI carries the version as written. The Python wheels carry its PEP 440 form, so `1.0.0-preview.1` is `1.0.0rc1` on PyPI.
 
-In brief, version numbers are generated as follows:
+Between releases:
 
-- If the current git head is tagged, the version number is exactly the
-  tag (e.g, `0.0.1`).
-- If the current git head is a clean checkout, but is not tagged,
-  the version number is a patch version increment of the most recent
-  tag, plus `devN` where N is the number of commits since the most
-  recent tag. For example, if there have been 5 commits since the
-  `0.0.1` tag, the generated version will be `0.0.2-dev5`.
-- If the current head is not a clean checkout, a `+dirty` local
-  version will be appended to the version number. For example,
-  `0.0.2-dev5+dirty`.
+- the CLI takes the version in `rust/cli/Cargo.toml`, which is set to the next release after each release;
+- the wheels built by the CI take their version from `setuptools_scm`. It does not read the `vX.Y.Z-preview.N` tags, so it counts the commits instead, for example `0.1.dev4710`. These wheels are not published.
 
-At any point, you can manually run `python -m setuptools_scm` to see
-what version would be assigned given your current state.
+Run `python -m setuptools_scm` to see the version a wheel built now would get.
 
 ## Continuous Integration
 
