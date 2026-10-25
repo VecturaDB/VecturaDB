@@ -66,7 +66,7 @@ fn login_success_message(team_name: &str, profile_name: &str, config_dir: &str) 
 fn set_profile_message(profile_name: &str) -> String {
     format!(
         "To set this profile as the current profile: {} {}",
-        "chroma profile use".yellow(),
+        "vecturadb profile use".yellow(),
         profile_name.yellow(),
     )
 }
@@ -74,8 +74,8 @@ fn set_profile_message(profile_name: &str) -> String {
 fn next_steps_message() -> String {
     format!(
         "Try this next:\n   Copy your collections out of Chroma Cloud\n    {}\n\nFor a full list of commands:\n   {}",
-        "chroma copy --from-cloud --to-local --all".yellow(),
-        "chroma --help".yellow()
+        "vecturadb copy --from-cloud --to-local --all".yellow(),
+        "vecturadb --help".yellow()
     )
 }
 

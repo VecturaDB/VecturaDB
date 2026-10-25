@@ -50,7 +50,7 @@ jobs:
         run: |
           mkdir ctx
           cp vecturadb/docker/Dockerfile vecturadb/docker/config.yaml ctx/
-          cp chroma-linux-x86_64 ctx/chroma-amd64 && cp chroma-linux-aarch64 ctx/chroma-arm64 && chmod +x ctx/chroma-*
+          cp vecturadb-linux-x86_64 ctx/vecturadb-amd64 && cp vecturadb-linux-aarch64 ctx/vecturadb-arm64 && chmod +x ctx/vecturadb-*
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
@@ -63,8 +63,10 @@ jobs:
           IMAGE: ghcr.io/vecturadb/vecturadb
           VERSION: ${{ needs.version.outputs.version }}
           CHANNEL: ${{ needs.version.outputs.prerelease == 'true' && 'preview' || 'latest' }}
+          DESCRIPTION: "Vector database compatible with the Chroma API. Independent project. Not affiliated with, endorsed by or sponsored by Chroma Inc. CHROMA is a registered trademark of Chroma Inc., used here only to describe compatibility."
         run: >-
           docker buildx build --platform linux/amd64,linux/arm64 --build-arg REVISION=${{ github.sha }}
+          --annotation "index:org.opencontainers.image.description=$DESCRIPTION"
           -t "$IMAGE:$VERSION" -t "$IMAGE:$CHANNEL" --push ctx
 
   github-release:

@@ -1,3 +1,5 @@
+// Changed by VecturaDB contributors for the VecturaDB branding.
+// Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
 use crate::config_store::{ConfigStore, FileConfigStore};
 use crate::terminal::{SystemTerminal, Terminal};
 use crate::utils::{CliConfig, CliError, Profiles};
@@ -9,9 +11,9 @@ use thiserror::Error;
 pub enum ProfileError {
     #[error("Profile {0} not found")]
     ProfileNotFound(String),
-    #[error("No current profile found.\nTo set a new profile use: chroma login")]
+    #[error("No current profile found.\nTo set a new profile use: vecturadb login")]
     NoActiveProfile,
-    #[error("Profile {0} already exists.\nTo delete it use: chroma profile delete {0}")]
+    #[error("Profile {0} already exists.\nTo delete it use: vecturadb profile delete {0}")]
     ProfileAlreadyExists(String),
 }
 
@@ -63,7 +65,7 @@ fn confirm_profile_delete_message(profile_name: &str) -> String {
             .bold(),
         "All Chroma Cloud CLI operations will fail without an active profile.",
         "If you wish to proceed, please use:",
-        "chroma profile use <profile name>".yellow(),
+        "vecturadb profile use <profile name>".yellow(),
         "to set a new profile",
         profile_name
     )
@@ -85,7 +87,7 @@ fn profile_delete_success_message(profile_name: &str) -> String {
 fn no_profiles_found_message() -> String {
     format!(
         "No profiles defined at the moment. To add a new profile use {}",
-        "chroma login".yellow()
+        "vecturadb login".yellow()
     )
 }
 
@@ -98,8 +100,8 @@ fn current_profile_set_message(profile_name: &str) -> String {
 fn no_current_profile_message() -> String {
     format!(
         "No profile set currently. Please use {} to add a profile, or {} to set an existing profile",
-        "chroma login".yellow(),
-        "chroma profile use <profile name>".yellow()
+        "vecturadb login".yellow(),
+        "vecturadb profile use <profile name>".yellow()
     )
 }
 

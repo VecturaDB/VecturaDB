@@ -1,3 +1,5 @@
+// Changed by VecturaDB contributors for the VecturaDB branding.
+// Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
 use crate::config_store::{ConfigStore, FileConfigStore};
 use crate::terminal::{SystemTerminal, Terminal};
 use crate::ui_utils::read_secret;
@@ -26,7 +28,7 @@ pub enum InstallError {
     GithubDownloadFailed,
     #[error("No such app {0}")]
     NoSuchApp(String),
-    #[error("Sample app {0} requires Chroma CLI with version {1}. Please update your CLI using `chroma update`")]
+    #[error("Sample app {0} requires Chroma CLI with version {1}. Please update your CLI using `vecturadb update`")]
     VersionMismatch(String, String),
     #[error("Failed to get sample apps listings")]
     ListingsDownloadFailed,

@@ -1,6 +1,8 @@
 VecturaDB
 Copyright VecturaDB contributors
 
+VecturaDB is an independent fork of Chroma, under the Apache License 2.0. The original code is copyright Chroma Inc. and its contributors.
+
 This product includes Chroma (https://github.com/chroma-core/chroma), licensed under the Apache License,
 Version 2.0. Chroma ships no NOTICE file; its copyright and license notices stay in its files as they are.
 The files changed by VecturaDB contributors say so at the top.
