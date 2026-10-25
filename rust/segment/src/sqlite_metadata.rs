@@ -1288,22 +1288,21 @@ impl SqliteMetadataReader {
         }
 
         if metadata && !records.is_empty() {
-            // Reuse the selection subquery instead of binding one parameter
-            // per returned record (Get without a limit may select many rows).
-            let (sql, values) = Query::select()
-                .column((alias.clone(), Embeddings::Id))
-                .column((Alias::new("sparse"), Alias::new("key")))
-                .column((Alias::new("sparse"), Alias::new("value")))
-                .from_subquery(filter_limit_query, alias.clone())
-                .join_as(
-                    sea_query::JoinType::InnerJoin,
-                    Alias::new("embedding_metadata_sparse"),
-                    Alias::new("sparse"),
-                    Expr::col((alias.clone(), Embeddings::Id))
-                        .equals((Alias::new("sparse"), Alias::new("id"))),
-                )
-                .build_sqlx(SqliteQueryBuilder);
-            for row in sqlx::query_with(&sql, values).fetch_all(&mut *conn).await? {
+            // The sparse vectors of the rows already selected, in batches: evaluating the selection again would
+            // double the cost of a Get with a large filter.
+            let offset_ids: Vec<u32> = records.keys().copied().collect();
+            let mut rows = Vec::new();
+            for batch in offset_ids.chunks(500) {
+                let (sql, values) = Query::select()
+                    .columns([Alias::new("id"), Alias::new("key"), Alias::new("value")])
+                    .from(Alias::new("embedding_metadata_sparse"))
+                    .and_where(
+                        Expr::col(Alias::new("id")).is_in(batch.iter().map(|id| *id as i64)),
+                    )
+                    .build_sqlx(SqliteQueryBuilder);
+                rows.extend(sqlx::query_with(&sql, values).fetch_all(&mut *conn).await?);
+            }
+            for row in rows {
                 let id: u32 = row.try_get(0)?;
                 let key: String = row.try_get(1)?;
                 let value: String = row.try_get(2)?;
@@ -3098,6 +3097,56 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    // A Get with metadata reads the sparse vector of every selected row, across batches, and only of those rows.
+    #[tokio::test]
+    async fn test_get_reads_sparse_vectors_of_every_selected_row() {
+        let logs = (0..1200)
+            .map(|i| {
+                let mut log = sparse_log(
+                    i as i64 + 1,
+                    &format!("r{i}"),
+                    Operation::Add,
+                    Some(UpdateMetadataValue::SparseVector(
+                        chroma_types::SparseVector::from_pairs(vec![(i as u32, 1.0)]),
+                    )),
+                );
+                log.record
+                    .metadata
+                    .as_mut()
+                    .unwrap()
+                    .insert("i".into(), UpdateMetadataValue::Int(i));
+                log
+            })
+            .collect();
+        let (reader, cas) = setup_with_logs(logs).await;
+        let first_1100 = Where::Metadata(MetadataExpression {
+            key: "i".into(),
+            comparison: MetadataComparison::Primitive(
+                PrimitiveOperator::LessThan,
+                MetadataValue::Int(1100),
+            ),
+        });
+        let records = reader
+            .get(make_get_plan(&cas, Some(first_1100)))
+            .await
+            .unwrap()
+            .result
+            .records;
+        assert_eq!(records.len(), 1100);
+        for record in records {
+            let metadata = record.metadata.unwrap();
+            let Some(MetadataValue::Int(i)) = metadata.get("i") else {
+                panic!("missing i");
+            };
+            assert_eq!(
+                metadata.get("sparse"),
+                Some(&MetadataValue::SparseVector(
+                    chroma_types::SparseVector::from_pairs(vec![(*i as u32, 1.0)])
+                ))
+            );
+        }
     }
 
     #[tokio::test]
