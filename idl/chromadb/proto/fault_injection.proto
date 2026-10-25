@@ -1,9 +1,8 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 syntax = "proto3";
 
 package chroma;
 option go_package = "github.com/chroma-core/chroma/go/pkg/proto/faultspb";
-
-import "chromadb/proto/chroma.proto";
 
 message SelectFileLine {
   string file = 1;
