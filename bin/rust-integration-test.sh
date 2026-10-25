@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 
 set -e
 
@@ -24,8 +25,8 @@ fi
 if [[ -n "${CHROMA_BIN:-}" ]]; then
     "$CHROMA_BIN" run bin/rust_single_node_integration_test_config.yaml &
 else
-    cargo build --bin chroma
-    cargo run --bin chroma -- run bin/rust_single_node_integration_test_config.yaml &
+    cargo build --bin vecturadb
+    cargo run --bin vecturadb -- run bin/rust_single_node_integration_test_config.yaml &
 fi
 server_pid="$!"
 

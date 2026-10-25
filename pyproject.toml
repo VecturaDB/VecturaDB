@@ -4,8 +4,8 @@
 name = "VecturaDB"
 dynamic = ["version"]
 
-authors = [{ name = "Jeff Huber", email = "jeff@trychroma.com" }, { name = "Anton Troynikov", email = "anton@trychroma.com" }, { name = "VecturaDB contributors" }]
-description = "Vector database compatible with the Chroma API, bringing Chroma Cloud's features to open source."
+authors = [{ name = "VecturaDB contributors" }]
+description = "Vector database compatible with the Chroma API, bringing Chroma Cloud's features to open source. Independent project. Not affiliated with, endorsed by or sponsored by Chroma Inc. CHROMA is a registered trademark of Chroma Inc., used here only to describe compatibility."
 readme = "README.md"
 requires-python = ">=3.9"
 classifiers = ["Programming Language :: Python :: 3", "License :: OSI Approved :: Apache Software License", "Operating System :: OS Independent"]
@@ -34,6 +34,7 @@ ignore_errors = true
 
 [project.scripts]
 chroma = "chromadb.cli.cli:app"
+vecturadb = "chromadb.cli.cli:app"
 
 [project.urls]
 "Homepage" = "https://vecturadb.org"

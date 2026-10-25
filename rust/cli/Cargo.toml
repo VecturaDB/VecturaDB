@@ -57,7 +57,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 uuid = { workspace = true }
 
 [[bin]]
-name = "chroma"
+name = "vecturadb"
 path = "src/main.rs"
 
 [[bin]]

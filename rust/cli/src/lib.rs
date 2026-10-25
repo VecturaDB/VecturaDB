@@ -52,7 +52,7 @@ enum Command {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "chroma")]
+#[command(name = "vecturadb")]
 #[command(version)]
 #[command(about = "VecturaDB, compatible with the Chroma API", long_about = None)]
 struct Cli {

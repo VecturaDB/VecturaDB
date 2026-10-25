@@ -1,3 +1,5 @@
+// Changed by VecturaDB contributors for the VecturaDB branding.
+// Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
 use crate::config_store::{ConfigStore, FileConfigStore};
 use crate::terminal::{SystemTerminal, Terminal};
 use crate::ui_utils::copy_to_clipboard;
@@ -130,7 +132,7 @@ fn no_dbs_message(profile_name: &str) -> String {
     format!(
         "Profile {} has 0 DBs. To create a new Chroma DB use: {}",
         profile_name,
-        "chroma db create <db name>".yellow()
+        "vecturadb db create <db name>".yellow()
     )
 }
 
@@ -151,7 +153,7 @@ fn create_db_already_exists_message(name: &str) -> String {
         "DB with name".red(),
         name.red(),
         "already exists!".red(),
-        "chroma db delete".yellow(),
+        "vecturadb db delete".yellow(),
         name.yellow()
     )
 }
@@ -170,7 +172,7 @@ fn create_db_success_message(name: &str) -> String {
         "\nDatabase".green(),
         name.green(),
         "created successfully!".green(),
-        "chroma db connect".yellow(),
+        "vecturadb db connect".yellow(),
         name.yellow()
     )
 }
