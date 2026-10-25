@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use super::*;
 use crate::sqlite_log::{LegacyEmbeddingsQueueConfig, SqliteLog, SqlitePushLogsError};
 use chroma_segment::local_segment_manager::LocalSegmentManagerConfig;

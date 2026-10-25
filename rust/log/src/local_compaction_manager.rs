@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 
