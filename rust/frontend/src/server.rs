@@ -4294,6 +4294,28 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_collection_by_crn_is_not_supported_on_a_single_node() {
+        let port = test_server(FrontendServerConfig::single_node_default()).await;
+        let response = Client::new()
+            .get(format!(
+                "http://127.0.0.1:{port}/api/v2/collections/resource:default_database:missing"
+            ))
+            .send()
+            .await
+            .expect("an answer, not a closed connection");
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = response.json::<serde_json::Value>().await.unwrap();
+        // As the other calls that the SQLite sysdb does not support, through its tonic status.
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("get_collection_by_crn is not supported in SqliteSysDb"),
+            "{body}"
+        );
+    }
+
     #[test]
     fn test_openapi_describes_the_server_block() {
         use utoipa::OpenApi;
