@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use crate::client::dashboard_client::DashboardClientError;
 use crate::commands::browse::BrowseError;
 use crate::commands::copy::CopyError;
@@ -131,6 +132,7 @@ pub async fn connect_local(
         let port = find_available_port()?;
         config.persist_path = path;
         config.port = port;
+        config.server_info = Some(crate::commands::run::server_info());
 
         let host = format!("http://localhost:{}", config.port);
         let handle = spawn(async move {

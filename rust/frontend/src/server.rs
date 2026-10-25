@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use async_trait::async_trait;
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
@@ -33,10 +34,10 @@ use chroma_types::{
     HealthCheckResponse, IndexStatusResponse, InternalCollectionConfiguration,
     InternalUpdateCollectionConfiguration, ListCollectionsRequest, ListCollectionsResponse,
     ListDatabasesRequest, ListDatabasesResponse, QueryRequest, QueryRequestPayload, QueryResponse,
-    Schema, SearchRequest, SearchRequestPayload, SearchResponse, UpdateCollectionPayload,
-    UpdateCollectionRecordsPayload, UpdateCollectionRecordsResponse, UpdateCollectionResponse,
-    UpdateTenantRequest, UpdateTenantResponse, UpsertCollectionRecordsPayload,
-    UpsertCollectionRecordsResponse,
+    Schema, SearchRequest, SearchRequestPayload, SearchResponse, ServerInfo,
+    UpdateCollectionPayload, UpdateCollectionRecordsPayload, UpdateCollectionRecordsResponse,
+    UpdateCollectionResponse, UpdateTenantRequest, UpdateTenantResponse,
+    UpsertCollectionRecordsPayload, UpsertCollectionRecordsResponse,
 };
 use frontend_core::auth::AuthError;
 use frontend_core::routes::{SystemMetrics, SystemState};
@@ -536,6 +537,10 @@ impl SystemState for FrontendServer {
         // TODO: Decide on how to handle versioning across python / rust frontend
         // for now return a hardcoded version
         "1.0.0".to_string()
+    }
+
+    fn server_info(&self) -> Option<ServerInfo> {
+        self.config.server_info.clone()
     }
 
     fn auth(&self) -> &dyn AuthenticateAndAuthorize {
@@ -4103,10 +4108,18 @@ mod tests {
     use crate::{config::FrontendServerConfig, Frontend, FrontendServer};
     use chroma_config::{registry::Registry, Configurable};
     use chroma_system::System;
+    use chroma_types::ServerInfo;
     use reqwest::{Client, Method, RequestBuilder, StatusCode};
     use std::sync::Arc;
 
-    async fn test_server(mut config: FrontendServerConfig) -> u16 {
+    async fn test_server(config: FrontendServerConfig) -> u16 {
+        test_server_with_auth(config, Arc::new(())).await
+    }
+
+    async fn test_server_with_auth(
+        mut config: FrontendServerConfig,
+        auth: Arc<dyn crate::auth::AuthenticateAndAuthorize>,
+    ) -> u16 {
         let registry = Registry::new();
         let system = System::new();
 
@@ -4116,14 +4129,7 @@ mod tests {
         let frontend = Frontend::try_from_config(&(config.clone().frontend, system), &registry)
             .await
             .unwrap();
-        let app = FrontendServer::new(
-            config,
-            frontend,
-            vec![],
-            Arc::new(()),
-            Arc::new(()),
-            System::new(),
-        );
+        let app = FrontendServer::new(config, frontend, vec![], auth, Arc::new(()), System::new());
 
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
@@ -4158,6 +4164,116 @@ mod tests {
 
     fn multi_region_database() -> &'static str {
         "topology+multiregiondb"
+    }
+
+    #[tokio::test]
+    async fn test_pre_flight_checks_server_block() {
+        async fn pre_flight_checks(config: FrontendServerConfig) -> serde_json::Value {
+            let port = test_server(config).await;
+            Client::new()
+                .get(format!("http://127.0.0.1:{port}/api/v2/pre-flight-checks"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap()
+        }
+
+        // Without the block, Chroma's answer: the two fields and nothing else.
+        let config = FrontendServerConfig::single_node_default();
+        let answer = pre_flight_checks(config.clone()).await;
+        let max_batch_size = answer["max_batch_size"].clone();
+        assert!(max_batch_size.as_u64().unwrap() > 0);
+        assert_eq!(
+            answer,
+            serde_json::json!({"max_batch_size": max_batch_size, "supports_base64_encoding": true})
+        );
+
+        // Without authentication, the block goes to everyone.
+        let mut config = config;
+        config.server_info = Some(ServerInfo {
+            name: "VecturaDB".to_string(),
+            version: "1.0.0-preview.2".to_string(),
+            features: vec!["sparse_vector_index".to_string(), "fork".to_string()],
+        });
+        assert_eq!(
+            pre_flight_checks(config).await,
+            serde_json::json!({
+                "max_batch_size": max_batch_size,
+                "supports_base64_encoding": true,
+                "server": {
+                    "name": "VecturaDB",
+                    "version": "1.0.0-preview.2",
+                    "features": ["sparse_vector_index", "fork"],
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pre_flight_checks_server_block_only_with_a_valid_key() {
+        let mut config = FrontendServerConfig::single_node_default();
+        config.server_authn_credentials = Some("key-a".to_string());
+        config.server_info = Some(ServerInfo {
+            name: "VecturaDB".to_string(),
+            version: "1.0.0-preview.2".to_string(),
+            features: vec!["api_keys".to_string()],
+        });
+        let auth = crate::token_auth::TokenAuthentication::from_config(&config)
+            .unwrap()
+            .unwrap();
+        let port = test_server_with_auth(config, Arc::new(auth)).await;
+        let pre_flight_checks = move |key: Option<&'static str>| async move {
+            let mut request =
+                Client::new().get(format!("http://127.0.0.1:{port}/api/v2/pre-flight-checks"));
+            if let Some(key) = key {
+                request = request.header("x-chroma-token", key);
+            }
+            let response = request.send().await.unwrap();
+            // Never a 401: a client asks before it knows how to authenticate.
+            assert_eq!(response.status(), StatusCode::OK);
+            response.json::<serde_json::Value>().await.unwrap()
+        };
+        // Without a valid key, Chroma's answer.
+        let chroma = pre_flight_checks(None).await;
+        let max_batch_size = chroma["max_batch_size"].clone();
+        assert_eq!(
+            chroma,
+            serde_json::json!({"max_batch_size": max_batch_size, "supports_base64_encoding": true})
+        );
+        assert_eq!(pre_flight_checks(Some("key-b")).await, chroma);
+        assert_eq!(
+            pre_flight_checks(Some("key-a")).await,
+            serde_json::json!({
+                "max_batch_size": max_batch_size,
+                "supports_base64_encoding": true,
+                "server": {
+                    "name": "VecturaDB",
+                    "version": "1.0.0-preview.2",
+                    "features": ["api_keys"],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn test_openapi_describes_the_server_block() {
+        use utoipa::OpenApi;
+        let openapi = serde_json::to_value(super::ApiDoc::openapi()).unwrap();
+        let schemas = &openapi["components"]["schemas"];
+        // The fields of Chroma stay required, the block is optional.
+        assert_eq!(
+            schemas["ChecklistResponse"]["required"],
+            serde_json::json!(["max_batch_size", "supports_base64_encoding"])
+        );
+        assert!(schemas["ChecklistResponse"]["properties"]["server"].is_object());
+        assert_eq!(
+            schemas["ServerInfo"]["required"],
+            serde_json::json!(["name", "version", "features"])
+        );
     }
 
     #[tokio::test]

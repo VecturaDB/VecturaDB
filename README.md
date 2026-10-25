@@ -91,6 +91,24 @@ The copy stops at the first collection it cannot create. The collections copied 
 
 What arrives: every record with its document, metadata, embedding and URI, the metadata of the collection, and its schema, sparse and BM25 indexes included. Sparse and BM25 searches give the same scores as on Chroma Cloud. The settings of the dense index do not arrive: Chroma Cloud uses SPANN, VecturaDB uses HNSW with its default settings.
 
+## Clients
+
+A client that needs to know which server it talks to reads `GET /api/v2/pre-flight-checks`. VecturaDB answers with the fields of Chroma and adds a `server` block, for example:
+
+```json
+{"max_batch_size": 5461, "supports_base64_encoding": true, "server": {"name": "VecturaDB", "version": "1.0.0-preview.N", "features": ["sparse_vector_index", "bm25", "search", "fork", "api_keys"]}}
+```
+
+`features` lists what VecturaDB has beyond single-node Chroma:
+
+- `sparse_vector_index`: sparse vector indexes in the schema of a collection;
+- `bm25`: sparse indexes with BM25 scoring;
+- `search`: the Search API, hybrid search included;
+- `fork`: collection fork and fork count;
+- `api_keys`: API keys, as on Chroma Cloud.
+
+With [API keys](docs/mintlify/guides/deploy/client-server-mode.mdx), only a request with a valid key gets the block. Chroma does not send the block, and the clients of Chroma ignore it. `GET /api/v2/version` answers `1.0.0`, as Chroma does.
+
 ## Telemetry
 
 Telemetry is off by default. Setting `ANONYMIZED_TELEMETRY=TRUE` turns on the anonymized telemetry inherited from Chroma (PostHog, Python package only). The server binary sends none.

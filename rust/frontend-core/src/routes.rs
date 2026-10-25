@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 //! Shared HTTP routes that any frontend binary in this workspace can embed.
 //!
 //! These cover the generic "System" endpoints (heartbeat, healthcheck,
@@ -15,7 +16,7 @@ use axum::{
     Json, Router,
 };
 use chroma_api_types::{GetUserIdentityResponse, HeartbeatResponse};
-use chroma_types::{ChecklistResponse, HealthCheckResponse};
+use chroma_types::{ChecklistResponse, HealthCheckResponse, ServerInfo};
 use opentelemetry::metrics::{Counter, Meter};
 
 use crate::auth::AuthenticateAndAuthorize;
@@ -52,6 +53,10 @@ pub trait SystemState: Clone + Send + Sync + 'static {
     async fn heartbeat(&self) -> Result<HeartbeatResponse, ServerError>;
     fn max_batch_size(&self) -> u32;
     fn version(&self) -> String;
+    /// The `server` block of the pre-flight checks; without it the answer is Chroma's.
+    fn server_info(&self) -> Option<ServerInfo> {
+        None
+    }
     fn auth(&self) -> &dyn AuthenticateAndAuthorize;
     fn system_metrics(&self) -> &SystemMetrics;
 }
@@ -128,7 +133,7 @@ pub async fn heartbeat<S: SystemState>(
     get,
     path = "/api/v2/pre-flight-checks",
     summary = "Pre-flight checks",
-    description = "Returns basic readiness information.",
+    description = "Returns basic readiness information. A server with API keys adds its `server` block only for a request with a valid key.",
     tag = "System",
     responses(
         (status = 200, description = "Pre flight checks", body = ChecklistResponse),
@@ -136,12 +141,20 @@ pub async fn heartbeat<S: SystemState>(
     )
 )]
 pub async fn pre_flight_checks<S: SystemState>(
+    headers: HeaderMap,
     State(server): State<S>,
 ) -> Result<Json<ChecklistResponse>, ServerError> {
     server.system_metrics().pre_flight_checks.add(1, &[]);
+    // The block goes only to whom the server knows, which without authentication is everyone. Never a 401: without
+    // a valid key the answer is Chroma's.
+    let server_info = match server.server_info() {
+        Some(info) if server.auth().get_user_identity(&headers).await.is_ok() => Some(info),
+        _ => None,
+    };
     Ok(Json(ChecklistResponse {
         max_batch_size: server.max_batch_size(),
         supports_base64_encoding: true,
+        server: server_info,
     }))
 }
 

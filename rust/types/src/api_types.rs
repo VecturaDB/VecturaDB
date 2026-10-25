@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use crate::collection_configuration::InternalCollectionConfiguration;
 use crate::collection_configuration::InternalUpdateCollectionConfiguration;
 use crate::error::QueryConversionError;
@@ -194,6 +195,23 @@ impl ChromaError for ResetError {
 pub struct ChecklistResponse {
     pub max_batch_size: u32,
     pub supports_base64_encoding: bool,
+    /// The server that answers, when it says it: with API keys, only to a request with a valid key. Chroma does
+    /// not send it, so the other fields stay as Chroma's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<ServerInfo>,
+}
+
+/// The server behind the API, for the clients that adapt to it.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct ServerInfo {
+    /// The name of the server, such as `VecturaDB`.
+    pub name: String,
+    /// The version of the server, which `/api/v2/version` does not give.
+    pub version: String,
+    /// What the server has beyond the single node of Chroma, such as `sparse_vector_index`, `bm25`, `search`,
+    /// `fork` and `api_keys`.
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Error)]

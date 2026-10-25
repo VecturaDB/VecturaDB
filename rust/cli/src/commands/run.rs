@@ -7,6 +7,7 @@ use chroma_frontend::auth::AuthenticateAndAuthorize;
 use chroma_frontend::config::FrontendServerConfig;
 use chroma_frontend::frontend_service_entrypoint_with_config;
 use chroma_frontend::token_auth::TokenAuthentication;
+use chroma_types::ServerInfo;
 use chrono::{Datelike, Local};
 use clap::Parser;
 use colored::Colorize;
@@ -94,6 +95,18 @@ fn override_default_config_with_args(args: RunArgs) -> Result<FrontendServerConf
     Ok(config)
 }
 
+/// The `server` block of `/api/v2/pre-flight-checks`: what VecturaDB has beyond the single node of Chroma. The
+/// release sets the version of this crate to the tag's (.github/workflows/ci.yml, "CLI version from the release tag").
+pub(crate) fn server_info() -> ServerInfo {
+    ServerInfo {
+        name: "VecturaDB".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        features: ["sparse_vector_index", "bm25", "search", "fork", "api_keys"]
+            .map(String::from)
+            .to_vec(),
+    }
+}
+
 fn display_run_message(config: &FrontendServerConfig, term: &mut dyn Terminal) {
     let now = Local::now();
 
@@ -121,7 +134,7 @@ fn display_run_message(config: &FrontendServerConfig, term: &mut dyn Terminal) {
 pub fn run(args: RunArgs) -> Result<(), CliError> {
     let mut term = SystemTerminal;
 
-    let config = match &args.config_path {
+    let mut config = match &args.config_path {
         Some(config_path) => {
             if !std::path::Path::new(config_path).exists() {
                 eprintln!(
@@ -143,6 +156,8 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
             config
         }
     };
+
+    config.server_info = Some(server_info());
 
     display_run_message(&config, &mut term);
 
