@@ -471,6 +471,12 @@ pub trait QuotaEnforcer: Send + Sync {
             dyn Future<Output = Result<Option<QuotaOverrides>, QuotaEnforcerError>> + Send + 'other,
         >,
     >;
+
+    /// Whether enforce reads the schema of the collection, which the endpoints of writes then read to fill the
+    /// payload.
+    fn uses_schema(&self) -> bool {
+        true
+    }
 }
 
 impl QuotaEnforcer for () {
@@ -480,6 +486,10 @@ impl QuotaEnforcer for () {
     ) -> Pin<Box<dyn Future<Output = Result<Option<QuotaOverrides>, QuotaEnforcerError>> + Send + 'a>>
     {
         Box::pin(ready(Ok(None)))
+    }
+
+    fn uses_schema(&self) -> bool {
+        false
     }
 }
 
