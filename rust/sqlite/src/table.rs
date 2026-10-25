@@ -53,6 +53,7 @@ pub enum Segments {
     Type,
     Scope,
     Collection,
+    FilePaths,
 }
 
 #[derive(Iden)]
