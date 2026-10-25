@@ -33,10 +33,10 @@ use chroma_types::{
     HealthCheckResponse, IndexStatusResponse, InternalCollectionConfiguration,
     InternalUpdateCollectionConfiguration, ListCollectionsRequest, ListCollectionsResponse,
     ListDatabasesRequest, ListDatabasesResponse, QueryRequest, QueryRequestPayload, QueryResponse,
-    Schema, SearchRequest, SearchRequestPayload, SearchResponse, UpdateCollectionPayload,
-    UpdateCollectionRecordsPayload, UpdateCollectionRecordsResponse, UpdateCollectionResponse,
-    UpdateTenantRequest, UpdateTenantResponse, UpsertCollectionRecordsPayload,
-    UpsertCollectionRecordsResponse,
+    Schema, SearchRequest, SearchRequestPayload, SearchResponse, ServerInfo,
+    UpdateCollectionPayload, UpdateCollectionRecordsPayload, UpdateCollectionRecordsResponse,
+    UpdateCollectionResponse, UpdateTenantRequest, UpdateTenantResponse,
+    UpsertCollectionRecordsPayload, UpsertCollectionRecordsResponse,
 };
 use frontend_core::auth::AuthError;
 use frontend_core::routes::{SystemMetrics, SystemState};
@@ -536,6 +536,10 @@ impl SystemState for FrontendServer {
         // TODO: Decide on how to handle versioning across python / rust frontend
         // for now return a hardcoded version
         "1.0.0".to_string()
+    }
+
+    fn server_info(&self) -> Option<ServerInfo> {
+        self.config.server_info.clone()
     }
 
     fn auth(&self) -> &dyn AuthenticateAndAuthorize {
@@ -4103,6 +4107,7 @@ mod tests {
     use crate::{config::FrontendServerConfig, Frontend, FrontendServer};
     use chroma_config::{registry::Registry, Configurable};
     use chroma_system::System;
+    use chroma_types::ServerInfo;
     use reqwest::{Client, Method, RequestBuilder, StatusCode};
     use std::sync::Arc;
 
@@ -4158,6 +4163,69 @@ mod tests {
 
     fn multi_region_database() -> &'static str {
         "topology+multiregiondb"
+    }
+
+    #[tokio::test]
+    async fn test_pre_flight_checks_server_block() {
+        async fn pre_flight_checks(config: FrontendServerConfig) -> serde_json::Value {
+            let port = test_server(config).await;
+            Client::new()
+                .get(format!("http://127.0.0.1:{port}/api/v2/pre-flight-checks"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap()
+        }
+
+        // Without the block, Chroma's answer: the two fields and nothing else.
+        let config = FrontendServerConfig::single_node_default();
+        let answer = pre_flight_checks(config.clone()).await;
+        let max_batch_size = answer["max_batch_size"].clone();
+        assert!(max_batch_size.as_u64().unwrap() > 0);
+        assert_eq!(
+            answer,
+            serde_json::json!({"max_batch_size": max_batch_size, "supports_base64_encoding": true})
+        );
+
+        let mut config = config;
+        config.server_info = Some(ServerInfo {
+            name: "VecturaDB".to_string(),
+            version: "1.0.0-preview.2".to_string(),
+            features: vec!["sparse_vector_index".to_string(), "fork".to_string()],
+        });
+        assert_eq!(
+            pre_flight_checks(config).await,
+            serde_json::json!({
+                "max_batch_size": max_batch_size,
+                "supports_base64_encoding": true,
+                "server": {
+                    "name": "VecturaDB",
+                    "version": "1.0.0-preview.2",
+                    "features": ["sparse_vector_index", "fork"],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn test_openapi_describes_the_server_block() {
+        use utoipa::OpenApi;
+        let openapi = serde_json::to_value(super::ApiDoc::openapi()).unwrap();
+        let schemas = &openapi["components"]["schemas"];
+        // The fields of Chroma stay required, the block is optional.
+        assert_eq!(
+            schemas["ChecklistResponse"]["required"],
+            serde_json::json!(["max_batch_size", "supports_base64_encoding"])
+        );
+        assert!(schemas["ChecklistResponse"]["properties"]["server"].is_object());
+        assert_eq!(
+            schemas["ServerInfo"]["required"],
+            serde_json::json!(["name", "version", "features"])
+        );
     }
 
     #[tokio::test]

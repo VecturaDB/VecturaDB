@@ -15,7 +15,7 @@ use axum::{
     Json, Router,
 };
 use chroma_api_types::{GetUserIdentityResponse, HeartbeatResponse};
-use chroma_types::{ChecklistResponse, HealthCheckResponse};
+use chroma_types::{ChecklistResponse, HealthCheckResponse, ServerInfo};
 use opentelemetry::metrics::{Counter, Meter};
 
 use crate::auth::AuthenticateAndAuthorize;
@@ -52,6 +52,10 @@ pub trait SystemState: Clone + Send + Sync + 'static {
     async fn heartbeat(&self) -> Result<HeartbeatResponse, ServerError>;
     fn max_batch_size(&self) -> u32;
     fn version(&self) -> String;
+    /// The `server` block of the pre-flight checks; without it the answer is Chroma's.
+    fn server_info(&self) -> Option<ServerInfo> {
+        None
+    }
     fn auth(&self) -> &dyn AuthenticateAndAuthorize;
     fn system_metrics(&self) -> &SystemMetrics;
 }
@@ -142,6 +146,7 @@ pub async fn pre_flight_checks<S: SystemState>(
     Ok(Json(ChecklistResponse {
         max_batch_size: server.max_batch_size(),
         supports_base64_encoding: true,
+        server: server.server_info(),
     }))
 }
 

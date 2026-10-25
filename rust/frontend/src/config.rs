@@ -7,7 +7,7 @@ use chroma_log::config::LogConfig;
 use chroma_segment::local_segment_manager::LocalSegmentManagerConfig;
 use chroma_sqlite::config::SqliteDBConfig;
 use chroma_sysdb::{GrpcSysDbConfig, SysDbConfig};
-use chroma_types::{default_default_knn_index, KnnIndex};
+use chroma_types::{default_default_knn_index, KnnIndex, ServerInfo};
 use figment::providers::{Format, Yaml};
 use mdac::CircuitBreakerConfig;
 use rust_embed::Embed;
@@ -200,6 +200,9 @@ pub struct FrontendServerConfig {
     /// `Bearer <key>` (`chroma_auth_token_transport_header` in Chroma 0.5).
     #[serde(default)]
     pub auth_token_transport_header: Option<String>,
+    /// The `server` block of `/api/v2/pre-flight-checks`, set by `chroma run` and never read from the file.
+    #[serde(skip)]
+    pub server_info: Option<ServerInfo>,
 }
 
 const DEFAULT_CONFIG_PATH: &str = "sample_configs/distributed.yaml";
