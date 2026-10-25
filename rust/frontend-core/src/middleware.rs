@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::{extract::Request, middleware::Next, response::Response, Json};
