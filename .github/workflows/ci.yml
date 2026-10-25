@@ -93,6 +93,8 @@ jobs:
         with:
           name: cli-windows-x64
           path: vecturadb-windows-x64.exe
+      # The tests of the local HNSW that only Windows runs: data paths at the limit of MAX_PATH.
+      - run: cargo test --release -p chroma-segment --lib on_windows
 
   cli-macos:
     name: CLI macOS ${{ matrix.name }}
