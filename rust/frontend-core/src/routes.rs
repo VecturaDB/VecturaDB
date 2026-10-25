@@ -133,7 +133,7 @@ pub async fn heartbeat<S: SystemState>(
     get,
     path = "/api/v2/pre-flight-checks",
     summary = "Pre-flight checks",
-    description = "Returns basic readiness information.",
+    description = "Returns basic readiness information. A server with API keys adds its `server` block only for a request with a valid key.",
     tag = "System",
     responses(
         (status = 200, description = "Pre flight checks", body = ChecklistResponse),
@@ -141,13 +141,20 @@ pub async fn heartbeat<S: SystemState>(
     )
 )]
 pub async fn pre_flight_checks<S: SystemState>(
+    headers: HeaderMap,
     State(server): State<S>,
 ) -> Result<Json<ChecklistResponse>, ServerError> {
     server.system_metrics().pre_flight_checks.add(1, &[]);
+    // The block goes only to whom the server knows, which without authentication is everyone. Never a 401: without
+    // a valid key the answer is Chroma's.
+    let server_info = match server.server_info() {
+        Some(info) if server.auth().get_user_identity(&headers).await.is_ok() => Some(info),
+        _ => None,
+    };
     Ok(Json(ChecklistResponse {
         max_batch_size: server.max_batch_size(),
         supports_base64_encoding: true,
-        server: server.server_info(),
+        server: server_info,
     }))
 }
 

@@ -107,7 +107,7 @@ A client that needs to know which server it talks to reads `GET /api/v2/pre-flig
 - `fork`: collection fork and fork count;
 - `api_keys`: API keys, as on Chroma Cloud.
 
-Chroma does not send the block, and the clients of Chroma ignore it. `GET /api/v2/version` answers `1.0.0`, as Chroma does.
+With [API keys](docs/mintlify/guides/deploy/client-server-mode.mdx), only a request with a valid key gets the block. Chroma does not send the block, and the clients of Chroma ignore it. `GET /api/v2/version` answers `1.0.0`, as Chroma does.
 
 ## Telemetry
 

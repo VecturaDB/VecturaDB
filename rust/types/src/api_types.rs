@@ -195,7 +195,8 @@ impl ChromaError for ResetError {
 pub struct ChecklistResponse {
     pub max_batch_size: u32,
     pub supports_base64_encoding: bool,
-    /// The server that answers, when it says it. Chroma does not send it, so the other fields stay as Chroma's.
+    /// The server that answers, when it says it: with API keys, only to a request with a valid key. Chroma does
+    /// not send it, so the other fields stay as Chroma's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<ServerInfo>,
 }
