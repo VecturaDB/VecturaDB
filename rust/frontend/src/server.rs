@@ -2081,10 +2081,18 @@ async fn collection_add(
     let database_name = DatabaseName::new(&database).ok_or_else(|| {
         ValidationError::InvalidArgument("database name must be at least 3 characters".to_string())
     })?;
-    let collection = server
-        .frontend
-        .get_cached_collection_for_tenant(database_name, collection_id, &tenant)
-        .await?;
+    // The schema only for an enforcer that reads it: a collection without a dimension, before its first write, is
+    // not cached, so this read goes to the catalog.
+    let collection = if server.quota_enforcer.uses_schema() {
+        Some(
+            server
+                .frontend
+                .get_cached_collection_for_tenant(database_name, collection_id, &tenant)
+                .await?,
+        )
+    } else {
+        None
+    };
 
     let mut quota_payload = QuotaPayload::new(Action::Add, tenant.clone(), api_token);
     quota_payload = quota_payload.with_ids(&payload.ids);
@@ -2101,7 +2109,10 @@ async fn collection_add(
         quota_payload = quota_payload.with_uris(uris);
     }
     quota_payload = quota_payload.with_collection_uuid(collection_id);
-    if let Some(ref schema) = collection.schema {
+    if let Some(schema) = collection
+        .as_ref()
+        .and_then(|collection| collection.schema.as_ref())
+    {
         quota_payload = quota_payload.with_schema(schema);
     }
     let _ = server.quota_enforcer.enforce(&quota_payload).await?;
@@ -2227,10 +2238,18 @@ async fn collection_update(
     let database_name = DatabaseName::new(&database).ok_or_else(|| {
         ValidationError::InvalidArgument("database name must be at least 3 characters".to_string())
     })?;
-    let collection = server
-        .frontend
-        .get_cached_collection_for_tenant(database_name, collection_id, &tenant)
-        .await?;
+    // The schema only for an enforcer that reads it: a collection without a dimension, before its first write, is
+    // not cached, so this read goes to the catalog.
+    let collection = if server.quota_enforcer.uses_schema() {
+        Some(
+            server
+                .frontend
+                .get_cached_collection_for_tenant(database_name, collection_id, &tenant)
+                .await?,
+        )
+    } else {
+        None
+    };
 
     let mut quota_payload = QuotaPayload::new(Action::Update, tenant.clone(), api_token);
     quota_payload = quota_payload.with_ids(&payload.ids);
@@ -2248,7 +2267,10 @@ async fn collection_update(
     if let Some(uris) = &payload.uris {
         quota_payload = quota_payload.with_uris(uris);
     }
-    if let Some(ref schema) = collection.schema {
+    if let Some(schema) = collection
+        .as_ref()
+        .and_then(|collection| collection.schema.as_ref())
+    {
         quota_payload = quota_payload.with_schema(schema);
     }
     let _ = server.quota_enforcer.enforce(&quota_payload).await?;
@@ -2376,10 +2398,18 @@ async fn collection_upsert(
     let database_name = DatabaseName::new(&database).ok_or_else(|| {
         ValidationError::InvalidArgument("database name must be at least 3 characters".to_string())
     })?;
-    let collection = server
-        .frontend
-        .get_cached_collection_for_tenant(database_name, collection_id, &tenant)
-        .await?;
+    // The schema only for an enforcer that reads it: a collection without a dimension, before its first write, is
+    // not cached, so this read goes to the catalog.
+    let collection = if server.quota_enforcer.uses_schema() {
+        Some(
+            server
+                .frontend
+                .get_cached_collection_for_tenant(database_name, collection_id, &tenant)
+                .await?,
+        )
+    } else {
+        None
+    };
 
     let mut quota_payload = QuotaPayload::new(Action::Upsert, tenant.clone(), api_token);
     quota_payload = quota_payload.with_ids(&payload.ids);
@@ -2395,7 +2425,10 @@ async fn collection_upsert(
         quota_payload = quota_payload.with_uris(uris);
     }
     quota_payload = quota_payload.with_collection_uuid(collection_id);
-    if let Some(ref schema) = collection.schema {
+    if let Some(schema) = collection
+        .as_ref()
+        .and_then(|collection| collection.schema.as_ref())
+    {
         quota_payload = quota_payload.with_schema(schema);
     }
     let _ = server.quota_enforcer.enforce(&quota_payload).await?;
@@ -4121,8 +4154,16 @@ mod tests {
     }
 
     async fn test_server_with_auth(
+        config: FrontendServerConfig,
+        auth: Arc<dyn crate::auth::AuthenticateAndAuthorize>,
+    ) -> u16 {
+        test_server_with(config, auth, Arc::new(())).await
+    }
+
+    async fn test_server_with(
         mut config: FrontendServerConfig,
         auth: Arc<dyn crate::auth::AuthenticateAndAuthorize>,
+        quota_enforcer: Arc<dyn crate::quota::QuotaEnforcer>,
     ) -> u16 {
         let registry = Registry::new();
         let system = System::new();
@@ -4133,7 +4174,14 @@ mod tests {
         let frontend = Frontend::try_from_config(&(config.clone().frontend, system), &registry)
             .await
             .unwrap();
-        let app = FrontendServer::new(config, frontend, vec![], auth, Arc::new(()), System::new());
+        let app = FrontendServer::new(
+            config,
+            frontend,
+            vec![],
+            auth,
+            quota_enforcer,
+            System::new(),
+        );
 
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
@@ -4314,6 +4362,106 @@ mod tests {
                 .contains("get_collection_by_crn is not supported in SqliteSysDb"),
             "{body}"
         );
+    }
+
+    // A quota enforcer that reads the schema, as on Chroma Cloud: it notes whether the payload brought one.
+    struct SchemaQuota(Arc<std::sync::atomic::AtomicBool>);
+
+    impl crate::quota::QuotaEnforcer for SchemaQuota {
+        fn enforce<'a>(
+            &'a self,
+            payload: &'a crate::quota::QuotaPayload<'a>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Option<crate::quota::QuotaOverrides>,
+                            crate::quota::QuotaEnforcerError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            if payload.schema.is_some() {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Box::pin(std::future::ready(Ok(None)))
+        }
+    }
+
+    struct SharedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // The reads of the catalog for a collection during its first add, from the log line of the cache of collections.
+    async fn catalog_reads_of_a_first_add(
+        quota_enforcer: Arc<dyn crate::quota::QuotaEnforcer>,
+    ) -> usize {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = {
+            let log = log.clone();
+            move || SharedLog(log.clone())
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let port = test_server_with(
+            FrontendServerConfig::single_node_default(),
+            Arc::new(()),
+            quota_enforcer,
+        )
+        .await;
+        let client = Client::new();
+        let base = format!(
+            "http://127.0.0.1:{port}/api/v2/tenants/default_tenant/databases/default_database/collections"
+        );
+        let created = client
+            .post(&base)
+            .json(&serde_json::json!({"name": format!("first-add-{}", uuid::Uuid::new_v4())}))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+        let misses = || {
+            String::from_utf8_lossy(&log.lock().unwrap())
+                .matches(&format!("Cache miss for collection {id}"))
+                .count()
+        };
+        let before = misses();
+        client
+            .post(format!("{base}/{id}/add"))
+            .json(&serde_json::json!({"ids": ["a", "b"], "embeddings": [[1.0, 0.0], [0.0, 1.0]]}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        misses() - before
+    }
+
+    #[tokio::test]
+    async fn test_writes_read_the_collection_for_the_quota_only_when_it_uses_the_schema() {
+        let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let with_schema = catalog_reads_of_a_first_add(Arc::new(SchemaQuota(seen.clone()))).await;
+        // As on Chroma Cloud, an enforcer that reads the schema gets it.
+        assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
+        // The single node, whose enforcer reads nothing, saves that read of the catalog.
+        let single_node = catalog_reads_of_a_first_add(Arc::new(())).await;
+        assert_eq!(single_node + 1, with_schema);
     }
 
     #[test]

@@ -3028,6 +3028,38 @@ impl ServiceBasedFrontend {
             .get_cached_collection_for_tenant(database_name.clone(), collection_id, &tenant_id)
             .await?;
 
+        // The single node indexes every write before it answers: nothing waits. Its log does not count the
+        // operations of a collection, so the operations it reports are the records.
+        if matches!(self.executor, Executor::Local(_)) {
+            let collection_and_segments = Self::get_collection_with_segments_for_tenant(
+                &mut self.collections_with_segments_provider,
+                Some(database_name),
+                collection_id,
+                &tenant_id,
+            )
+            .await
+            .map_err(IndexStatusError::Internal)?;
+            let records = Box::pin(self.fan_out_count(
+                tenant_id,
+                collection_and_segments,
+                chroma_types::plan::ReadLevel::default(),
+                0,
+            ))
+            .await
+            .map_err(|err| IndexStatusError::Internal(Box::new(err)))?
+            .count as u64;
+            chroma_metering::with_current(|context| {
+                context.latest_collection_logical_size_bytes(0);
+                context.finish_request(Instant::now());
+            });
+            return Ok(IndexStatusResponse {
+                op_indexing_progress: 1.0,
+                num_unindexed_ops: 0,
+                num_indexed_ops: records,
+                total_ops: records,
+            });
+        }
+
         let num_indexed_ops = collection.log_position.try_into().map_err(|_| {
             IndexStatusError::Internal(Box::new(chroma_error::TonicError(tonic::Status::internal(
                 "Invalid log_position value: must be >= 0 and convertible to u64",
@@ -3367,6 +3399,27 @@ impl ServiceBasedFrontend {
         )
         .await
         .map_err(QueryError::Other)?;
+        // As the query: a dense KNN on the embeddings has the dimension of the collection, or a 400.
+        if let Some(expected) = collection_and_segments.collection.dimension {
+            for payload in &request.searches {
+                for knn in payload.rank.knn_queries() {
+                    if let (
+                        chroma_types::operator::Key::Embedding,
+                        chroma_types::operator::QueryVector::Dense(vector),
+                    ) = (&knn.key, &knn.query)
+                    {
+                        if vector.len() != expected as usize {
+                            return Err(QueryError::Other(Box::new(
+                                ValidationError::DimensionMismatch(
+                                    expected as u32,
+                                    vector.len() as u32,
+                                ),
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         if self.enable_schema {
             if let Some(ref schema) = collection_and_segments.collection.schema {
                 for payload in &request.searches {
@@ -4774,6 +4827,103 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(count_err.code(), ErrorCodes::NotFound);
+    }
+
+    #[tokio::test]
+    async fn search_with_a_dense_query_of_another_dimension_answers_as_the_query() {
+        let (mut frontend, collection) = seeded_collection().await;
+        let query_err = frontend
+            .query(
+                QueryRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    None,
+                    None,
+                    vec![vec![1.0, 2.0, 3.0]],
+                    10,
+                    chroma_types::IncludeList::default_query(),
+                )
+                .unwrap(),
+            )
+            .await
+            .err()
+            .unwrap();
+        let search_err = frontend
+            .search(
+                SearchRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    vec![SearchPayload {
+                        rank: chroma_types::operator::Rank {
+                            expr: Some(chroma_types::operator::RankExpr::Knn {
+                                query: chroma_types::operator::QueryVector::Dense(vec![
+                                    1.0, 2.0, 3.0,
+                                ]),
+                                key: chroma_types::operator::Key::Embedding,
+                                limit: 10,
+                                default: None,
+                                return_rank: false,
+                            }),
+                        },
+                        ..Default::default()
+                    }],
+                    chroma_types::plan::ReadLevel::default(),
+                )
+                .unwrap(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(search_err.code(), ErrorCodes::InvalidArgument);
+        assert_eq!(search_err.to_string(), query_err.to_string());
+    }
+
+    #[tokio::test]
+    async fn indexing_status_on_a_single_node_has_nothing_waiting() {
+        async fn status(
+            frontend: &mut ServiceBasedFrontend,
+            collection_id: CollectionUuid,
+        ) -> Result<IndexStatusResponse, IndexStatusError> {
+            frontend
+                .indexing_status(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    collection_id,
+                )
+                .await
+        }
+        let (mut frontend, collection) = seeded_collection().await;
+        let seeded = status(&mut frontend, collection.collection_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                seeded.op_indexing_progress,
+                seeded.num_unindexed_ops,
+                seeded.num_indexed_ops,
+                seeded.total_ops
+            ),
+            (1.0, 0, 1, 1)
+        );
+        // An empty collection answers as on Chroma Cloud.
+        let empty = create_collection_for(&mut frontend, TENANT, DATABASE, "nothing_yet").await;
+        let empty = status(&mut frontend, empty.collection_id).await.unwrap();
+        assert_eq!(
+            (
+                empty.op_indexing_progress,
+                empty.num_unindexed_ops,
+                empty.num_indexed_ops,
+                empty.total_ops
+            ),
+            (1.0, 0, 0, 0)
+        );
+        let missing = status(&mut frontend, CollectionUuid::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(missing.code(), ErrorCodes::NotFound);
     }
 
     #[tokio::test]
