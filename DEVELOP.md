@@ -87,7 +87,7 @@ Not yet implemented.
 
 ## Versioning
 
-A release takes its version from its tag, as [RELEASE_PROCESS.md](RELEASE_PROCESS.md) describes: `vX.Y.Z`, or `vX.Y.Z-preview.N` for a preview. The CLI carries the version as written. The Python wheels carry its PEP 440 form, so `1.0.0-preview.1` is `1.0.0rc1` on PyPI.
+A release takes its version from its tag, as [RELEASE_PROCESS.md](RELEASE_PROCESS.md) describes: `vX.Y.Z`, or `vX.Y.Z-preview.N` for a preview. The CLI carries the version as written. The Python wheels carry its PEP 440 form, so `X.Y.Z-preview.N` is `X.Y.ZrcN` on PyPI.
 
 Between releases:
 

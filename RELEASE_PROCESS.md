@@ -6,9 +6,9 @@ A release starts from a version tag on a commit of `main` whose CI passed: `vX.Y
 
 `.github/workflows/release.yml` then:
 
-1. runs the whole CI with the version of the tag. The CLI binaries carry the version as written (`1.0.0-preview.1`); the wheels carry its PEP 440 form (`1.0.0rc1`).
+1. runs the whole CI with the version of the tag. The CLI binaries carry the version as written (`X.Y.Z-preview.N`); the wheels carry its PEP 440 form (`X.Y.ZrcN`).
 2. Only if the CI passes, three jobs run in parallel:
-   - the image `ghcr.io/vecturadb/vecturadb` for amd64 and arm64, tagged with the version without the `v` (`1.0.0-preview.1`), and with `preview` for a preview, `latest` otherwise;
+   - the image `ghcr.io/vecturadb/vecturadb` for amd64 and arm64, tagged with the version without the `v` (`X.Y.Z-preview.N`), and with `preview` for a preview, `latest` otherwise;
    - the GitHub release, with the five CLI binaries, the five wheels and notes generated from the merged pull requests; a preview is a prerelease;
    - the wheels to PyPI with trusted publishing, in the environment `pypi`.
 

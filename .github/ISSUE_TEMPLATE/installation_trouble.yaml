@@ -22,7 +22,7 @@ body:
     attributes:
       label: Versions
       description: We need your VecturaDB, Python, and OS versions, as well as whatever else you think relevant.
-      placeholder: VecturaDB 1.0.0-preview.1, Python 3.12, macOS 15
+      placeholder: VecturaDB <version>, Python 3.12, macOS 15
 #       value: "A bug happened!"
     validations:
       required: true
