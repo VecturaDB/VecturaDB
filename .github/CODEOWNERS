@@ -1,4 +1,2 @@
-# CODEOWNERS for Rust components
-rust/error/ @codetheweb @rescrv
-rust/api_types/ @codetheweb @rescrv
-rust/chroma/ @codetheweb @rescrv
+# The maintainers of VecturaDB review every change.
+* @VecturaDB/maintainers
