@@ -4343,25 +4343,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_collection_by_crn_is_not_supported_on_a_single_node() {
+    async fn test_resource_name_and_collection_by_crn_on_a_single_node() {
         let port = test_server(FrontendServerConfig::single_node_default()).await;
-        let response = Client::new()
-            .get(format!(
-                "http://127.0.0.1:{port}/api/v2/collections/resource:default_database:missing"
+        let client = Client::new();
+        let base = format!("http://127.0.0.1:{port}/api/v2");
+        let tenant = {
+            let (client, base) = (&client, &base);
+            move || async move {
+                client
+                    .get(format!("{base}/tenants/default_tenant"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap()
+            }
+        };
+        let set = |tenant: &'static str, resource_name: &'static str| {
+            client
+                .patch(format!("{base}/tenants/{tenant}"))
+                .json(&serde_json::json!({ "resource_name": resource_name }))
+                .send()
+        };
+        let by_crn = |crn: &'static str| client.get(format!("{base}/collections/{crn}")).send();
+
+        assert_eq!(tenant().await["resource_name"], serde_json::Value::Null);
+        assert_eq!(
+            by_crn("resource:default_database:crn")
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let response = set("default_tenant", "resource").await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(tenant().await["resource_name"], "resource");
+        // As Chroma Cloud: the resource name of a tenant is set once.
+        let response = set("default_tenant", "another").await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({"error": "ChromaError", "message": "Failed to set resource name"})
+        );
+        assert_eq!(tenant().await["resource_name"], "resource");
+        let response = set("no_such_tenant", "another").await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let created = client
+            .post(format!(
+                "{base}/tenants/default_tenant/databases/default_database/collections"
             ))
+            .json(&serde_json::json!({"name": "crn"}))
             .send()
             .await
-            .expect("an answer, not a closed connection");
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        let body = response.json::<serde_json::Value>().await.unwrap();
-        // As the other calls that the SQLite sysdb does not support, through its tonic status.
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap()
-                .contains("get_collection_by_crn is not supported in SqliteSysDb"),
-            "{body}"
-        );
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        let response = by_crn("resource:default_database:crn").await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let found = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(found["id"], created["id"]);
+        assert_eq!(found["name"], "crn");
+        for missing in [
+            "resource:default_database:missing",
+            "resource:no_database:crn",
+            "another:default_database:crn",
+        ] {
+            let response = by_crn(missing).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{missing}");
+        }
     }
 
     // A quota enforcer that reads the schema, as on Chroma Cloud: it notes whether the payload brought one.
