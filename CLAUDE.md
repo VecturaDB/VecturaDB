@@ -2,36 +2,20 @@
 
 ## Commit Message Style
 
-Use the `[TYPE](scope): Description` format:
+VecturaDB commits use `Area: what changes`, in plain words, as the history since the fork:
 
 ```
-[ENH](rust-client): Add retry middleware
-[BUG](rust-client): Fix connection timeout on retry
-[TST](gc): Add MCMR hard delete integration test
-[DOC](api): Update embeddings endpoint docs
-[CHORE](deps): Bump reqwest to 0.13
+Single node: a collection by CRN answers the collection, or 404
+Local storage: write each file whole, and on disk before its key is recorded
+Release: a tag vX.Y.Z-preview.N.postM, for a post-release of a preview
 ```
 
-Common types: `ENH` (feature/enhancement), `BUG` (fix), `TST` (test), `DOC`
-(docs), `CHORE` (maintenance/refactor), `BLD` (build system changes).
-
-Scope is optional but encouraged — use the component name (e.g.
-`rust-client`, `gc`, `dashboard-api`).
-
-### 50/72 Rule
-
-- **Subject line: ≤ 50 characters.** Keeps it readable in `git log --oneline`,
-  GitHub PR lists, and rebase tooling.
-- **Blank line** between subject and body (required — many tools use this to
-  split them).
-- **Body lines: wrap at 72 characters.** Leaves room for indentation in
-  80-column terminals and email patch workflows.
-- **Imperative mood** in the subject: "Add login command", not "Added" or
-  "Adds". Matches Git's own generated messages.
-- **Body explains what and why**, not how — the diff shows how.
-
-With the `[TYPE](scope):` prefix, aim to keep the whole subject under 50 chars.
-If the scope makes that tight, drop it — the type alone is fine.
+- Subject: one line. The area is the component or path (`Single node`, `Local HNSW`, `Release`), and after the colon
+  comes what the change does, as its user sees it. No `[TYPE](scope)` prefix.
+- Blank line, then a body wrapped at 120 characters: what was wrong, what the change does, and the measured numbers
+  where there are any.
+- A commit that only adds the header of a changed Chroma file says so: `Mark the Chroma file changed by ...`.
+- The commits of Chroma in the history keep their own format, `[TYPE](scope): Description`.
 
 ## Tilt-Backed Tests
 
