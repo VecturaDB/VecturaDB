@@ -1,7 +1,8 @@
 # Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
-# On a tag vX.Y.Z or vX.Y.Z-preview.N: the CI builds and tests everything with the version of the tag, then the CLI
-# binaries and the wheels go to a GitHub Release, the image to ghcr.io/vecturadb/vecturadb, the wheels to PyPI with
-# Trusted Publishing (no tokens). A preview is a GitHub prerelease, its image gets the tag preview, never latest.
+# On a tag vX.Y.Z, vX.Y.Z-preview.N or vX.Y.Z-preview.N.postM: the CI builds and tests everything with the version of
+# the tag, then the CLI binaries and the wheels go to a GitHub Release, the image to ghcr.io/vecturadb/vecturadb, the
+# wheels to PyPI with Trusted Publishing (no tokens). A preview is a GitHub prerelease, its image gets the tag preview,
+# never latest.
 name: Release
 
 on:
@@ -22,8 +23,8 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]+)?$ ]]; then
-            echo "Tag $TAG is not vX.Y.Z or vX.Y.Z-preview.N"; exit 1
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]+(\.post[0-9]+)?)?$ ]]; then
+            echo "Tag $TAG is not vX.Y.Z, vX.Y.Z-preview.N or vX.Y.Z-preview.N.postM"; exit 1
           fi
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
           if [[ "$TAG" == *-preview.* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
