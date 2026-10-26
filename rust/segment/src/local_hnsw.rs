@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 mod persistence;
 pub(crate) use persistence::validate_checkpoint;
 use persistence::{validate_checkpoint_seq_id, CheckpointFingerprint, VerifiedCheckpoint};
@@ -1397,7 +1398,11 @@ async fn persist(
             buffered_file.flush()?;
         }
         file.as_file().sync_all()?;
-        file.persist(metadata_file_path).map_err(|err| err.error)?;
+        // std::fs::rename, unlike persist of tempfile, takes long paths on Windows: the ID map then reaches the data
+        // paths that hnswlib reaches.
+        let temp_path = file.into_temp_path();
+        std::fs::rename(&temp_path, &metadata_file_path)?;
+        let _ = temp_path.keep();
         sync_dir(Path::new(path))?;
         if let Some(parent) = Path::new(path).parent() {
             sync_dir(parent)?;
@@ -1431,6 +1436,101 @@ mod tests {
         SegmentScope, SegmentType, SegmentUuid,
     };
     use serde_pickle::DeOptions;
+
+    // A data path of the given length under root, in directories of at most 100 characters.
+    #[cfg(windows)]
+    fn data_path_of(root: &std::path::Path, length: usize) -> String {
+        let root = root.to_str().expect("utf-8 path");
+        let needed = length - root.len();
+        let count = needed.div_ceil(101);
+        let chars = needed - count;
+        let mut path = root.to_string();
+        for i in 0..count {
+            path.push('\\');
+            path.push_str(&"d".repeat(chars / count + usize::from(i < chars % count)));
+        }
+        assert_eq!(path.len(), length);
+        path
+    }
+
+    // Persists one record under a data path of the given length, then reads it back from the files.
+    #[cfg(windows)]
+    async fn persist_and_read_back(length: usize) -> Result<Vec<f32>, String> {
+        let sqlite = get_new_sqlite_db().await;
+        let root = tempfile::tempdir().expect("persist dir");
+        let persist_path = data_path_of(root.path(), length);
+        std::fs::create_dir_all(&persist_path).expect("data path");
+        let mut collection = Collection::test_collection(3);
+        collection.schema = Some(Schema::new_default(KnnIndex::Hnsw));
+        let vector_segment = Segment {
+            id: SegmentUuid::new(),
+            r#type: SegmentType::HnswLocalPersisted,
+            scope: SegmentScope::VECTOR,
+            collection: collection.collection_id,
+            metadata: None,
+            file_path: Default::default(),
+        };
+        let mut writer = LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &vector_segment,
+            3,
+            Some(persist_path.clone()),
+            sqlite.clone(),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![LogRecord {
+                    log_offset: 1,
+                    record: OperationRecord {
+                        id: "id-1".to_string(),
+                        embedding: Some(vec![1.0, 2.0, 3.0]),
+                        encoding: None,
+                        metadata: None,
+                        document: None,
+                        operation: Operation::Add,
+                    },
+                }]
+                .into(),
+            ))
+            .await
+            .map_err(|err| err.to_string())?;
+        {
+            let guard = writer.index.inner.write().await;
+            drop(persist(guard).await.map_err(|err| err.to_string())?);
+        }
+        writer.index.close().await;
+        drop(writer);
+        let reader = LocalHnswSegmentReader::from_segment(
+            &collection,
+            &vector_segment,
+            3,
+            Some(persist_path),
+            sqlite,
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        reader
+            .get_embedding_by_user_id(&"id-1".to_string())
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    // As Chroma 1.5.9: on Windows hnswlib opens <segment id>\data_level0.bin without long paths, so a data path
+    // reaches 206 characters, and the ID map, 6 characters longer, must reach them too.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_data_path_of_206_characters_keeps_the_index_on_windows() {
+        assert_eq!(persist_and_read_back(206).await, Ok(vec![1.0, 2.0, 3.0]));
+    }
+
+    // Past 206 characters hnswlib writes nothing; Chroma 1.5.9 then lost the index in silence, here the write fails.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_longer_data_path_fails_the_write_on_windows() {
+        assert!(persist_and_read_back(207).await.is_err());
+    }
 
     #[tokio::test]
     async fn reader_migrates_legacy_max_seq_id() {
