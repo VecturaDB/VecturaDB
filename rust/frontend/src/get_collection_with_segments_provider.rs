@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use backon::ConstantBuilder;
 use chroma_cache::{AysncPartitionedMutex, Cache, CacheError, Weighted};
 use chroma_config::Configurable;
