@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 //! Validate persisted bytes before passing them to the native HNSW loader.
 use std::{
     collections::HashSet,

@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 [package]
 name = "chroma-log"
 version = "0.1.0"
