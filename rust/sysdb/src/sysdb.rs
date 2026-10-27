@@ -691,7 +691,17 @@ impl SysDb {
                 )
                 .await
             }
-            SysDb::Sqlite(_) => todo!(),
+            SysDb::Sqlite(sqlite) => {
+                sqlite
+                    .flush_compaction(
+                        collection_id,
+                        log_position,
+                        collection_version,
+                        segment_flush_info,
+                        schema,
+                    )
+                    .await
+            }
             SysDb::Test(test) => {
                 test.flush_compaction(
                     tenant_id,
