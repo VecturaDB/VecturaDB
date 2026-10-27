@@ -688,8 +688,6 @@ mod tests {
         SegmentUuid,
     };
 
-    // The SPANN index of distributed Chroma on the data path of the single node: written and flushed with the
-    // providers of one manager, read back from the files by those of the next one.
     // The SPANN provider of a single node reads as the query service of the worker of distributed Chroma and writes as
     // its compaction service, with the settings of rust/worker/chroma_config.yaml.
     #[test]
@@ -741,6 +739,8 @@ mod tests {
         );
     }
 
+    // The SPANN index of distributed Chroma on the data path of the single node: written and flushed with the
+    // providers of one manager, read back from the files by those of the next one.
     #[tokio::test]
     async fn spann_segments_are_written_on_the_data_path_and_read_after_a_restart() {
         use crate::{
