@@ -1857,9 +1857,10 @@ impl ServiceBasedFrontend {
     }
 
     /// The fork on a single node. Distributed Chroma forks the log and shares the segment files of the source (the
-    /// other branch of retryable_fork); a single node has no segment files to share and its log holds only the writes
-    /// not yet applied. So the sysdb copies the collection and its segments, then the records of the source are written
-    /// again into the copy through the local write path, in storage order. If the copy fails, the new collection is
+    /// other branch of retryable_fork); a single node shares no segment files, not even the blockfiles of a SPANN
+    /// collection, and its log holds only the writes not yet applied. So the sysdb copies the collection and its
+    /// segments without their files, then the records of the source are written again into the copy through the local
+    /// write path, in storage order. If the copy fails, the new collection is
     /// removed and the fork fails as a whole.
     async fn fork_local(
         &mut self,
@@ -1900,6 +1901,7 @@ impl ServiceBasedFrontend {
         {
             let segments = [
                 target.metadata_segment.clone(),
+                target.record_segment.clone(),
                 target.vector_segment.clone(),
             ];
             if let Err(cleanup) = self
@@ -5165,6 +5167,69 @@ mod tests {
         frontend.executor.cleanup_deleted_indexes().await.unwrap();
         assert!(files_under(root.path().join("tenant").as_path()).is_empty());
         assert_eq!(pending_cleanups(root.path()), 0);
+    }
+
+    // On a single node a fork copies the records of a SPANN collection into files of its own, as it copies those of an
+    // HNSW collection: the fork answers after the source and its files are gone.
+    #[tokio::test]
+    async fn a_spann_fork_keeps_files_of_its_own() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let source = spann_collection_with_records(&mut frontend, "spann-source").await;
+        let fork = frontend
+            .fork_collection(
+                ForkCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    source,
+                    "spann-fork".to_string(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collection_id;
+        let files = |segments: &CollectionAndSegments| {
+            segments
+                .record_segment
+                .file_path
+                .values()
+                .chain(segments.vector_segment.file_path.values())
+                .flatten()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let source_files = files(
+            &frontend
+                .sysdb_client
+                .get_collection_with_segments(None, source)
+                .await
+                .unwrap(),
+        );
+        let forked = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, fork)
+            .await
+            .unwrap();
+        assert_eq!(forked.vector_segment.r#type, SegmentType::Spann);
+        let fork_files = files(&forked);
+        assert!(!fork_files.is_empty());
+        assert!(fork_files.is_disjoint(&source_files));
+
+        frontend
+            .delete_collection(delete_collection_request("spann-source"))
+            .await
+            .unwrap();
+        frontend.executor.cleanup_deleted_indexes().await.unwrap();
+        let records = (0..100)
+            .map(|i| (format!("r{i}"), vec![i as f32, (i as f32).sin()]))
+            .collect::<Vec<_>>();
+        for query in [vec![3.2, 0.0], vec![70.0, 1.0]] {
+            assert_eq!(
+                query_ids(&mut frontend, fork, query.clone(), 4).await,
+                exact_nearest(&records, &query, 4)
+            );
+        }
     }
 
     #[tokio::test]

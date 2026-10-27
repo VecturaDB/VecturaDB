@@ -1011,9 +1011,11 @@ impl SqliteSysDb {
             .map_err(|e| ForkCollectionError::Internal(e.boxed()))?;
         for segment in source_segments {
             let segment_id = SegmentUuid::new();
+            // Without the files of the source: on a single node the records are written again into the fork, which
+            // keeps files of its own, so the deletion of one collection never takes the files of another.
             sqlx::query(
-                "INSERT INTO segments (id, type, scope, collection, file_paths) \
-                 SELECT $1, type, scope, $2, file_paths FROM segments WHERE id = $3",
+                "INSERT INTO segments (id, type, scope, collection) \
+                 SELECT $1, type, scope, $2 FROM segments WHERE id = $3",
             )
             .bind(segment_id.to_string())
             .bind(target_collection_id.to_string())
@@ -2134,8 +2136,8 @@ mod tests {
             .unwrap();
         let fork = sysdb.get_collection_with_segments(fork_id).await.unwrap();
         assert_ne!(fork.vector_segment.id, vector.id);
-        assert_eq!(fork.record_segment.file_path, record_files);
-        assert_eq!(fork.vector_segment.file_path, vector_files);
+        assert!(fork.record_segment.file_path.is_empty());
+        assert!(fork.vector_segment.file_path.is_empty());
     }
 
     #[tokio::test]
