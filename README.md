@@ -54,10 +54,10 @@ pip install --force-reinstall --no-deps VecturaDB
 ## Docker
 
 ```bash
-docker run -p 8000:8000 -v ./data:/data ghcr.io/vecturadb/vecturadb:preview
+docker run -p 127.0.0.1:8000:8000 -v ./data:/data ghcr.io/vecturadb/vecturadb:preview
 ```
 
-Images for amd64 and arm64. `preview` is the newest preview; every release also has a tag with its version. The data lives in `/data`.
+Images for amd64 and arm64. `preview` is the newest preview; every release also has a tag with its version. The data lives in `/data`. `-p 127.0.0.1:8000:8000` publishes the port on this machine only.
 
 ## CLI
 
@@ -111,7 +111,7 @@ vecturadb run config.yaml
 With Docker, the image reads its configuration file, and an environment variable sets the option:
 
 ```bash
-docker run -p 8000:8000 -v ./data:/data -e CHROMA_EXECUTOR__LOCAL__SPANN=true ghcr.io/vecturadb/vecturadb:preview
+docker run -p 127.0.0.1:8000:8000 -v ./data:/data -e CHROMA_EXECUTOR__LOCAL__SPANN=true ghcr.io/vecturadb/vecturadb:preview
 ```
 
 `run --path` reads no option, and the Python package has no SPANN in process.
