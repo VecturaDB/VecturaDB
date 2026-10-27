@@ -5046,6 +5046,127 @@ mod tests {
         .expect("the sweep at startup must take the row out");
     }
 
+    // The files under a folder and its subfolders.
+    fn files_under(folder: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut folders = vec![folder.to_path_buf()];
+        while let Some(folder) = folders.pop() {
+            let Ok(entries) = std::fs::read_dir(&folder) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    folders.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
+    }
+
+    fn copy_folder(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let path = entry.unwrap().path();
+            let target = to.join(path.file_name().unwrap());
+            if path.is_dir() {
+                copy_folder(&path, &target);
+            } else {
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+
+    async fn spann_collection_with_records(
+        frontend: &mut ServiceBasedFrontend,
+        name: &str,
+    ) -> CollectionUuid {
+        let collection_id = frontend
+            .create_collection(
+                CreateCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    name.to_string(),
+                    None,
+                    None,
+                    Some(Schema::new_default(KnnIndex::Spann)),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collection_id;
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    (0..100).map(|i| format!("r{i}")).collect(),
+                    (0..100).map(|i| vec![i as f32, (i as f32).sin()]).collect(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        collection_id
+    }
+
+    // The files of a SPANN collection, its record segment and its SPANN index, go with the collection; their rows
+    // wait for the sweep, as those of an HNSW index. Another collection keeps its files.
+    #[tokio::test]
+    async fn a_spann_collection_deletion_removes_its_files() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let kept = spann_collection_with_records(&mut frontend, "spann-kept").await;
+        let kept_files = files_under(root.path().join("tenant").as_path()).len();
+        assert!(kept_files > 0);
+        spann_collection_with_records(&mut frontend, "spann-deleted").await;
+        assert!(files_under(root.path().join("tenant").as_path()).len() > kept_files);
+        frontend
+            .delete_collection(delete_collection_request("spann-deleted"))
+            .await
+            .unwrap();
+        let left = files_under(root.path().join("tenant").as_path());
+        assert_eq!(left.len(), kept_files);
+        assert!(left
+            .iter()
+            .all(|file| file.to_string_lossy().contains(&kept.to_string())));
+        assert_eq!(pending_cleanups(root.path()), 2);
+        frontend.executor.cleanup_deleted_indexes().await.unwrap();
+        assert_eq!(pending_cleanups(root.path()), 0);
+        assert_eq!(
+            query_ids(&mut frontend, kept, vec![3.0, 3f32.sin()], 1).await,
+            vec!["r3".to_string()]
+        );
+    }
+
+    // Files left by a deletion that stopped before removing them go with the sweep.
+    #[tokio::test]
+    async fn the_sweep_removes_the_files_of_a_deleted_spann_collection() {
+        let root = tempfile::tempdir().unwrap();
+        let saved = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        spann_collection_with_records(&mut frontend, "spann-swept").await;
+        copy_folder(&root.path().join("tenant"), &saved.path().join("tenant"));
+        frontend
+            .delete_collection(delete_collection_request("spann-swept"))
+            .await
+            .unwrap();
+        // As after a stop between the deletion in the catalog and the removal of the files.
+        copy_folder(&saved.path().join("tenant"), &root.path().join("tenant"));
+        assert!(!files_under(root.path().join("tenant").as_path()).is_empty());
+        frontend.executor.cleanup_deleted_indexes().await.unwrap();
+        assert!(files_under(root.path().join("tenant").as_path()).is_empty());
+        assert_eq!(pending_cleanups(root.path()), 0);
+    }
+
     #[tokio::test]
     async fn a_collection_created_again_before_the_sweep_is_new_and_works() {
         let root = tempfile::tempdir().unwrap();

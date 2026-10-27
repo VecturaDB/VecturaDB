@@ -143,7 +143,10 @@ impl LocalExecutor {
         for segment in segments {
             if !matches!(
                 segment.r#type,
-                SegmentType::HnswLocalMemory | SegmentType::HnswLocalPersisted
+                SegmentType::HnswLocalMemory
+                    | SegmentType::HnswLocalPersisted
+                    | SegmentType::Spann
+                    | SegmentType::BlockfileRecord
             ) {
                 continue;
             }

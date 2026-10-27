@@ -1499,12 +1499,15 @@ impl SqliteSysDb {
         .await?;
 
         // Snapshot actual index IDs in the deletion transaction, not the caller's
-        // earlier listing. Metadata segments have no index files to reclaim.
+        // earlier listing. Metadata segments have no index files to reclaim; the
+        // record segment and the index of a SPANN collection have blockfiles.
         sqlx::query(
             "INSERT OR IGNORE INTO index_cleanup (segment_id) \
              SELECT id FROM segments WHERE collection = ? AND type IN \
              ('urn:chroma:segment/vector/hnsw-local-memory', \
-              'urn:chroma:segment/vector/hnsw-local-persisted')",
+              'urn:chroma:segment/vector/hnsw-local-persisted', \
+              'urn:chroma:segment/vector/spann', \
+              'urn:chroma:segment/record/blockfile')",
         )
         .bind(collection_id.to_string())
         .execute(&mut *conn)

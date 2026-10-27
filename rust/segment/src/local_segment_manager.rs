@@ -110,6 +110,47 @@ async fn local_spann_provider(
     SpannProvider::try_from_config(&config, registry).await
 }
 
+// The folder of a segment of a SPANN collection, under the prefix of distributed Chroma
+// (tenant/{tenant}/database/{database}/collection/{collection}/segment/{segment}), removed with the folders of its
+// collection that it leaves empty. The catalog no longer names the tenant, the database or the collection of a deleted
+// segment: its folder is found by its id.
+async fn remove_blockfile_segment(root: &Path, segment_id: SegmentUuid) -> io::Result<()> {
+    async fn folders(path: &Path) -> io::Result<Vec<std::path::PathBuf>> {
+        let mut entries = match tokio::fs::read_dir(path).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+        let mut folders = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_dir() {
+                folders.push(entry.path());
+            }
+        }
+        Ok(folders)
+    }
+    let segment = segment_id.to_string();
+    for tenant in folders(&root.join("tenant")).await? {
+        for database in folders(&tenant.join("database")).await? {
+            for collection in folders(&database.join("collection")).await? {
+                let segments = collection.join("segment");
+                match tokio::fs::remove_dir_all(segments.join(&segment)).await {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                    Err(err) => return Err(err),
+                }
+                // A folder that still holds something stays.
+                for empty in [segments, collection] {
+                    if tokio::fs::remove_dir(&empty).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct CleanupTask(tokio::task::JoinHandle<()>);
 
@@ -350,7 +391,7 @@ impl LocalSegmentManager {
     }
 
     /// The files of a deleted index, removed: true when they were queued in index_cleanup, whose row stays until
-    /// forget_deleted_hnsw_indexes.
+    /// forget_deleted_hnsw_indexes. For a segment of a SPANN collection, its blockfiles.
     pub async fn delete_hnsw_index_files(
         &self,
         segment_id: SegmentUuid,
@@ -384,6 +425,7 @@ impl LocalSegmentManager {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err.into()),
             }
+            remove_blockfile_segment(Path::new(root), segment_id).await?;
         }
         Ok(true)
     }
