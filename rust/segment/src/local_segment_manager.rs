@@ -91,6 +91,23 @@ fn local_spann_config() -> Result<SpannProviderConfig, serde_json::Error> {
     }))
 }
 
+// The blockfiles of the SPANN index, with the settings of the compaction service of the worker
+// (rust/worker/chroma_config.yaml): blocks of 8 MiB, and a cache of 1000 of them and of 1000 roots in memory.
+fn local_blockfile_config() -> Result<BlockfileProviderConfig, serde_json::Error> {
+    serde_json::from_value(serde_json::json!({
+        "arrow": {
+            "block_manager_config": {
+                "max_block_size_bytes": 8388608,
+                "block_cache_config": {"lru": {"name": "block_cache", "capacity": 1000}},
+                "num_concurrent_block_flushes": 40,
+            },
+            "sparse_index_manager_config": {
+                "sparse_index_cache_config": {"lru": {"name": "sparse_index_cache", "capacity": 1000}},
+            },
+        },
+    }))
+}
+
 // The providers of the SPANN index, as the worker of distributed Chroma builds them, on local storage at the data path:
 // the blockfiles, and the HNSW index of the centers.
 async fn local_spann_provider(
@@ -98,12 +115,12 @@ async fn local_spann_provider(
     registry: &Registry,
 ) -> Result<SpannProvider, Box<dyn ChromaError>> {
     let storage = Storage::Local(LocalStorage::new(persist_path));
+    let defaults = |e| -> Box<dyn ChromaError> { Box::new(SpannDefaultsError(e)) };
     let blockfile_provider = BlockfileProvider::try_from_config(
-        &(BlockfileProviderConfig::default(), storage.clone()),
+        &(local_blockfile_config().map_err(defaults)?, storage.clone()),
         registry,
     )
     .await?;
-    let defaults = |e| -> Box<dyn ChromaError> { Box::new(SpannDefaultsError(e)) };
     let mut hnsw_config: HnswProviderConfig = serde_json::from_str("{}").map_err(defaults)?;
     hnsw_config.hnsw_cache_config = CacheConfig::Memory(FoyerCacheConfig {
         capacity: 64,
@@ -681,6 +698,7 @@ mod tests {
         #[derive(Deserialize)]
         struct Service {
             spann_provider: serde_json::Value,
+            blockfile_provider: serde_json::Value,
         }
         #[derive(Deserialize)]
         struct Worker {
@@ -710,6 +728,17 @@ mod tests {
         ] {
             assert_eq!(local[setting], compaction[setting], "{setting}");
         }
+        let blockfiles = serde_json::to_value(
+            serde_json::from_value::<BlockfileProviderConfig>(
+                worker.compaction_service.blockfile_provider,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(local_blockfile_config().unwrap()).unwrap(),
+            blockfiles
+        );
     }
 
     #[tokio::test]
