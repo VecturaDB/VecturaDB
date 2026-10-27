@@ -1520,3 +1520,58 @@ async fn watermark_read_failure_invalidates_replay_completion() {
     drop(reader);
     f.stop().await;
 }
+
+// The replaced versions of SPANN segments that the compactor remembers are those that a flush can still remove: a
+// segment that no flush has touched for longer than the grace, as one of a deleted collection, leaves nothing in memory.
+#[tokio::test]
+async fn replaced_spann_versions_are_forgotten_after_the_grace() {
+    let db = chroma_sqlite::db::test_utils::get_new_sqlite_db().await;
+    let registry = Registry::new();
+    registry.register(db.clone());
+    let manager = LocalSegmentManager::try_from_config(
+        &serde_json::from_value::<LocalSegmentManagerConfig>(serde_json::json!({
+            "persist_path": null
+        }))
+        .unwrap(),
+        &registry,
+    )
+    .await
+    .unwrap();
+    let mut compactor = LocalCompactionManager {
+        log: Log::Sqlite(SqliteLog::new(
+            db.clone(),
+            "default".into(),
+            "default".into(),
+        )),
+        sqlite_db: db.clone(),
+        hnsw_segment_manager: manager,
+        metrics: LocalCompactionMetrics::default(),
+        sysdb: SysDb::Test(TestSysDb::new()),
+        purged: HashSet::new(),
+        spann_versions: HashMap::new(),
+        spann_version_grace: Duration::ZERO,
+    };
+    let collection = Collection::test_collection(3);
+    for _ in 0..100 {
+        let segment = Segment {
+            id: SegmentUuid::new(),
+            scope: SegmentScope::VECTOR,
+            r#type: SegmentType::Spann,
+            collection: collection.collection_id,
+            metadata: None,
+            file_path: HashMap::from([(
+                "hnsw_index".to_string(),
+                vec!["tenant/t/database/d/collection/c/segment/s/hnsw/i".to_string()],
+            )]),
+        };
+        compactor
+            .remove_replaced_versions(&collection, &segment, HashMap::new())
+            .await
+            .unwrap();
+    }
+    assert!(
+        compactor.spann_versions.len() <= 1,
+        "{} segments remembered",
+        compactor.spann_versions.len()
+    );
+}

@@ -45,7 +45,7 @@ pub struct LocalCompactionManager {
     // backfill before a read or a write goes on. Each backfill forgets its collection, any other purge request
     // skips SQLite. A change missed here only delays a purge, which never decides what a read returns.
     purged: HashSet<CollectionUuid>,
-    // The versions that the flushes of SPANN collections replaced since the start, by segment.
+    // The versions that the flushes of SPANN collections replaced within the grace, by segment.
     spann_versions: HashMap<SegmentUuid, ReplacedVersions>,
     spann_version_grace: Duration,
 }
@@ -55,6 +55,16 @@ struct ReplacedVersions {
     // The files of each replaced version, with when it was replaced, oldest first.
     replaced: VecDeque<(Instant, HashMap<String, Vec<String>>)>,
     removed_at: Option<Instant>,
+}
+
+impl ReplacedVersions {
+    // When a flush last touched the segment.
+    fn last_flush(&self) -> Option<Instant> {
+        self.replaced
+            .back()
+            .map(|(replaced_at, _)| *replaced_at)
+            .max(self.removed_at)
+    }
 }
 
 /// How long the files of a version of a SPANN collection stay after a flush replaced it, for the reads that opened it:
@@ -537,6 +547,14 @@ impl LocalCompactionManager {
     ) -> Result<(), LocalSegmentManagerError> {
         let now = Instant::now();
         let grace = self.spann_version_grace;
+        // A segment that no flush touched for longer than the grace, as one of a deleted collection, has no version left
+        // to keep for the reads: its next flush keeps the version before its current one anyway.
+        self.spann_versions.retain(|segment_id, versions| {
+            *segment_id == segment.id
+                || versions
+                    .last_flush()
+                    .is_some_and(|last_flush| now.duration_since(last_flush) < grace)
+        });
         let versions = self.spann_versions.entry(segment.id).or_default();
         if !segment.file_path.is_empty() {
             versions
