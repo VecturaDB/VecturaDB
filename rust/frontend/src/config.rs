@@ -26,7 +26,7 @@ fn default_log_config() -> LogConfig {
 }
 
 fn default_executor_config() -> ExecutorConfig {
-    ExecutorConfig::Local(LocalExecutorConfig {})
+    ExecutorConfig::Local(LocalExecutorConfig::default())
 }
 
 fn default_sqlitedb() -> Option<SqliteDBConfig> {

@@ -26,6 +26,7 @@ pub struct LocalExecutor {
     hnsw_manager: LocalSegmentManager,
     metadata_reader: SqliteMetadataReader,
     compactor_handle: ComponentHandle<LocalCompactionManager>,
+    spann: bool,
 }
 
 impl LocalExecutor {
@@ -38,15 +39,26 @@ impl LocalExecutor {
             hnsw_manager,
             metadata_reader: SqliteMetadataReader::new(sqlite_db),
             compactor_handle,
+            spann: false,
         }
     }
 
+    /// SPANN collections, when the option asks for them and the data path can hold their files.
+    pub fn with_spann(mut self, spann: bool) -> Self {
+        self.spann = spann && self.hnsw_manager.spann_provider().is_some();
+        self
+    }
+
     pub fn get_supported_segment_types(&self) -> Vec<SegmentType> {
-        vec![
+        let mut types = vec![
             SegmentType::HnswLocalMemory,
             SegmentType::HnswLocalPersisted,
             SegmentType::Sqlite,
-        ]
+        ];
+        if self.spann {
+            types.extend([SegmentType::Spann, SegmentType::BlockfileRecord]);
+        }
+        types
     }
     pub async fn validate_index(
         &self,
@@ -472,7 +484,7 @@ impl LocalExecutor {
 #[async_trait]
 impl Configurable<LocalExecutorConfig> for LocalExecutor {
     async fn try_from_config(
-        _config: &LocalExecutorConfig,
+        config: &LocalExecutorConfig,
         registry: &Registry,
     ) -> Result<Self, Box<dyn ChromaError>> {
         let hnsw_manager = registry
@@ -482,7 +494,7 @@ impl Configurable<LocalExecutorConfig> for LocalExecutor {
         let compactor_handle = registry
             .get::<ComponentHandle<LocalCompactionManager>>()
             .map_err(|err| err.boxed())?;
-        Ok(Self::new(hnsw_manager, sqlite_db, compactor_handle.clone()))
+        Ok(Self::new(hnsw_manager, sqlite_db, compactor_handle.clone()).with_spann(config.spann))
     }
 }
 

@@ -52,8 +52,13 @@ pub struct DistributedExecutorConfig {
     pub tiers: TiersConfig,
 }
 
-#[derive(Deserialize, Clone, Serialize, Debug)]
-pub struct LocalExecutorConfig {}
+#[derive(Deserialize, Clone, Serialize, Debug, Default)]
+pub struct LocalExecutorConfig {
+    /// Collections whose configuration or schema asks for SPANN get a SPANN index, as on distributed Chroma, instead of
+    /// HNSW. Off by default: a SPANN request then gets HNSW, as before. Needs a persistent data path.
+    #[serde(default)]
+    pub spann: bool,
+}
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Deserialize, Clone, Serialize, Debug)]

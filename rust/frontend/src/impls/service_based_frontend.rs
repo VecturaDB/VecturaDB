@@ -1171,6 +1171,22 @@ impl ServiceBasedFrontend {
         self.default_knn_index
     }
 
+    /// The index of a new collection: SPANN on a single node when the request asks for it and the executor supports
+    /// SPANN collections, the default otherwise.
+    pub fn knn_index_for(&self, spann_requested: bool) -> KnnIndex {
+        match &self.executor {
+            Executor::Local(_)
+                if spann_requested
+                    && self
+                        .get_supported_segment_types()
+                        .contains(&SegmentType::Spann) =>
+            {
+                KnnIndex::Spann
+            }
+            _ => self.default_knn_index,
+        }
+    }
+
     pub async fn heartbeat(&self) -> Result<HeartbeatResponse, HeartbeatError> {
         Ok(HeartbeatResponse {
             nanosecond_heartbeat: SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
@@ -1611,13 +1627,22 @@ impl ServiceBasedFrontend {
             ..
         }: CreateCollectionRequest,
     ) -> Result<CreateCollectionResponse, CreateCollectionError> {
+        let spann_requested = configuration.as_ref().is_some_and(|config| {
+            matches!(
+                config.vector_index,
+                chroma_types::VectorIndexConfiguration::Spann(_)
+            )
+        }) || schema
+            .as_ref()
+            .is_some_and(|schema| schema.get_internal_spann_config().is_some());
+        let knn_index = self.knn_index_for(spann_requested);
         let plan = frontend_core::collection_ops::plan_create_collection(
             configuration,
             schema,
             executor_kind(&self.executor),
             &self.get_supported_segment_types(),
             self.enable_schema,
-            self.default_knn_index,
+            knn_index,
             frontend_core::collection_ops::TenantFeatureFlags {
                 enable_quantization: self.should_enable_quantization_for_tenant(&tenant_id),
                 enable_maxscore: self.should_enable_maxscore_for_tenant(&tenant_id),
@@ -3930,8 +3955,8 @@ mod tests {
     use chroma_config::registry::Registry;
     use chroma_sysdb::GrpcSysDbConfig;
     use chroma_types::{
-        Collection, MetadataComparison, MetadataExpression, MetadataValue, PrimitiveOperator,
-        SegmentScope,
+        Collection, InternalCollectionConfiguration, MetadataComparison, MetadataExpression,
+        MetadataValue, PrimitiveOperator, SegmentScope,
     };
     use uuid::Uuid;
 
@@ -4386,6 +4411,113 @@ mod tests {
         ServiceBasedFrontend::try_from_config(&(config, system), &registry)
             .await
             .unwrap()
+    }
+
+    // A single node on a data path, with SPANN collections when spann is on.
+    async fn frontend_with_spann(root: &std::path::Path, spann: bool) -> ServiceBasedFrontend {
+        let registry = Registry::new();
+        let system = System::new();
+        let mut config = FrontendConfig::sqlite_in_memory();
+        config.sqlitedb.as_mut().unwrap().url =
+            Some(root.join("chroma.sqlite3").to_str().unwrap().into());
+        config.segment_manager.as_mut().unwrap().persist_path = Some(root.to_str().unwrap().into());
+        config.executor = crate::executor::config::ExecutorConfig::Local(
+            crate::executor::config::LocalExecutorConfig { spann },
+        );
+        ServiceBasedFrontend::try_from_config(&(config, system), &registry)
+            .await
+            .unwrap()
+    }
+
+    // With the option off, a request for SPANN, in the configuration or in the schema, gets HNSW as before; with it on,
+    // the segments of distributed Chroma. A request without SPANN gets HNSW either way.
+    #[tokio::test]
+    async fn a_spann_request_gets_hnsw_unless_the_option_asks_for_spann() {
+        for spann in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut frontend = frontend_with_spann(root.path(), spann).await;
+            let request = |name: &str, configuration, schema| {
+                CreateCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    name.to_string(),
+                    None,
+                    configuration,
+                    schema,
+                    false,
+                )
+                .unwrap()
+            };
+            // As the HTTP server: a configuration with SPANN, converted with the index the frontend gives a SPANN
+            // request.
+            let spann_configuration = InternalCollectionConfiguration::try_from_config(
+                chroma_types::CollectionConfiguration {
+                    hnsw: None,
+                    spann: Some(chroma_types::SpannConfiguration::default()),
+                    embedding_function: None,
+                },
+                frontend.knn_index_for(true),
+                None,
+            )
+            .unwrap();
+            let created = [
+                (
+                    frontend
+                        .create_collection(request(
+                            "by-configuration",
+                            Some(spann_configuration),
+                            None,
+                        ))
+                        .await
+                        .unwrap(),
+                    spann,
+                ),
+                (
+                    frontend
+                        .create_collection(request(
+                            "by-schema",
+                            None,
+                            Some(Schema::new_default(KnnIndex::Spann)),
+                        ))
+                        .await
+                        .unwrap(),
+                    spann,
+                ),
+                (
+                    frontend
+                        .create_collection(request("plain", None, None))
+                        .await
+                        .unwrap(),
+                    false,
+                ),
+            ];
+            for (collection, gets_spann) in created {
+                let segments = frontend
+                    .sysdb_client
+                    .get_collection_with_segments(None, collection.collection_id)
+                    .await
+                    .unwrap();
+                let (vector, record) = if gets_spann {
+                    (SegmentType::Spann, SegmentType::BlockfileRecord)
+                } else {
+                    (SegmentType::HnswLocalPersisted, SegmentType::Sqlite)
+                };
+                assert_eq!(
+                    segments.vector_segment.r#type, vector,
+                    "{} spann={spann}",
+                    collection.name
+                );
+                assert_eq!(
+                    segments.record_segment.r#type, record,
+                    "{} spann={spann}",
+                    collection.name
+                );
+                assert_eq!(segments.metadata_segment.r#type, SegmentType::Sqlite);
+                let schema = segments.collection.schema.unwrap();
+                assert_eq!(schema.get_internal_spann_config().is_some(), gets_spann);
+                assert_eq!(schema.get_internal_hnsw_config().is_some(), !gets_spann);
+            }
+        }
     }
 
     #[tokio::test]

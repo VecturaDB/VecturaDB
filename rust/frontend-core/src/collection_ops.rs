@@ -206,6 +206,32 @@ pub fn plan_create_collection(
                 },
             ]
         }
+        ExecutorKind::Local
+            if supported.contains(&SegmentType::Spann)
+                && (reconciled_schema
+                    .as_ref()
+                    .is_some_and(|schema| schema.get_internal_spann_config().is_some())
+                    || configuration.as_ref().is_some_and(|config| {
+                        matches!(config.vector_index, VectorIndexConfiguration::Spann(_))
+                    })) =>
+        {
+            // As distributed Chroma, a record segment beside the SPANN index; the metadata stay in SQLite.
+            [
+                (SegmentType::Spann, SegmentScope::VECTOR),
+                (SegmentType::Sqlite, SegmentScope::METADATA),
+                (SegmentType::BlockfileRecord, SegmentScope::RECORD),
+            ]
+            .into_iter()
+            .map(|(r#type, scope)| Segment {
+                id: SegmentUuid::new(),
+                r#type,
+                scope,
+                collection: collection_id,
+                metadata: None,
+                file_path: Default::default(),
+            })
+            .collect()
+        }
         ExecutorKind::Local => {
             vec![
                 Segment {
