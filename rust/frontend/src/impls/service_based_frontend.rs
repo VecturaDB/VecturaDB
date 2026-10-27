@@ -4534,6 +4534,203 @@ mod tests {
         }
     }
 
+    // The ids of the k nearest of a query among the records, by squared L2 distance.
+    fn exact_nearest(records: &[(String, Vec<f32>)], query: &[f32], k: usize) -> Vec<String> {
+        let mut by_distance = records
+            .iter()
+            .map(|(id, vector)| {
+                let distance: f32 = vector
+                    .iter()
+                    .zip(query)
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
+                (distance, id.clone())
+            })
+            .collect::<Vec<_>>();
+        by_distance.sort_by(|a, b| a.0.total_cmp(&b.0));
+        by_distance.into_iter().take(k).map(|(_, id)| id).collect()
+    }
+
+    async fn query_ids(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        query: Vec<f32>,
+        k: u32,
+    ) -> Vec<String> {
+        frontend
+            .query(
+                QueryRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    None,
+                    None,
+                    vec![query],
+                    k,
+                    chroma_types::IncludeList::default_query(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .ids
+            .remove(0)
+    }
+
+    // A SPANN collection on a single node reads back what is written to it, by id and by KNN, after deletes and after
+    // a restart.
+    #[tokio::test]
+    async fn a_spann_collection_reads_back_its_records() {
+        let root = tempfile::tempdir().unwrap();
+        let mut records = (0..300)
+            .map(|i| {
+                let x = i as f32;
+                (
+                    format!("r{i}"),
+                    vec![
+                        (x * 0.37).sin(),
+                        (x * 0.11).cos(),
+                        (x * 0.05).sin(),
+                        x / 300.0,
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        let queries = [0usize, 77, 150, 299]
+            .iter()
+            .map(|&i| records[i].1.iter().map(|v| v + 0.01).collect::<Vec<f32>>())
+            .collect::<Vec<_>>();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection = frontend
+            .create_collection(
+                CreateCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    "spann-records".to_string(),
+                    None,
+                    None,
+                    Some(Schema::new_default(KnnIndex::Spann)),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let collection_id = collection.collection_id;
+        for chunk in records.chunks(100) {
+            frontend
+                .add(
+                    AddCollectionRecordsRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection_id,
+                        chunk.iter().map(|(id, _)| id.clone()).collect(),
+                        chunk.iter().map(|(_, vector)| vector.clone()).collect(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let segments = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collection_id)
+            .await
+            .unwrap();
+        assert_eq!(segments.vector_segment.r#type, SegmentType::Spann);
+        assert!(!segments.vector_segment.file_path.is_empty());
+        assert!(!segments.record_segment.file_path.is_empty());
+        for query in &queries {
+            assert_eq!(
+                query_ids(&mut frontend, collection_id, query.clone(), 5).await,
+                exact_nearest(&records, query, 5)
+            );
+        }
+        let got = frontend
+            .get(
+                GetRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    Some(vec!["r7".to_string(), "r250".to_string()]),
+                    None,
+                    None,
+                    0,
+                    chroma_types::IncludeList(vec![chroma_types::Include::Embedding]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut got = got
+            .ids
+            .into_iter()
+            .zip(got.embeddings.unwrap())
+            .collect::<Vec<_>>();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("r250".to_string(), records[250].1.clone()),
+                ("r7".to_string(), records[7].1.clone()),
+            ]
+        );
+
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    Some((0..10).map(|i| format!("r{i}")).collect()),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        records.drain(0..10);
+        let count = |frontend: &mut ServiceBasedFrontend| {
+            let mut frontend = frontend.clone();
+            async move {
+                frontend
+                    .count(
+                        CountRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            chroma_types::plan::ReadLevel::default(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(count(&mut frontend).await, 290);
+        for query in &queries {
+            assert_eq!(
+                query_ids(&mut frontend, collection_id, query.clone(), 5).await,
+                exact_nearest(&records, query, 5)
+            );
+        }
+        drop(frontend);
+
+        let mut reopened = frontend_with_spann(root.path(), true).await;
+        assert_eq!(count(&mut reopened).await, 290);
+        for query in &queries {
+            assert_eq!(
+                query_ids(&mut reopened, collection_id, query.clone(), 5).await,
+                exact_nearest(&records, query, 5)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn database_deletion_leaves_unrelated_cleanup_to_background() {
         let registry = Registry::new();
