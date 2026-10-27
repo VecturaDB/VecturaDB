@@ -5639,6 +5639,302 @@ mod tests {
             .unwrap();
     }
 
+    // Records with a document each, under the prefix, with the vectors of their numbers.
+    async fn add_with_documents(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        numbers: std::ops::Range<usize>,
+        prefix: &str,
+    ) {
+        let numbers = numbers.collect::<Vec<_>>();
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    numbers.iter().map(|i| format!("{prefix}{i}")).collect(),
+                    numbers
+                        .iter()
+                        .map(|&i| vec![i as f32, (i as f32).sin()])
+                        .collect(),
+                    Some(
+                        numbers
+                            .iter()
+                            .map(|i| Some(format!("document {prefix}{i}")))
+                            .collect(),
+                    ),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // What reads see while one writer adds and deletes records of the same collection: every record that a query, a
+    // search or a get returns should come with its document and its embedding, and no read should fail. Returns what
+    // went otherwise.
+    async fn reads_during_writes(index: KnnIndex, rounds: usize) -> Vec<String> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = frontend
+            .create_collection(
+                CreateCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    "moments".to_string(),
+                    None,
+                    None,
+                    Some(Schema::new_default(index)),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collection_id;
+        add_with_documents(&mut frontend, collection_id, 0..200, "r").await;
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let writer = {
+            let mut frontend = frontend.clone();
+            let done = done.clone();
+            async move {
+                for round in 0..rounds {
+                    add_with_documents(&mut frontend, collection_id, round..round + 1, "w").await;
+                    frontend
+                        .delete(
+                            DeleteCollectionRecordsRequest::try_new(
+                                TENANT.to_string(),
+                                DATABASE.to_string(),
+                                collection_id,
+                                Some(vec![format!("w{round}")]),
+                                None,
+                                None,
+                            )
+                            .unwrap(),
+                            String::new(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                done.store(true, Ordering::SeqCst);
+            }
+        };
+        let queries = {
+            let mut frontend = frontend.clone();
+            let done = done.clone();
+            async move {
+                let mut wrong = Vec::new();
+                while !done.load(Ordering::SeqCst) {
+                    let response = frontend
+                        .query(
+                            QueryRequest::try_new(
+                                TENANT.to_string(),
+                                DATABASE.to_string(),
+                                collection_id,
+                                None,
+                                None,
+                                vec![vec![0.0, 0.0]],
+                                500,
+                                chroma_types::IncludeList(vec![
+                                    chroma_types::Include::Document,
+                                    chroma_types::Include::Embedding,
+                                ]),
+                            )
+                            .unwrap(),
+                        )
+                        .await;
+                    match response {
+                        Ok(response) => {
+                            let documents = response.documents.unwrap_or_default();
+                            let embeddings = response.embeddings.unwrap_or_default();
+                            fn at<T>(lists: &[Vec<Option<T>>], position: usize) -> bool {
+                                lists
+                                    .first()
+                                    .and_then(|list| list.get(position))
+                                    .is_some_and(Option::is_some)
+                            }
+                            for (position, id) in response.ids[0].iter().enumerate() {
+                                if !at(&documents, position) {
+                                    wrong.push(format!("query: {id} without its document"));
+                                }
+                                if !at(&embeddings, position) {
+                                    wrong.push(format!("query: {id} without its embedding"));
+                                }
+                            }
+                        }
+                        Err(err) => wrong.push(format!("query: {err}")),
+                    }
+                }
+                wrong
+            }
+        };
+        let searches = {
+            let mut frontend = frontend.clone();
+            let done = done.clone();
+            async move {
+                let payload = SearchPayload {
+                    filter: Filter {
+                        query_ids: None,
+                        where_clause: None,
+                    },
+                    rank: chroma_types::operator::Rank {
+                        expr: Some(chroma_types::operator::RankExpr::Knn {
+                            query: chroma_types::operator::QueryVector::Dense(vec![0.0, 0.0]),
+                            key: chroma_types::operator::Key::Embedding,
+                            limit: 500,
+                            default: None,
+                            return_rank: false,
+                        }),
+                    },
+                    limit: Limit {
+                        offset: 0,
+                        limit: Some(500),
+                    },
+                    select: chroma_types::operator::Select {
+                        keys: [
+                            chroma_types::operator::Key::Document,
+                            chroma_types::operator::Key::Embedding,
+                        ]
+                        .into_iter()
+                        .collect(),
+                    },
+                    ..Default::default()
+                };
+                // Without a rank the records come from SQLite, and their embeddings from the vectors.
+                let listed = SearchPayload {
+                    rank: chroma_types::operator::Rank { expr: None },
+                    ..payload.clone()
+                };
+                let mut wrong = Vec::new();
+                while !done.load(Ordering::SeqCst) {
+                    let response = frontend
+                        .search(
+                            SearchRequest::try_new(
+                                TENANT.to_string(),
+                                DATABASE.to_string(),
+                                collection_id,
+                                vec![payload.clone(), listed.clone()],
+                                chroma_types::plan::ReadLevel::default(),
+                            )
+                            .unwrap(),
+                        )
+                        .await;
+                    match response {
+                        Ok(response) => {
+                            for (search, ids) in response.ids.iter().enumerate() {
+                                let documents =
+                                    response.documents[search].clone().unwrap_or_default();
+                                let embeddings =
+                                    response.embeddings[search].clone().unwrap_or_default();
+                                for (position, id) in ids.iter().enumerate() {
+                                    if documents.get(position).cloned().flatten().is_none() {
+                                        wrong.push(format!(
+                                            "search {search}: {id} without its document"
+                                        ));
+                                    }
+                                    if embeddings.get(position).cloned().flatten().is_none() {
+                                        wrong.push(format!(
+                                            "search {search}: {id} without its embedding"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => wrong.push(format!("search: {err}")),
+                    }
+                }
+                wrong
+            }
+        };
+        let gets = {
+            let mut frontend = frontend.clone();
+            let done = done.clone();
+            async move {
+                let mut wrong = Vec::new();
+                while !done.load(Ordering::SeqCst) {
+                    let response = frontend
+                        .get(
+                            GetRequest::try_new(
+                                TENANT.to_string(),
+                                DATABASE.to_string(),
+                                collection_id,
+                                None,
+                                None,
+                                None,
+                                0,
+                                chroma_types::IncludeList(vec![
+                                    chroma_types::Include::Document,
+                                    chroma_types::Include::Embedding,
+                                ]),
+                            )
+                            .unwrap(),
+                        )
+                        .await;
+                    match response {
+                        Ok(response) => {
+                            let embeddings = response.embeddings.map_or(0, |e| e.len());
+                            if embeddings != response.ids.len() {
+                                wrong.push(format!(
+                                    "get: {} ids and {embeddings} embeddings",
+                                    response.ids.len()
+                                ));
+                            }
+                            if response
+                                .documents
+                                .unwrap_or_default()
+                                .iter()
+                                .any(Option::is_none)
+                            {
+                                wrong.push("get: a record without its document".to_string());
+                            }
+                        }
+                        Err(err) => wrong.push(format!("get: {err}")),
+                    }
+                }
+                wrong
+            }
+        };
+        let ((), mut wrong, searched, got) = tokio::join!(writer, queries, searches, gets);
+        wrong.extend(searched);
+        wrong.extend(got);
+        wrong
+    }
+
+    // Reads of a SPANN collection see one moment of it, while another request writes it: the records of SQLite and the
+    // SPANN files of the same flush. A write commits SQLite first and then flushes SPANN, hundreds of ms later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn spann_reads_during_writes_see_one_moment() {
+        let wrong = reads_during_writes(KnnIndex::Spann, 30).await;
+        let kinds = ["query", "search", "get"].map(|kind| {
+            let of_kind = wrong
+                .iter()
+                .filter(|answer| answer.starts_with(kind))
+                .collect::<Vec<_>>();
+            format!("{kind} {}, as {:?}", of_kind.len(), of_kind.first())
+        });
+        assert!(
+            wrong.is_empty(),
+            "{} answers mixed two moments: {kinds:?}",
+            wrong.len()
+        );
+    }
+
+    // The same on an HNSW collection, for the attribution: run by hand, it prints what went otherwise.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "a probe for the attribution, run by hand"]
+    async fn hnsw_reads_during_writes_see_one_moment() {
+        let wrong = reads_during_writes(KnnIndex::Hnsw, 30).await;
+        println!(
+            "HNSW: {} answers mixed two moments, for example {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(8)]
+        );
+    }
+
     #[tokio::test]
     async fn a_collection_created_again_before_the_sweep_is_new_and_works() {
         let root = tempfile::tempdir().unwrap();

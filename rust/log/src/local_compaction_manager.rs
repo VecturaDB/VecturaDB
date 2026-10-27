@@ -331,6 +331,20 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
         }
         mt_data_chunk.set_visibility(mt_visibility);
         hnsw_data_chunk.set_visibility(hnsw_visibility);
+        // As the flush of distributed Chroma, which changes every segment of a collection at once: the files of a SPANN
+        // collection are written first, and its records go to SQLite in the transaction that records those files, so a
+        // read in one transaction sees them at the same flush.
+        let spann_flush = match spann {
+            true => {
+                self.write_spann(
+                    &collection_and_segments,
+                    dim as usize,
+                    hnsw_data_chunk.clone(),
+                )
+                .await?
+            }
+            false => None,
+        };
         // Apply the records to the metadata writer.
         let metadata_writer = SqliteMetadataWriter::new(self.sqlite_db.clone());
         let mut tx = metadata_writer
@@ -362,13 +376,49 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
                     .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
             }
         }
+        if let Some(flush) = &spann_flush {
+            chroma_sysdb::sqlite::flush_compaction_in(
+                &mut *tx,
+                collection_and_segments.collection.collection_id,
+                flush.log_position,
+                collection_and_segments.collection.version,
+                &[
+                    SegmentFlushInfo {
+                        segment_id: collection_and_segments.record_segment.id,
+                        file_paths: flush.record_files.clone(),
+                    },
+                    SegmentFlushInfo {
+                        segment_id: collection_and_segments.vector_segment.id,
+                        file_paths: flush.vector_files.clone(),
+                    },
+                ],
+                None,
+            )
+            .await
+            .map_err(|err| CompactionManagerError::SpannWriteError(err.boxed()))?;
+        }
         tx.commit()
             .await
             .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
         if spann {
-            return self
-                .apply_spann(&collection_and_segments, dim as usize, hnsw_data_chunk)
-                .await;
+            if let Some(flush) = spann_flush {
+                for (segment, files) in [
+                    (&collection_and_segments.record_segment, flush.record_files),
+                    (&collection_and_segments.vector_segment, flush.vector_files),
+                ] {
+                    if let Err(err) = self
+                        .remove_replaced_versions(
+                            &collection_and_segments.collection,
+                            segment,
+                            files,
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %err, "SPANN flush done; the files of older versions stay for the next flush");
+                    }
+                }
+            }
+            return Ok(());
         }
         // Next apply it to the hnsw writer.
         let mut hnsw_writer = self
@@ -411,17 +461,25 @@ impl Handler<PurgeLogsMessage> for LocalCompactionManager {
     }
 }
 
+// The files of a flush of a SPANN collection, and the log position they cover.
+struct SpannFlush {
+    log_position: i64,
+    record_files: HashMap<String, Vec<String>>,
+    vector_files: HashMap<String, Vec<String>>,
+}
+
 impl LocalCompactionManager {
     // As the compaction of distributed Chroma: the records are materialized against the record segment, applied to it
-    // and to the SPANN index, and the new files of both are recorded with the log position they cover in one flush.
-    async fn apply_spann(
+    // and to the SPANN index, and the new files of both written; the caller records them with the log position they
+    // cover. None when the log has nothing past the last flush.
+    async fn write_spann(
         &mut self,
         collection_and_segments: &CollectionAndSegments,
         dimensionality: usize,
         logs: Chunk<LogRecord>,
-    ) -> Result<(), CompactionManagerError> {
+    ) -> Result<Option<SpannFlush>, CompactionManagerError> {
         let Some(log_position) = logs.iter().map(|(log, _)| log.log_offset).max() else {
-            return Ok(());
+            return Ok(None);
         };
         let write = |err: Box<dyn ChromaError>| CompactionManagerError::SpannWriteError(err);
         let provider = self
@@ -495,44 +553,11 @@ impl LocalCompactionManager {
             .flush()
             .await
             .map_err(write)?;
-        let database_name = DatabaseName::new(collection.database.clone())
-            .ok_or(CompactionManagerError::PullLogsFailure)?;
-        self.sysdb
-            .flush_compaction(
-                collection.tenant.clone(),
-                database_name,
-                collection.collection_id,
-                log_position,
-                collection.version,
-                vec![
-                    SegmentFlushInfo {
-                        segment_id: collection_and_segments.record_segment.id,
-                        file_paths: record_files.clone(),
-                    },
-                    SegmentFlushInfo {
-                        segment_id: collection_and_segments.vector_segment.id,
-                        file_paths: vector_files.clone(),
-                    },
-                ]
-                .into(),
-                0,
-                0,
-                None,
-            )
-            .await
-            .map_err(|err| write(err.boxed()))?;
-        for (segment, files) in [
-            (&collection_and_segments.record_segment, record_files),
-            (&collection_and_segments.vector_segment, vector_files),
-        ] {
-            if let Err(err) = self
-                .remove_replaced_versions(collection, segment, files)
-                .await
-            {
-                tracing::warn!(error = %err, "SPANN flush done; the files of older versions stay for the next flush");
-            }
-        }
-        Ok(())
+        Ok(Some(SpannFlush {
+            log_position,
+            record_files,
+            vector_files,
+        }))
     }
 
     // The files of the versions of a SPANN segment that a flush replaced longer than the grace ago, removed, at most

@@ -785,75 +785,17 @@ impl SqliteSysDb {
             .begin()
             .await
             .map_err(|e| internal(e.to_string()))?;
-        let schema_str = schema
-            .map(|schema| serde_json::to_string(&schema))
-            .transpose()
-            .map_err(|e| internal(e.to_string()))?;
-        let found = sqlx::query(
-            "UPDATE collections SET schema_str = COALESCE($1, schema_str) WHERE id = $2",
-        )
-        .bind(schema_str)
-        .bind(collection_id.to_string())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| internal(e.to_string()))?
-        .rows_affected();
-        if found == 0 {
-            return Err(FlushCompactionError::CollectionNotFound);
-        }
-        for info in segment_flush_info.iter() {
-            // As the version check of distributed Chroma: a flush older than the last one of the segment would put back
-            // files without the records after it, so the whole flush fails.
-            let current: Option<i64> =
-                sqlx::query_scalar("SELECT seq_id FROM max_seq_id WHERE segment_id = $1")
-                    .bind(info.segment_id.to_string())
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| internal(e.to_string()))?;
-            if let Some(current) = current.filter(|current| *current > log_position) {
-                return Err(FlushCompactionError::FailedToFlushCompaction(
-                    tonic::Status::failed_precondition(format!(
-                        "Flush is stale: segment {} is at log position {current}, the flush at {log_position}",
-                        info.segment_id
-                    )),
-                ));
-            }
-            let file_paths =
-                serde_json::to_string(&info.file_paths).map_err(|e| internal(e.to_string()))?;
-            let updated = sqlx::query(
-                "UPDATE segments SET file_paths = $1 WHERE id = $2 AND collection = $3",
-            )
-            .bind(file_paths)
-            .bind(info.segment_id.to_string())
-            .bind(collection_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| internal(e.to_string()))?
-            .rows_affected();
-            if updated == 0 {
-                return Err(FlushCompactionError::SegmentNotFound);
-            }
-            sqlx::query(
-                "INSERT INTO max_seq_id (segment_id, seq_id) VALUES ($1, $2) \
-                 ON CONFLICT(segment_id) DO UPDATE SET seq_id = excluded.seq_id \
-                 WHERE max_seq_id.seq_id < excluded.seq_id",
-            )
-            .bind(info.segment_id.to_string())
-            .bind(log_position)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| internal(e.to_string()))?;
-        }
-        tx.commit().await.map_err(|e| internal(e.to_string()))?;
-        let last_compaction_time = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs() as i64)
-            .unwrap_or_default();
-        Ok(FlushCompactionResponse {
+        let response = flush_compaction_in(
+            &mut tx,
             collection_id,
+            log_position,
             collection_version,
-            last_compaction_time,
-        })
+            &segment_flush_info,
+            schema,
+        )
+        .await?;
+        tx.commit().await.map_err(|e| internal(e.to_string()))?;
+        Ok(response)
     }
 
     pub(crate) async fn delete_collection(
@@ -1625,6 +1567,89 @@ impl Configurable<SqliteSysDbConfig> for SqliteSysDb {
             config.log_topic_namespace.clone(),
         ))
     }
+}
+
+/// FlushCollectionCompaction on a connection of the caller: the new files of each segment and the log position they
+/// cover, as the max_seq_id of the segment, which never goes down; a segment of another collection fails the whole
+/// flush. A caller can record a flush in the transaction of other writes to the same database, as the compaction of a
+/// SPANN collection on a single node does with its records.
+pub async fn flush_compaction_in(
+    conn: &mut sqlx::SqliteConnection,
+    collection_id: CollectionUuid,
+    log_position: i64,
+    collection_version: i32,
+    segment_flush_info: &[SegmentFlushInfo],
+    schema: Option<Schema>,
+) -> Result<FlushCompactionResponse, FlushCompactionError> {
+    let internal = |message: String| {
+        FlushCompactionError::FailedToFlushCompaction(tonic::Status::internal(message))
+    };
+    let schema_str = schema
+        .map(|schema| serde_json::to_string(&schema))
+        .transpose()
+        .map_err(|e| internal(e.to_string()))?;
+    let found =
+        sqlx::query("UPDATE collections SET schema_str = COALESCE($1, schema_str) WHERE id = $2")
+            .bind(schema_str)
+            .bind(collection_id.to_string())
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| internal(e.to_string()))?
+            .rows_affected();
+    if found == 0 {
+        return Err(FlushCompactionError::CollectionNotFound);
+    }
+    for info in segment_flush_info.iter() {
+        // As the version check of distributed Chroma: a flush older than the last one of the segment would put back
+        // files without the records after it, so the whole flush fails.
+        let current: Option<i64> =
+            sqlx::query_scalar("SELECT seq_id FROM max_seq_id WHERE segment_id = $1")
+                .bind(info.segment_id.to_string())
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| internal(e.to_string()))?;
+        if let Some(current) = current.filter(|current| *current > log_position) {
+            return Err(FlushCompactionError::FailedToFlushCompaction(
+                tonic::Status::failed_precondition(format!(
+                    "Flush is stale: segment {} is at log position {current}, the flush at {log_position}",
+                    info.segment_id
+                )),
+            ));
+        }
+        let file_paths =
+            serde_json::to_string(&info.file_paths).map_err(|e| internal(e.to_string()))?;
+        let updated =
+            sqlx::query("UPDATE segments SET file_paths = $1 WHERE id = $2 AND collection = $3")
+                .bind(file_paths)
+                .bind(info.segment_id.to_string())
+                .bind(collection_id.to_string())
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| internal(e.to_string()))?
+                .rows_affected();
+        if updated == 0 {
+            return Err(FlushCompactionError::SegmentNotFound);
+        }
+        sqlx::query(
+            "INSERT INTO max_seq_id (segment_id, seq_id) VALUES ($1, $2) \
+             ON CONFLICT(segment_id) DO UPDATE SET seq_id = excluded.seq_id \
+             WHERE max_seq_id.seq_id < excluded.seq_id",
+        )
+        .bind(info.segment_id.to_string())
+        .bind(log_position)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| internal(e.to_string()))?;
+    }
+    let last_compaction_time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default();
+    Ok(FlushCompactionResponse {
+        collection_id,
+        collection_version,
+        last_compaction_time,
+    })
 }
 
 #[cfg(test)]

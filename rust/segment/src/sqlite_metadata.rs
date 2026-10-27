@@ -60,6 +60,8 @@ pub enum SqliteMetadataError {
     MissingEmbedding(String),
     #[error("Could not encode or decode sparse metadata: {0}")]
     SparseMetadataJson(serde_json::Error),
+    #[error("Could not read the files of a segment: {0}")]
+    SegmentFiles(serde_json::Error),
     #[error("Could not serialize schema: {0}")]
     SerializeSchema(#[from] serde_json::Error),
 }
@@ -153,6 +155,33 @@ impl DenseVectorReader for LocalHnswSegmentReader {
         self.get_embedding_by_user_id(&user_id.to_string())
             .await
             .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))
+    }
+}
+
+/// A read of the metadata at one moment: see SqliteMetadataReader::snapshot.
+pub struct MetadataSnapshot {
+    tx: Transaction<'static, Sqlite>,
+}
+
+impl MetadataSnapshot {
+    /// The files of the segments of a collection, by segment id, as its last flush recorded them.
+    pub async fn segment_files(
+        &mut self,
+        collection_id: CollectionUuid,
+    ) -> Result<HashMap<String, HashMap<String, Vec<String>>>, SqliteMetadataError> {
+        let rows = sqlx::query("SELECT id, file_paths FROM segments WHERE collection = ?")
+            .bind(collection_id.to_string())
+            .fetch_all(&mut *self.tx)
+            .await?;
+        let mut files = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let file_paths: String = row.try_get(1)?;
+            files.insert(
+                row.try_get(0)?,
+                serde_json::from_str(&file_paths).map_err(SqliteMetadataError::SegmentFiles)?,
+            );
+        }
+        Ok(files)
     }
 }
 
@@ -1447,6 +1476,36 @@ impl SqliteMetadataReader {
             .await?;
         tx.commit().await?;
         Ok(result)
+    }
+
+    /// A read of the metadata at one moment: a read transaction of SQLite, whose first read fixes what all its reads
+    /// see. A flush of a SPANN collection records its files in the transaction of its records, so a snapshot reads one
+    /// version of every segment of the collection, as a read of distributed Chroma does.
+    pub async fn snapshot(&self) -> Result<MetadataSnapshot, SqliteMetadataError> {
+        Ok(MetadataSnapshot {
+            tx: self.db.get_conn().begin().await?,
+        })
+    }
+
+    /// A get at the moment of a snapshot.
+    pub async fn get_at(
+        &self,
+        snapshot: &mut MetadataSnapshot,
+        plan: Get,
+    ) -> Result<GetResult, SqliteMetadataError> {
+        self.get_with_connection(plan, &mut snapshot.tx).await
+    }
+
+    /// A search at the moment of a snapshot.
+    pub async fn search_at(
+        &self,
+        snapshot: &mut MetadataSnapshot,
+        collection: chroma_types::CollectionAndSegments,
+        vectors: Option<&dyn DenseVectorReader>,
+        payloads: Vec<chroma_types::plan::SearchPayload>,
+    ) -> Result<chroma_types::operator::SearchResult, SqliteMetadataError> {
+        self.search_with_connection(collection, vectors, payloads, &mut snapshot.tx)
+            .await
     }
 
     async fn search_with_connection(

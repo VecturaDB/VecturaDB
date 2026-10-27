@@ -12,10 +12,11 @@ use chroma_segment::distributed_spann::{SpannSegmentReaderShard, SpannSegmentRea
 use chroma_segment::{
     local_hnsw::LocalHnswSegmentReader,
     local_segment_manager::LocalSegmentManager,
-    sqlite_metadata::{DenseVectorReader, SqliteMetadataError, SqliteMetadataReader},
+    sqlite_metadata::{
+        DenseVectorReader, MetadataSnapshot, SqliteMetadataError, SqliteMetadataReader,
+    },
 };
 use chroma_sqlite::db::SqliteDb;
-use chroma_sysdb::SysDb;
 use chroma_system::ComponentHandle;
 use chroma_types::{
     operator::{
@@ -37,8 +38,6 @@ pub struct LocalExecutor {
     metadata_reader: SqliteMetadataReader,
     compactor_handle: ComponentHandle<LocalCompactionManager>,
     spann: bool,
-    // The catalog, for the files of the last flush of a SPANN collection.
-    sysdb: Option<SysDb>,
 }
 
 impl LocalExecutor {
@@ -52,37 +51,13 @@ impl LocalExecutor {
             metadata_reader: SqliteMetadataReader::new(sqlite_db),
             compactor_handle,
             spann: false,
-            sysdb: None,
         }
     }
 
     /// SPANN collections, when the option asks for them and the data path can hold their files.
-    pub fn with_spann(mut self, spann: bool, sysdb: SysDb) -> Self {
+    pub fn with_spann(mut self, spann: bool) -> Self {
         self.spann = spann && self.hnsw_manager.spann_provider().is_some();
-        self.sysdb = Some(sysdb);
         self
-    }
-
-    // The segments of a SPANN collection with the files of its last flush: a cache of collections can hold the files
-    // of an older one.
-    async fn last_flush(
-        &self,
-        collection_and_segments: &CollectionAndSegments,
-    ) -> Result<CollectionAndSegments, ExecutorError> {
-        let mut collection_and_segments = collection_and_segments.clone();
-        if let Some(sysdb) = &self.sysdb {
-            let stored = sysdb
-                .clone()
-                .get_collection_with_segments(
-                    None,
-                    collection_and_segments.collection.collection_id,
-                )
-                .await
-                .map_err(|err| ExecutorError::Internal(err.boxed()))?;
-            collection_and_segments.record_segment.file_path = stored.record_segment.file_path;
-            collection_and_segments.vector_segment.file_path = stored.vector_segment.file_path;
-        }
-        Ok(collection_and_segments)
     }
 
     pub fn get_supported_segment_types(&self) -> Vec<SegmentType> {
@@ -266,6 +241,9 @@ impl LocalExecutor {
         F: Fn(tonic::Code) -> Fut,
         Fut: Future<Output = Result<Get, Box<dyn ChromaError>>>,
     {
+        if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
+            return Box::pin(self.spann_get(plan)).await;
+        }
         let collection_and_segments = plan.scan.collection_and_segments.clone();
         let hnsw_reader = self
             .try_backfill_collection(&collection_and_segments)
@@ -276,9 +254,59 @@ impl LocalExecutor {
             .get(plan)
             .await
             .map_err(|err| ExecutorError::Internal(Box::new(err)))?;
-        if load_embedding && collection_and_segments.vector_segment.r#type == SegmentType::Spann {
-            let flushed = self.last_flush(&collection_and_segments).await?;
-            if let Some(records) = Box::pin(self.spann_records(&flushed)).await? {
+        if load_embedding {
+            if let Some(hnsw_reader) = hnsw_reader {
+                for record in &mut result.result.records {
+                    record.embedding = Some(
+                        hnsw_reader
+                            .get_embedding_by_user_id(&record.id)
+                            .await
+                            .map_err(|err| ExecutorError::Internal(Box::new(err)))?,
+                    );
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    // One read of a SPANN collection: its log applied first, then a snapshot of SQLite, which reads the files of the
+    // last flush with the records at one moment, as a read of distributed Chroma reads one version of every segment.
+    // The files of a flush never change, and those of a replaced flush stay at least a grace.
+    async fn spann_snapshot(
+        &mut self,
+        collection_and_segments: &CollectionAndSegments,
+    ) -> Result<(MetadataSnapshot, CollectionAndSegments), ExecutorError> {
+        self.try_backfill_collection(collection_and_segments)
+            .await?;
+        let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
+        let mut snapshot = self.metadata_reader.snapshot().await.map_err(internal)?;
+        let mut files = snapshot
+            .segment_files(collection_and_segments.collection.collection_id)
+            .await
+            .map_err(internal)?;
+        let mut collection_and_segments = collection_and_segments.clone();
+        collection_and_segments.record_segment.file_path = files
+            .remove(&collection_and_segments.record_segment.id.to_string())
+            .unwrap_or_default();
+        collection_and_segments.vector_segment.file_path = files
+            .remove(&collection_and_segments.vector_segment.id.to_string())
+            .unwrap_or_default();
+        Ok((snapshot, collection_and_segments))
+    }
+
+    // A get of a SPANN collection: the records of SQLite and their embeddings from the record segment, at one moment.
+    async fn spann_get(&mut self, plan: Get) -> Result<GetResult, ExecutorError> {
+        let (mut snapshot, collection_and_segments) = self
+            .spann_snapshot(&plan.scan.collection_and_segments)
+            .await?;
+        let load_embedding = plan.proj.embedding;
+        let mut result = self
+            .metadata_reader
+            .get_at(&mut snapshot, plan)
+            .await
+            .map_err(|err| ExecutorError::Internal(Box::new(err)))?;
+        if load_embedding {
+            if let Some(records) = Box::pin(self.spann_records(&collection_and_segments)).await? {
                 for record in &mut result.result.records {
                     let offset_id = records
                         .get_offset_id_for_user_id(
@@ -296,17 +324,6 @@ impl LocalExecutor {
                     }
                 }
             }
-        } else if load_embedding {
-            if let Some(hnsw_reader) = hnsw_reader {
-                for record in &mut result.result.records {
-                    record.embedding = Some(
-                        hnsw_reader
-                            .get_embedding_by_user_id(&record.id)
-                            .await
-                            .map_err(|err| ExecutorError::Internal(Box::new(err)))?,
-                    );
-                }
-            }
         }
         Ok(result)
     }
@@ -316,6 +333,9 @@ impl LocalExecutor {
         F: Fn(tonic::Code) -> Fut,
         Fut: Future<Output = Result<Knn, Box<dyn ChromaError>>>,
     {
+        if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
+            return Box::pin(self.spann_knn(plan)).await;
+        }
         let collection_and_segments = plan.scan.collection_and_segments.clone();
         let hnsw_reader = self
             .try_backfill_collection(&collection_and_segments)
@@ -326,10 +346,9 @@ impl LocalExecutor {
             results: vec![Default::default(); plan.knn.embeddings.len()],
         });
 
-        let spann = collection_and_segments.vector_segment.r#type == SegmentType::Spann;
-        if !spann && hnsw_reader.is_none() {
+        let Some(hnsw_reader) = hnsw_reader else {
             return empty_result;
-        }
+        };
 
         let allowed_user_ids = match plan.filter {
             Filter {
@@ -377,19 +396,6 @@ impl LocalExecutor {
 
                 allowed_uids
             }
-        };
-
-        let Some(hnsw_reader) = hnsw_reader else {
-            let (results, returned_user_ids) = Box::pin(self.spann_query(
-                &collection_and_segments,
-                plan.knn.embeddings,
-                plan.knn.fetch,
-                &plan.proj,
-                allowed_user_ids,
-            ))
-            .await?;
-            return Box::pin(self.hydrate_knn(plan.scan, plan.proj, results, returned_user_ids))
-                .await;
         };
 
         let mut allowed_offset_ids = Vec::new();
@@ -461,36 +467,7 @@ impl LocalExecutor {
             results.push(KnnProjectionOutput { records });
         }
 
-        Box::pin(self.hydrate_knn(plan.scan, plan.proj, results, returned_user_ids)).await
-    }
-
-    // The documents and metadata of the nearest records, from SQLite.
-    async fn hydrate_knn(
-        &mut self,
-        scan: Scan,
-        proj: KnnProjection,
-        mut results: Vec<KnnProjectionOutput>,
-        returned_user_ids: Vec<String>,
-    ) -> Result<KnnBatchResult, ExecutorError> {
-        let plan_proj = proj;
-        if plan_proj.projection.document || plan_proj.projection.metadata {
-            let projection_plan = Get {
-                scan,
-                filter: Filter {
-                    query_ids: Some(returned_user_ids),
-                    where_clause: None,
-                },
-                limit: Limit {
-                    offset: 0,
-                    limit: None,
-                },
-                proj: Projection {
-                    document: plan_proj.projection.document,
-                    embedding: false,
-                    metadata: plan_proj.projection.metadata,
-                },
-            };
-
+        if let Some(projection_plan) = knn_hydration(plan.scan, &plan.proj, returned_user_ids) {
             let replan = {
                 let plan = projection_plan.clone();
                 move |_: tonic::Code| {
@@ -499,33 +476,80 @@ impl LocalExecutor {
                 }
             };
             let hydrated_records = self.get(projection_plan, replan).await?;
-            let mut user_id_to_document = HashMap::new();
-            let mut user_id_to_metadata = HashMap::new();
-            for ProjectionRecord {
-                id,
-                document,
-                embedding: _,
-                metadata,
-            } in hydrated_records.result.records
-            {
-                user_id_to_document.insert(id.clone(), document);
-                user_id_to_metadata.insert(id, metadata);
-            }
-
-            for result in &mut results {
-                for record in &mut result.records {
-                    record.record.document = user_id_to_document
-                        .get(&record.record.id)
-                        .cloned()
-                        .flatten();
-                    record.record.metadata = user_id_to_metadata
-                        .get(&record.record.id)
-                        .cloned()
-                        .flatten();
-                }
-            }
+            fill_knn(&mut results, hydrated_records);
         }
 
+        Ok(KnnBatchResult {
+            pulled_log_bytes: 0,
+            results,
+        })
+    }
+
+    // A KNN of a SPANN collection: its filter, its nearest records and their documents and metadata, at one moment.
+    async fn spann_knn(&mut self, plan: Knn) -> Result<KnnBatchResult, ExecutorError> {
+        let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
+        let empty_result = Ok(KnnBatchResult {
+            pulled_log_bytes: 0,
+            results: vec![Default::default(); plan.knn.embeddings.len()],
+        });
+        let (mut snapshot, collection_and_segments) = self
+            .spann_snapshot(&plan.scan.collection_and_segments)
+            .await?;
+        let allowed_user_ids = match plan.filter {
+            Filter {
+                query_ids: None,
+                where_clause: None,
+            } => Vec::new(),
+            Filter {
+                query_ids: Some(uids),
+                where_clause: _,
+            } if uids.is_empty() => return empty_result,
+            Filter {
+                query_ids: Some(uids),
+                where_clause: None,
+            } => uids,
+            filter => {
+                let filter_plan = Get {
+                    scan: plan.scan.clone(),
+                    filter,
+                    limit: Limit {
+                        offset: 0,
+                        limit: None,
+                    },
+                    proj: Default::default(),
+                };
+                let allowed_uids = self
+                    .metadata_reader
+                    .get_at(&mut snapshot, filter_plan)
+                    .await
+                    .map_err(internal)?
+                    .result
+                    .records
+                    .into_iter()
+                    .map(|record| record.id)
+                    .collect::<Vec<_>>();
+                if allowed_uids.is_empty() {
+                    return empty_result;
+                }
+                allowed_uids
+            }
+        };
+        let (mut results, returned_user_ids) = Box::pin(self.spann_query(
+            &collection_and_segments,
+            plan.knn.embeddings,
+            plan.knn.fetch,
+            &plan.proj,
+            allowed_user_ids,
+        ))
+        .await?;
+        if let Some(projection_plan) = knn_hydration(plan.scan, &plan.proj, returned_user_ids) {
+            let hydrated_records = self
+                .metadata_reader
+                .get_at(&mut snapshot, projection_plan)
+                .await
+                .map_err(internal)?;
+            fill_knn(&mut results, hydrated_records);
+        }
         Ok(KnnBatchResult {
             pulled_log_bytes: 0,
             results,
@@ -565,7 +589,6 @@ impl LocalExecutor {
         collection_and_segments: &CollectionAndSegments,
     ) -> Result<Option<SpannVectors<'_>>, ExecutorError> {
         let internal = |err: Box<dyn ChromaError>| ExecutorError::Internal(err);
-        let collection_and_segments = &self.last_flush(collection_and_segments).await?;
         let (Some(provider), Some(dimension)) = (
             self.hnsw_manager.spann_provider(),
             collection_and_segments.collection.dimension,
@@ -678,6 +701,9 @@ impl LocalExecutor {
         F: Fn(tonic::Code) -> Fut,
         Fut: Future<Output = Result<Search, Box<dyn ChromaError>>>,
     {
+        if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
+            return Box::pin(self.spann_search(plan)).await;
+        }
         // Every read level reads the same records: the local writes reach the indexes before they are acknowledged,
         // and the replay below applies any write a previous process left in the log.
         let hnsw_reader = self
@@ -690,20 +716,38 @@ impl LocalExecutor {
                 pulled_log_bytes: 0,
             });
         }
-        let spann_vectors =
-            if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
-                self.spann_vectors(&plan.scan.collection_and_segments)
-                    .await?
-            } else {
-                None
-            };
-        let vectors: Option<&dyn DenseVectorReader> = match (&spann_vectors, &hnsw_reader) {
-            (Some(spann), _) => Some(spann),
-            (None, Some(hnsw)) => Some(hnsw),
-            (None, None) => None,
-        };
+        let vectors = hnsw_reader
+            .as_ref()
+            .map(|hnsw| hnsw as &dyn DenseVectorReader);
         self.metadata_reader
             .search(plan.scan.collection_and_segments, vectors, plan.payloads)
+            .await
+            .map_err(|error| ExecutorError::Internal(Box::new(error)))
+    }
+
+    // A search of a SPANN collection: its files and its records at one moment.
+    async fn spann_search(&mut self, plan: Search) -> Result<SearchResult, ExecutorError> {
+        let (mut snapshot, collection_and_segments) = self
+            .spann_snapshot(&plan.scan.collection_and_segments)
+            .await?;
+        // As distributed Chroma (rust/worker/src/server.rs:697-701): an uninitialized collection has no results.
+        if collection_and_segments.is_uninitialized() {
+            return Ok(SearchResult {
+                results: vec![Default::default(); plan.payloads.len()],
+                pulled_log_bytes: 0,
+            });
+        }
+        let spann_vectors = self.spann_vectors(&collection_and_segments).await?;
+        let vectors = spann_vectors
+            .as_ref()
+            .map(|spann| spann as &dyn DenseVectorReader);
+        self.metadata_reader
+            .search_at(
+                &mut snapshot,
+                collection_and_segments,
+                vectors,
+                plan.payloads,
+            )
             .await
             .map_err(|error| ExecutorError::Internal(Box::new(error)))
     }
@@ -711,6 +755,54 @@ impl LocalExecutor {
     pub async fn reset(&mut self) -> Result<(), Box<dyn ChromaError>> {
         self.hnsw_manager.reset().await.map_err(|err| err.boxed())?;
         Ok(())
+    }
+}
+
+// The get of the documents and metadata of the nearest records of a KNN, when its projection asks for them.
+fn knn_hydration(scan: Scan, proj: &KnnProjection, returned_user_ids: Vec<String>) -> Option<Get> {
+    (proj.projection.document || proj.projection.metadata).then(|| Get {
+        scan,
+        filter: Filter {
+            query_ids: Some(returned_user_ids),
+            where_clause: None,
+        },
+        limit: Limit {
+            offset: 0,
+            limit: None,
+        },
+        proj: Projection {
+            document: proj.projection.document,
+            embedding: false,
+            metadata: proj.projection.metadata,
+        },
+    })
+}
+
+// The documents and metadata of the nearest records, from their get.
+fn fill_knn(results: &mut [KnnProjectionOutput], hydrated_records: GetResult) {
+    let mut user_id_to_document = HashMap::new();
+    let mut user_id_to_metadata = HashMap::new();
+    for ProjectionRecord {
+        id,
+        document,
+        embedding: _,
+        metadata,
+    } in hydrated_records.result.records
+    {
+        user_id_to_document.insert(id.clone(), document);
+        user_id_to_metadata.insert(id, metadata);
+    }
+    for result in results {
+        for record in &mut result.records {
+            record.record.document = user_id_to_document
+                .get(&record.record.id)
+                .cloned()
+                .flatten();
+            record.record.metadata = user_id_to_metadata
+                .get(&record.record.id)
+                .cloned()
+                .flatten();
+        }
     }
 }
 
@@ -869,9 +961,7 @@ impl Configurable<LocalExecutorConfig> for LocalExecutor {
         let compactor_handle = registry
             .get::<ComponentHandle<LocalCompactionManager>>()
             .map_err(|err| err.boxed())?;
-        let sysdb = registry.get::<SysDb>().map_err(|err| err.boxed())?;
-        Ok(Self::new(hnsw_manager, sqlite_db, compactor_handle.clone())
-            .with_spann(config.spann, sysdb))
+        Ok(Self::new(hnsw_manager, sqlite_db, compactor_handle.clone()).with_spann(config.spann))
     }
 }
 
