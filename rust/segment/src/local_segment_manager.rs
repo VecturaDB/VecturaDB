@@ -1,6 +1,13 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
-use chroma_blockstore::{config::BlockfileProviderConfig, provider::BlockfileProvider};
-use chroma_cache::{AysncPartitionedMutex, Cache, CacheConfig, CacheError, FoyerCacheConfig};
+use chroma_blockstore::{
+    arrow::provider::{BlockManager, RootManagerError},
+    config::BlockfileProviderConfig,
+    provider::BlockfileProvider,
+    RootManager,
+};
+use chroma_cache::{
+    nop::NopCache, AysncPartitionedMutex, Cache, CacheConfig, CacheError, FoyerCacheConfig,
+};
 use chroma_config::{
     registry::{Injectable, Registry},
     Configurable,
@@ -8,16 +15,16 @@ use chroma_config::{
 use chroma_error::{ChromaError, ErrorCodes};
 use chroma_index::{
     config::{HnswProviderConfig, SpannProviderConfig},
-    hnsw_provider::HnswIndexProvider,
+    hnsw_provider::{HnswIndexProvider, FILES},
     IndexUuid,
 };
 use chroma_sqlite::db::SqliteDb;
 use chroma_storage::{local::LocalStorage, Storage};
-use chroma_types::{Collection, Segment, SegmentUuid};
+use chroma_types::{Collection, Segment, SegmentUuid, HNSW_PATH, USER_ID_BLOOM_FILTER};
 use sea_query_binder::SqlxBinder;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     path::Path,
     sync::{Arc, Weak},
@@ -115,24 +122,11 @@ async fn local_spann_provider(
 // collection that it leaves empty. The catalog no longer names the tenant, the database or the collection of a deleted
 // segment: its folder is found by its id.
 async fn remove_blockfile_segment(root: &Path, segment_id: SegmentUuid) -> io::Result<()> {
-    async fn folders(path: &Path) -> io::Result<Vec<std::path::PathBuf>> {
-        let mut entries = match tokio::fs::read_dir(path).await {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(err),
-        };
-        let mut folders = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.file_type().await?.is_dir() {
-                folders.push(entry.path());
-            }
-        }
-        Ok(folders)
-    }
+    let folders = |path: std::path::PathBuf| async move { entries(&path, true).await };
     let segment = segment_id.to_string();
-    for tenant in folders(&root.join("tenant")).await? {
-        for database in folders(&tenant.join("database")).await? {
-            for collection in folders(&database.join("collection")).await? {
+    for tenant in folders(root.join("tenant")).await? {
+        for database in folders(tenant.join("database")).await? {
+            for collection in folders(database.join("collection")).await? {
                 let segments = collection.join("segment");
                 match tokio::fs::remove_dir_all(segments.join(&segment)).await {
                     Ok(()) => {}
@@ -149,6 +143,22 @@ async fn remove_blockfile_segment(root: &Path, segment_id: SegmentUuid) -> io::R
         }
     }
     Ok(())
+}
+
+// The folders, or else the files, in a folder; none in a folder that is not there.
+async fn entries(path: &Path, folders: bool) -> io::Result<Vec<std::path::PathBuf>> {
+    let mut entries = match tokio::fs::read_dir(path).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut found = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_dir() == folders {
+            found.push(entry.path());
+        }
+    }
+    Ok(found)
 }
 
 #[derive(Debug)]
@@ -224,6 +234,8 @@ pub enum LocalSegmentManagerError {
     PoolCacheError(#[from] CacheError),
     #[error("Error creating hnsw segment writer: {0}")]
     LocalHnswSegmentWriterError(#[from] LocalHnswSegmentWriterError),
+    #[error("Error reading the root of a blockfile: {0}")]
+    Root(#[from] RootManagerError),
 }
 
 impl ChromaError for LocalSegmentManagerError {
@@ -234,6 +246,7 @@ impl ChromaError for LocalSegmentManagerError {
             LocalSegmentManagerError::LocalHnswSegmentReaderError(e) => e.code(),
             LocalSegmentManagerError::PoolCacheError(e) => e.code(),
             LocalSegmentManagerError::LocalHnswSegmentWriterError(e) => e.code(),
+            LocalSegmentManagerError::Root(e) => e.code(),
         }
     }
 }
@@ -448,6 +461,87 @@ impl LocalSegmentManager {
                 .await?;
         }
         Ok(())
+    }
+
+    /// The files under the prefix of a segment of a SPANN collection that none of the versions given references,
+    /// removed: blocks, roots and the files of the HNSW indexes of the centers, listed as the garbage collector of
+    /// distributed Chroma lists the files of a version (rust/garbage_collector/src/operators/list_files_at_version.rs).
+    /// Other files stay. Returns how many went.
+    pub async fn remove_unused_spann_files(
+        &self,
+        prefix: &str,
+        versions: &[&HashMap<String, Vec<String>>],
+    ) -> Result<usize, LocalSegmentManagerError> {
+        let (Some(root), Some(storage)) = (
+            &self.persist_root,
+            self.spann_provider
+                .as_ref()
+                .and_then(|provider| provider.blockfile_provider.storage()),
+        ) else {
+            return Ok(0);
+        };
+        let roots = RootManager::new((*storage).clone(), Box::new(NopCache));
+        let mut live = HashSet::new();
+        for files in versions {
+            for (file_type, paths) in files.iter() {
+                for path in paths {
+                    let (path_prefix, id) = Segment::extract_prefix_and_id(path)
+                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+                    if file_type == HNSW_PATH || file_type == "hnsw_index" {
+                        live.extend(FILES.iter().map(|file| {
+                            HnswIndexProvider::format_key(path_prefix, &IndexUuid(id), file)
+                        }));
+                    } else if file_type == USER_ID_BLOOM_FILTER {
+                        live.insert(path.clone());
+                    } else {
+                        live.insert(RootManager::get_storage_key(path_prefix, &id));
+                        let blocks = roots.get_all_block_ids(&id, path_prefix).await?;
+                        live.extend(
+                            blocks
+                                .iter()
+                                .map(|block| BlockManager::format_key(path_prefix, block)),
+                        );
+                    }
+                }
+            }
+        }
+        let root = Path::new(root);
+        let mut removed = 0;
+        let remove_unused = |key: String| {
+            let path = root.join(&key);
+            let unused = !live.contains(&key);
+            async move {
+                if unused {
+                    match tokio::fs::remove_file(path).await {
+                        Ok(()) => return Ok(true),
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok(false)
+            }
+        };
+        for kind in ["block", "root"] {
+            for file in entries(&root.join(format!("{prefix}/{kind}")), false).await? {
+                if let Some(name) = file.file_name().and_then(|name| name.to_str()) {
+                    removed += remove_unused(format!("{prefix}/{kind}/{name}")).await? as usize;
+                }
+            }
+        }
+        for index in entries(&root.join(format!("{prefix}/hnsw")), true).await? {
+            let Some(index_name) = index.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            for file in entries(&index, false).await? {
+                if let Some(name) = file.file_name().and_then(|name| name.to_str()) {
+                    removed +=
+                        remove_unused(format!("{prefix}/hnsw/{index_name}/{name}")).await? as usize;
+                }
+            }
+            // A folder that still holds files stays.
+            let _ = tokio::fs::remove_dir(&index).await;
+        }
+        Ok(removed)
     }
 
     /// Whether the indexes are files, which the sweep at startup and every hour removes once deleted.

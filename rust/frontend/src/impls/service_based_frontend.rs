@@ -4431,7 +4431,24 @@ mod tests {
 
     // A single node on a data path, with SPANN collections when spann is on.
     async fn frontend_with_spann(root: &std::path::Path, spann: bool) -> ServiceBasedFrontend {
+        frontend_with_spann_registry(root, spann, Registry::new()).await
+    }
+
+    // A SPANN frontend that keeps the files of a replaced version for the grace given.
+    async fn frontend_with_spann_grace(
+        root: &std::path::Path,
+        grace: std::time::Duration,
+    ) -> ServiceBasedFrontend {
         let registry = Registry::new();
+        registry.register(chroma_log::SpannVersionGrace(grace));
+        frontend_with_spann_registry(root, true, registry).await
+    }
+
+    async fn frontend_with_spann_registry(
+        root: &std::path::Path,
+        spann: bool,
+        registry: Registry,
+    ) -> ServiceBasedFrontend {
         let system = System::new();
         let mut config = FrontendConfig::sqlite_in_memory();
         config.sqlitedb.as_mut().unwrap().url =
@@ -5228,6 +5245,142 @@ mod tests {
             assert_eq!(
                 query_ids(&mut frontend, fork, query.clone(), 4).await,
                 exact_nearest(&records, &query, 4)
+            );
+        }
+    }
+
+    // The versions of a SPANN collection on disk, from the files of its segments: a flush writes a root for each
+    // blockfile of a segment and a folder for the HNSW index of the centers.
+    fn spann_versions_on_disk(
+        root: &std::path::Path,
+        segments: &CollectionAndSegments,
+    ) -> (usize, usize, usize) {
+        let files = files_under(root.join("tenant").as_path());
+        let in_folder = |segment: chroma_types::SegmentUuid, folder: &str| {
+            files
+                .iter()
+                .filter(|file| {
+                    file.to_string_lossy().contains(&segment.to_string())
+                        && file.parent().and_then(|parent| parent.file_name())
+                            == Some(std::ffi::OsStr::new(folder))
+                })
+                .count()
+        };
+        let hnsw_indexes = files
+            .iter()
+            .filter(|file| {
+                file.to_string_lossy()
+                    .contains(&segments.vector_segment.id.to_string())
+            })
+            .filter_map(|file| {
+                let index = file.parent()?;
+                (index.parent()?.file_name()? == "hnsw").then(|| index.to_path_buf())
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        (
+            in_folder(segments.record_segment.id, "root"),
+            in_folder(segments.vector_segment.id, "root"),
+            hnsw_indexes,
+        )
+    }
+
+    // A flush removes the files of the versions of a SPANN collection that it replaced longer than the grace ago, and
+    // keeps the version before the current one, as the garbage collector of distributed Chroma with its
+    // min_versions_to_keep of 2. The records still read back, after a restart too.
+    #[tokio::test]
+    async fn a_spann_flush_removes_the_versions_it_replaced() {
+        let records = (0..2000)
+            .map(|i| {
+                let x = i as f32;
+                (
+                    format!("r{i}"),
+                    vec![(x * 0.37).sin(), (x * 0.11).cos(), x / 2000.0],
+                )
+            })
+            .collect::<Vec<_>>();
+        let write =
+            |frontend: &mut ServiceBasedFrontend, collection_id, chunk: &[(String, Vec<f32>)]| {
+                let mut frontend = frontend.clone();
+                let request = AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    chunk.iter().map(|(id, _)| id.clone()).collect(),
+                    chunk.iter().map(|(_, vector)| vector.clone()).collect(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+                async move { frontend.add(request).await.unwrap() }
+            };
+        let create = |frontend: &mut ServiceBasedFrontend| {
+            let mut frontend = frontend.clone();
+            async move {
+                frontend
+                    .create_collection(
+                        CreateCollectionRequest::try_new(
+                            TENANT.to_string(),
+                            DatabaseName::new(DATABASE).unwrap(),
+                            "spann-versions".to_string(),
+                            None,
+                            None,
+                            Some(Schema::new_default(KnnIndex::Spann)),
+                            false,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .collection_id
+            }
+        };
+
+        // Within the grace every version stays, for the reads that opened it.
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = create(&mut frontend).await;
+        for chunk in records[..300].chunks(100) {
+            write(&mut frontend, collection_id, chunk).await;
+        }
+        let segments = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collection_id)
+            .await
+            .unwrap();
+        assert_eq!(spann_versions_on_disk(root.path(), &segments), (12, 9, 3));
+        drop(frontend);
+
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann_grace(root.path(), std::time::Duration::ZERO).await;
+        let collection_id = create(&mut frontend).await;
+        for chunk in records.chunks(100) {
+            write(&mut frontend, collection_id, chunk).await;
+        }
+        let segments = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collection_id)
+            .await
+            .unwrap();
+        // The current version and the one before it.
+        assert_eq!(spann_versions_on_disk(root.path(), &segments), (8, 6, 2));
+        let queries = [0usize, 777, 1999]
+            .iter()
+            .map(|&i| records[i].1.iter().map(|v| v + 0.01).collect::<Vec<f32>>())
+            .collect::<Vec<_>>();
+        for query in &queries {
+            assert_eq!(
+                query_ids(&mut frontend, collection_id, query.clone(), 5).await,
+                exact_nearest(&records, query, 5)
+            );
+        }
+        drop(frontend);
+        let mut reopened = frontend_with_spann(root.path(), true).await;
+        for query in &queries {
+            assert_eq!(
+                query_ids(&mut reopened, collection_id, query.clone(), 5).await,
+                exact_nearest(&records, query, 5)
             );
         }
     }

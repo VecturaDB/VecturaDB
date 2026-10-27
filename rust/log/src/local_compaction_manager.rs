@@ -1,6 +1,7 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Formatter};
+use std::time::{Duration, Instant};
 
 use crate::Log;
 use async_trait::async_trait;
@@ -22,8 +23,9 @@ use chroma_sysdb::SysDb;
 use chroma_system::Handler;
 use chroma_system::{Component, ComponentContext};
 use chroma_types::{
-    Chunk, CollectionAndSegments, CollectionUuid, DatabaseName, GetCollectionWithSegmentsError,
-    LogRecord, Schema, SchemaError, SegmentFlushInfo, SegmentShard, SegmentType, SegmentUuid,
+    Chunk, Collection, CollectionAndSegments, CollectionUuid, DatabaseName,
+    GetCollectionWithSegmentsError, LogRecord, Schema, SchemaError, Segment, SegmentFlushInfo,
+    SegmentShard, SegmentType, SegmentUuid,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -43,7 +45,31 @@ pub struct LocalCompactionManager {
     // backfill before a read or a write goes on. Each backfill forgets its collection, any other purge request
     // skips SQLite. A change missed here only delays a purge, which never decides what a read returns.
     purged: HashSet<CollectionUuid>,
+    // The versions that the flushes of SPANN collections replaced since the start, by segment.
+    spann_versions: HashMap<SegmentUuid, ReplacedVersions>,
+    spann_version_grace: Duration,
 }
+
+#[derive(Clone, Debug, Default)]
+struct ReplacedVersions {
+    // The files of each replaced version, with when it was replaced, oldest first.
+    replaced: VecDeque<(Instant, HashMap<String, Vec<String>>)>,
+    removed_at: Option<Instant>,
+}
+
+/// How long the files of a version of a SPANN collection stay after a flush replaced it, for the reads that opened it:
+/// a minute, as the garbage collector of distributed Chroma in rust/worker/chroma_config.yaml
+/// (relative_cutoff_time_seconds). Injectable for tests.
+#[derive(Clone, Copy, Debug)]
+pub struct SpannVersionGrace(pub Duration);
+
+impl Default for SpannVersionGrace {
+    fn default() -> Self {
+        Self(Duration::from_secs(60))
+    }
+}
+
+impl Injectable for SpannVersionGrace {}
 
 // Forgetting a collection costs one more check, so the set is emptied instead of growing with every collection
 // a long-running server has read.
@@ -101,6 +127,8 @@ impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
             sysdb,
             metrics: registry.get::<LocalCompactionMetrics>().unwrap_or_default(),
             purged: HashSet::new(),
+            spann_versions: HashMap::new(),
+            spann_version_grace: registry.get::<SpannVersionGrace>().unwrap_or_default().0,
         };
         registry.register(res.clone());
         Ok(res)
@@ -467,11 +495,11 @@ impl LocalCompactionManager {
                 vec![
                     SegmentFlushInfo {
                         segment_id: collection_and_segments.record_segment.id,
-                        file_paths: record_files,
+                        file_paths: record_files.clone(),
                     },
                     SegmentFlushInfo {
                         segment_id: collection_and_segments.vector_segment.id,
-                        file_paths: vector_files,
+                        file_paths: vector_files.clone(),
                     },
                 ]
                 .into(),
@@ -481,6 +509,62 @@ impl LocalCompactionManager {
             )
             .await
             .map_err(|err| write(err.boxed()))?;
+        for (segment, files) in [
+            (&collection_and_segments.record_segment, record_files),
+            (&collection_and_segments.vector_segment, vector_files),
+        ] {
+            if let Err(err) = self
+                .remove_replaced_versions(collection, segment, files)
+                .await
+            {
+                tracing::warn!(error = %err, "SPANN flush done; the files of older versions stay for the next flush");
+            }
+        }
+        Ok(())
+    }
+
+    // The files of the versions of a SPANN segment that a flush replaced longer than the grace ago, removed, at most
+    // once a grace for each segment. The version before the current one stays, as min_versions_to_keep 2 in the garbage
+    // collector of distributed Chroma. Flushes run one at a time here, so no file of a flush to come is on disk yet;
+    // after a restart, the files of the versions replaced before it go at the first flush.
+    async fn remove_replaced_versions(
+        &mut self,
+        collection: &Collection,
+        segment: &Segment,
+        current: HashMap<String, Vec<String>>,
+    ) -> Result<(), LocalSegmentManagerError> {
+        let now = Instant::now();
+        let grace = self.spann_version_grace;
+        let versions = self.spann_versions.entry(segment.id).or_default();
+        if !segment.file_path.is_empty() {
+            versions
+                .replaced
+                .push_back((now, segment.file_path.clone()));
+        }
+        while versions.replaced.len() > 1
+            && versions
+                .replaced
+                .front()
+                .is_some_and(|(replaced_at, _)| now.duration_since(*replaced_at) >= grace)
+        {
+            versions.replaced.pop_front();
+        }
+        if versions
+            .removed_at
+            .is_some_and(|removed_at| now.duration_since(removed_at) < grace)
+        {
+            return Ok(());
+        }
+        versions.removed_at = Some(now);
+        let kept = std::iter::once(&current)
+            .chain(versions.replaced.iter().map(|(_, files)| files))
+            .collect::<Vec<_>>();
+        self.hnsw_segment_manager
+            .remove_unused_spann_files(
+                &segment.construct_prefix_path(&collection.tenant, &collection.database_id),
+                &kept,
+            )
+            .await?;
         Ok(())
     }
 

@@ -89,6 +89,8 @@ impl Fixture {
             metrics: LocalCompactionMetrics::default(),
             sysdb: SysDb::Test(sysdb.clone()),
             purged: HashSet::new(),
+            spann_versions: HashMap::new(),
+            spann_version_grace: SpannVersionGrace::default().0,
         });
         Self {
             db,
@@ -219,6 +221,8 @@ impl Fixture {
             metrics: LocalCompactionMetrics::default(),
             sysdb: SysDb::Test(self.sysdb.clone()),
             purged: HashSet::new(),
+            spann_versions: HashMap::new(),
+            spann_version_grace: SpannVersionGrace::default().0,
         });
     }
 
