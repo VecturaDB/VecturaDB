@@ -463,7 +463,7 @@ impl LocalCompactionManager {
             .apply_materialized_log_chunk(&record_reader, &materialized)
             .await
             .map_err(|err| write(err.boxed()))?;
-        let spann_writer = provider
+        let mut spann_writer = provider
             .write(collection, &vector_shard, dimensionality, None)
             .await
             .map_err(|err| write(err.boxed()))?;
@@ -477,6 +477,8 @@ impl LocalCompactionManager {
             .flush()
             .await
             .map_err(|err| write(err.boxed()))?;
+        // As the commit of a compaction (rust/worker/src/execution/operators/commit_segment_writer.rs).
+        spann_writer.garbage_collect().await.map_err(write)?;
         let vector_files = Box::pin(spann_writer.commit())
             .await
             .map_err(write)?

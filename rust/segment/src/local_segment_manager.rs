@@ -78,8 +78,21 @@ impl ChromaError for SpannDefaultsError {
     }
 }
 
-// The providers of the SPANN index, as the worker of distributed Chroma builds them with the defaults of its
-// configuration, on local storage at the data path: the blockfiles, and the HNSW index of the centers.
+// The settings of the SPANN index in the configuration of the worker of distributed Chroma
+// (rust/worker/chroma_config.yaml): reads as its query service, without the adaptive number of probes, so a query probes
+// the search_nprobe of the collection; writes as its compaction service, with the garbage collection of the posting
+// lists and of the HNSW index of the centers.
+fn local_spann_config() -> Result<SpannProviderConfig, serde_json::Error> {
+    serde_json::from_value(serde_json::json!({
+        "adaptive_search_nprobe": false,
+        "pl_block_size": 5242880,
+        "pl_garbage_collection": {"enabled": true, "policy": {"random_sample": {"sample_size": 0.1}}},
+        "hnsw_garbage_collection": {"enabled": true, "policy": "full_rebuild"},
+    }))
+}
+
+// The providers of the SPANN index, as the worker of distributed Chroma builds them, on local storage at the data path:
+// the blockfiles, and the HNSW index of the centers.
 async fn local_spann_provider(
     persist_path: &str,
     registry: &Registry,
@@ -98,7 +111,7 @@ async fn local_spann_provider(
     });
     let hnsw_provider =
         HnswIndexProvider::try_from_config(&(hnsw_config, storage.clone()), registry).await?;
-    let spann_config: SpannProviderConfig = serde_json::from_str("{}").map_err(defaults)?;
+    let spann_config = local_spann_config().map_err(defaults)?;
     #[cfg(not(feature = "usearch"))]
     let config = (hnsw_provider, blockfile_provider, spann_config);
     #[cfg(feature = "usearch")]
@@ -660,6 +673,45 @@ mod tests {
 
     // The SPANN index of distributed Chroma on the data path of the single node: written and flushed with the
     // providers of one manager, read back from the files by those of the next one.
+    // The SPANN provider of a single node reads as the query service of the worker of distributed Chroma and writes as
+    // its compaction service, with the settings of rust/worker/chroma_config.yaml.
+    #[test]
+    fn the_spann_provider_has_the_settings_of_the_worker() {
+        use figment::providers::Format;
+        #[derive(Deserialize)]
+        struct Service {
+            spann_provider: serde_json::Value,
+        }
+        #[derive(Deserialize)]
+        struct Worker {
+            query_service: Service,
+            compaction_service: Service,
+        }
+        let worker: Worker = figment::Figment::from(figment::providers::Yaml::string(
+            include_str!("../../worker/chroma_config.yaml"),
+        ))
+        .extract()
+        .unwrap();
+        let normalized = |section: serde_json::Value| {
+            serde_json::to_value(serde_json::from_value::<SpannProviderConfig>(section).unwrap())
+                .unwrap()
+        };
+        let query = normalized(worker.query_service.spann_provider);
+        let compaction = normalized(worker.compaction_service.spann_provider);
+        let local = serde_json::to_value(local_spann_config().unwrap()).unwrap();
+        assert_eq!(
+            local["adaptive_search_nprobe"],
+            query["adaptive_search_nprobe"]
+        );
+        for setting in [
+            "pl_block_size",
+            "pl_garbage_collection",
+            "hnsw_garbage_collection",
+        ] {
+            assert_eq!(local[setting], compaction[setting], "{setting}");
+        }
+    }
+
     #[tokio::test]
     async fn spann_segments_are_written_on_the_data_path_and_read_after_a_restart() {
         use crate::{
