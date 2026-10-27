@@ -6,6 +6,8 @@ edition = "2021"
 [features]
 default = []
 usearch = ["chroma-index/usearch", "faer"]
+# Hooks that tests of other crates use to reproduce the timing of slow or network file systems.
+test-hooks = []
 
 [dependencies]
 async-trait = { workspace = true }

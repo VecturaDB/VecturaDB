@@ -371,10 +371,24 @@ impl LocalCompactionManager {
         }
         if max_seq_id > 0 {
             self.metrics.checkpoint_inspections.add(1, &[]);
-            self.hnsw_segment_manager
+            match self
+                .hnsw_segment_manager
                 .validate_persisted_checkpoint(&collection_segments.vector_segment.id, max_seq_id)
                 .await
-                .map_err(CompactionManagerError::UnsafeHnswCheckpoint)?;
+            {
+                Ok(()) => {}
+                // The checkpoint could not be verified now, as when a network file system reports its attributes
+                // late: nothing is purged without a verification, so the purge waits for the next write.
+                Err(err) if chroma_segment::local_hnsw::is_checkpoint_changed(&err) => {
+                    tracing::warn!(
+                        collection_id = %collection_id,
+                        error = %err,
+                        "Purge of logs postponed: the HNSW checkpoint changed during its inspection"
+                    );
+                    return Ok(());
+                }
+                Err(err) => return Err(CompactionManagerError::UnsafeHnswCheckpoint(err)),
+            }
         }
         self.log
             .purge_logs(collection_id, max_seq_id)

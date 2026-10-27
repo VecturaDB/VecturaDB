@@ -808,6 +808,41 @@ async fn push_attempts_purge_after_backfill_failure_and_retains_new_records() {
     f.stop().await;
 }
 
+// On a file system that reports the attributes of the checkpoint late, as SMB, its fingerprint changes between the two
+// reads around an inspection although nobody writes. The purge waits, the log keeps every record, and the write that
+// asked for the purge succeeds.
+#[tokio::test]
+async fn a_checkpoint_that_changes_during_inspection_postpones_the_purge() {
+    let mut f = Fixture::new().await;
+    let original = f.seed().await;
+    f.checkpoint().await;
+    let checkpoint = original.last().unwrap().log_offset;
+    f.watermark(f.metadata, checkpoint).await;
+    f.watermark(f.vector, checkpoint).await;
+    let folder = f.path.path().join(f.vector.to_string());
+    *chroma_segment::local_hnsw::TOUCH_AFTER_INSPECTION
+        .lock()
+        .unwrap() = Some(folder);
+    let purged = f.purge().await;
+    f.log.init_compactor_handle(f.handle.clone()).unwrap();
+    let pushed = f
+        .log
+        .push_logs(f.collection.collection_id, vec![operation(5)])
+        .await;
+    *chroma_segment::local_hnsw::TOUCH_AFTER_INSPECTION
+        .lock()
+        .unwrap() = None;
+    assert!(purged.is_ok(), "{purged:?}");
+    assert!(pushed.is_ok(), "{pushed:?}");
+    let mut expected = original;
+    expected.push(LogRecord {
+        log_offset: checkpoint + 1,
+        record: operation(5),
+    });
+    assert_records(f.records().await, expected);
+    f.stop().await;
+}
+
 #[tokio::test]
 async fn push_returns_purge_failure_when_backfill_succeeds() {
     let mut f = Fixture::new().await;

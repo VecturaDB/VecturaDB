@@ -4,9 +4,11 @@ pub(crate) use persistence::validate_checkpoint;
 use persistence::{validate_checkpoint_seq_id, CheckpointFingerprint, VerifiedCheckpoint};
 #[cfg(test)]
 mod regression;
+#[cfg(feature = "test-hooks")]
+pub use persistence::TOUCH_AFTER_INSPECTION;
 pub use persistence::{
     inspect_persisted_hnsw_index, inspect_persisted_hnsw_index_for_config_repair,
-    PersistedHnswIndex,
+    is_checkpoint_changed, CheckpointChanged, PersistedHnswIndex,
 };
 
 use std::{
@@ -747,9 +749,7 @@ impl LocalHnswIndex {
                 .await
                 .map_err(std::io::Error::other)??;
         if before != inspection.fingerprint {
-            return Err(std::io::Error::other(
-                "checkpoint changed during inspection",
-            ));
+            return Err(persistence::checkpoint_changed());
         }
         guard.verified_checkpoint = Some(inspection);
         Ok(true)
