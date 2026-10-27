@@ -10,8 +10,9 @@ use chroma_segment::blockfile_record::{
 };
 use chroma_segment::distributed_spann::{SpannSegmentReaderShard, SpannSegmentReaderShardError};
 use chroma_segment::{
-    local_hnsw::LocalHnswSegmentReader, local_segment_manager::LocalSegmentManager,
-    sqlite_metadata::SqliteMetadataReader,
+    local_hnsw::LocalHnswSegmentReader,
+    local_segment_manager::LocalSegmentManager,
+    sqlite_metadata::{DenseVectorReader, SqliteMetadataError, SqliteMetadataReader},
 };
 use chroma_sqlite::db::SqliteDb;
 use chroma_sysdb::SysDb;
@@ -557,28 +558,22 @@ impl LocalExecutor {
         }
     }
 
-    // The KNN of distributed Chroma (rust/worker/src/execution/orchestration/spann_knn.rs) on the files of a SPANN
-    // collection: the nearest centers of each query, their posting lists in brute force under the filter, and the merge
-    // of the k nearest. An empty filter allows every record, as in the HNSW path.
-    async fn spann_query(
+    // The SPANN index and the record segment of a SPANN collection, at the files of its last flush; none before its
+    // first flush.
+    async fn spann_vectors(
         &self,
         collection_and_segments: &CollectionAndSegments,
-        embeddings: Vec<Vec<f32>>,
-        k: u32,
-        proj: &KnnProjection,
-        allowed_user_ids: Vec<String>,
-    ) -> Result<(Vec<KnnProjectionOutput>, Vec<String>), ExecutorError> {
+    ) -> Result<Option<SpannVectors<'_>>, ExecutorError> {
         let internal = |err: Box<dyn ChromaError>| ExecutorError::Internal(err);
-        let empty = (vec![Default::default(); embeddings.len()], Vec::new());
         let collection_and_segments = &self.last_flush(collection_and_segments).await?;
         let (Some(provider), Some(dimension)) = (
             self.hnsw_manager.spann_provider(),
             collection_and_segments.collection.dimension,
         ) else {
-            return Ok(empty);
+            return Ok(None);
         };
         let Some(records) = self.spann_records(collection_and_segments).await? else {
-            return Ok(empty);
+            return Ok(None);
         };
         let shard = SegmentShard::try_from((&collection_and_segments.vector_segment, 0))
             .map_err(|err| internal(err.boxed()))?;
@@ -593,23 +588,8 @@ impl LocalExecutor {
         .await
         {
             Ok(reader) => reader,
-            Err(SpannSegmentReaderShardError::UninitializedSegment) => return Ok(empty),
+            Err(SpannSegmentReaderShardError::UninitializedSegment) => return Ok(None),
             Err(err) => return Err(internal(err.boxed())),
-        };
-        let allowed = if allowed_user_ids.is_empty() {
-            None
-        } else {
-            let mut allowed = HashSet::new();
-            for user_id in &allowed_user_ids {
-                if let Some(offset_id) = records
-                    .get_offset_id_for_user_id(user_id, &RecordSegmentReaderOptions::default())
-                    .await
-                    .map_err(|err| internal(err.boxed()))?
-                {
-                    allowed.insert(offset_id);
-                }
-            }
-            Some(allowed)
         };
         let space = collection_and_segments
             .collection
@@ -618,66 +598,54 @@ impl LocalExecutor {
             .and_then(|schema| schema.get_internal_spann_config())
             .map(|config| config.space)
             .ok_or(ExecutorError::CollectionMissingHnswConfiguration)?;
-        let distance_function = DistanceFunction::from(space);
-        // An upper bound of the records, for the adaptive number of probes; the SQLite catalog keeps no count.
-        let collection_size = records.get_max_offset_id() as usize;
+        Ok(Some(SpannVectors {
+            reader,
+            records,
+            distance_function: DistanceFunction::from(space),
+        }))
+    }
+
+    // The KNN of a SPANN collection for the query API. An empty filter allows every record, as in the HNSW path.
+    async fn spann_query(
+        &self,
+        collection_and_segments: &CollectionAndSegments,
+        embeddings: Vec<Vec<f32>>,
+        k: u32,
+        proj: &KnnProjection,
+        allowed_user_ids: Vec<String>,
+    ) -> Result<(Vec<KnnProjectionOutput>, Vec<String>), ExecutorError> {
+        let internal = |err: Box<dyn ChromaError>| ExecutorError::Internal(err);
+        let Some(vectors) = self.spann_vectors(collection_and_segments).await? else {
+            return Ok((vec![Default::default(); embeddings.len()], Vec::new()));
+        };
+        let allowed = if allowed_user_ids.is_empty() {
+            None
+        } else {
+            Some(
+                vectors
+                    .allowed_offsets(&allowed_user_ids)
+                    .await
+                    .map_err(internal)?,
+            )
+        };
         let mut results = Vec::new();
         let mut returned_user_ids = Vec::new();
         for embedding in embeddings {
-            let query = if distance_function == DistanceFunction::Cosine {
-                normalize(&embedding)
-            } else {
-                embedding
-            };
-            let (centers, _, _) = reader
-                .rng_query(&query, collection_size, k as usize)
-                .await
-                .map_err(|err| internal(err.boxed()))?;
-            let mut batches = Vec::with_capacity(centers.len());
-            for center in centers {
-                let postings = reader
-                    .fetch_posting_list(center as u32)
-                    .await
-                    .map_err(|err| internal(err.boxed()))?;
-                let mut nearest = BinaryHeap::with_capacity(k as usize);
-                for posting in postings {
-                    if allowed
-                        .as_ref()
-                        .is_some_and(|allowed| !allowed.contains(&posting.doc_offset_id))
-                    {
-                        continue;
-                    }
-                    let record = RecordMeasure {
-                        offset_id: posting.doc_offset_id,
-                        measure: distance_function.distance(&posting.doc_embedding, &query),
-                    };
-                    if nearest.len() < k as usize {
-                        nearest.push(record);
-                    } else if nearest.peek().is_some_and(|furthest| &record < furthest) {
-                        nearest.pop();
-                        nearest.push(record);
-                    }
-                }
-                // Merge takes the largest first, so the nearest go in reversed, as in the KnnMerge of the worker.
-                batches.push(
-                    nearest
-                        .into_sorted_vec()
-                        .into_iter()
-                        .map(std::cmp::Reverse)
-                        .collect::<Vec<_>>(),
-                );
-            }
             let mut output = Vec::new();
-            for std::cmp::Reverse(RecordMeasure { offset_id, measure }) in
-                (Merge { k }).merge(batches)
+            for RecordMeasure { offset_id, measure } in vectors
+                .nearest(embedding, k, allowed.as_ref())
+                .await
+                .map_err(internal)?
             {
-                let user_id = records
+                let user_id = vectors
+                    .records
                     .get_user_id_for_offset_id(offset_id)
                     .await
                     .map_err(|err| internal(err.boxed()))?
                     .to_string();
                 let embedding = if proj.projection.embedding {
-                    records
+                    vectors
+                        .records
                         .get_data_for_offset_id(offset_id)
                         .await
                         .map_err(|err| internal(err.boxed()))?
@@ -722,12 +690,20 @@ impl LocalExecutor {
                 pulled_log_bytes: 0,
             });
         }
+        let spann_vectors =
+            if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
+                self.spann_vectors(&plan.scan.collection_and_segments)
+                    .await?
+            } else {
+                None
+            };
+        let vectors: Option<&dyn DenseVectorReader> = match (&spann_vectors, &hnsw_reader) {
+            (Some(spann), _) => Some(spann),
+            (None, Some(hnsw)) => Some(hnsw),
+            (None, None) => None,
+        };
         self.metadata_reader
-            .search(
-                plan.scan.collection_and_segments,
-                hnsw_reader.as_ref(),
-                plan.payloads,
-            )
+            .search(plan.scan.collection_and_segments, vectors, plan.payloads)
             .await
             .map_err(|error| ExecutorError::Internal(Box::new(error)))
     }
@@ -735,6 +711,148 @@ impl LocalExecutor {
     pub async fn reset(&mut self) -> Result<(), Box<dyn ChromaError>> {
         self.hnsw_manager.reset().await.map_err(|err| err.boxed())?;
         Ok(())
+    }
+}
+
+// The SPANN index of a collection with its record segment, for the KNN of distributed Chroma
+// (rust/worker/src/execution/orchestration/spann_knn.rs): the nearest centers of a query, their posting lists in brute
+// force under the filter, and the merge of the k nearest.
+struct SpannVectors<'me> {
+    reader: SpannSegmentReaderShard<'me>,
+    records: RecordSegmentReaderShard<'me>,
+    distance_function: DistanceFunction,
+}
+
+impl SpannVectors<'_> {
+    // The offsets of the user ids in the record segment; ids it does not hold are left out.
+    async fn allowed_offsets(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashSet<u32>, Box<dyn ChromaError>> {
+        let mut allowed = HashSet::new();
+        for user_id in user_ids {
+            if let Some(offset_id) = self
+                .records
+                .get_offset_id_for_user_id(user_id, &RecordSegmentReaderOptions::default())
+                .await
+                .map_err(|err| err.boxed())?
+            {
+                allowed.insert(offset_id);
+            }
+        }
+        Ok(allowed)
+    }
+
+    // The k nearest of the query among the allowed offsets, or all the records without them, nearest first.
+    async fn nearest(
+        &self,
+        query: Vec<f32>,
+        k: u32,
+        allowed: Option<&HashSet<u32>>,
+    ) -> Result<Vec<RecordMeasure>, Box<dyn ChromaError>> {
+        let query = if self.distance_function == DistanceFunction::Cosine {
+            normalize(&query)
+        } else {
+            query
+        };
+        // An upper bound of the records, for the adaptive number of probes; the SQLite catalog keeps no count.
+        let collection_size = self.records.get_max_offset_id() as usize;
+        let (centers, _, _) = self
+            .reader
+            .rng_query(&query, collection_size, k as usize)
+            .await
+            .map_err(|err| err.boxed())?;
+        let mut batches = Vec::with_capacity(centers.len());
+        for center in centers {
+            let postings = self
+                .reader
+                .fetch_posting_list(center as u32)
+                .await
+                .map_err(|err| err.boxed())?;
+            let mut nearest = BinaryHeap::with_capacity(k as usize);
+            for posting in postings {
+                if allowed.is_some_and(|allowed| !allowed.contains(&posting.doc_offset_id)) {
+                    continue;
+                }
+                let record = RecordMeasure {
+                    offset_id: posting.doc_offset_id,
+                    measure: self
+                        .distance_function
+                        .distance(&posting.doc_embedding, &query),
+                };
+                if nearest.len() < k as usize {
+                    nearest.push(record);
+                } else if nearest.peek().is_some_and(|furthest| &record < furthest) {
+                    nearest.pop();
+                    nearest.push(record);
+                }
+            }
+            // Merge takes the largest first, so the nearest go in reversed, as in the KnnMerge of the worker.
+            batches.push(
+                nearest
+                    .into_sorted_vec()
+                    .into_iter()
+                    .map(std::cmp::Reverse)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        Ok((Merge { k })
+            .merge(batches)
+            .into_iter()
+            .map(|std::cmp::Reverse(record)| record)
+            .collect())
+    }
+}
+
+// The dense leaves of the Search API on a SPANN collection.
+#[async_trait]
+impl DenseVectorReader for SpannVectors<'_> {
+    async fn nearest(
+        &self,
+        _: &CollectionAndSegments,
+        query: Vec<f32>,
+        allowed_user_ids: Option<&[String]>,
+        limit: u32,
+    ) -> Result<Vec<(u32, String, f32)>, SqliteMetadataError> {
+        let spann = SqliteMetadataError::DenseVectors;
+        let allowed = match allowed_user_ids {
+            Some(user_ids) => Some(self.allowed_offsets(user_ids).await.map_err(spann)?),
+            None => None,
+        };
+        let mut nearest = Vec::new();
+        for RecordMeasure { offset_id, measure } in
+            SpannVectors::nearest(self, query, limit, allowed.as_ref())
+                .await
+                .map_err(spann)?
+        {
+            let user_id = self
+                .records
+                .get_user_id_for_offset_id(offset_id)
+                .await
+                .map_err(|err| spann(err.boxed()))?
+                .to_string();
+            nearest.push((offset_id, user_id, measure));
+        }
+        Ok(nearest)
+    }
+
+    async fn embedding(&self, user_id: &str) -> Result<Vec<f32>, SqliteMetadataError> {
+        let spann = SqliteMetadataError::DenseVectors;
+        let offset_id = self
+            .records
+            .get_offset_id_for_user_id(user_id, &RecordSegmentReaderOptions::default())
+            .await
+            .map_err(|err| spann(err.boxed()))?;
+        let data = match offset_id {
+            Some(offset_id) => self
+                .records
+                .get_data_for_offset_id(offset_id)
+                .await
+                .map_err(|err| spann(err.boxed()))?,
+            None => None,
+        };
+        data.map(|data| data.embedding.to_vec())
+            .ok_or_else(|| SqliteMetadataError::MissingEmbedding(user_id.to_string()))
     }
 }
 

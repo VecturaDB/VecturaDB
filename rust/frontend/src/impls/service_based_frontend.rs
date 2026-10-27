@@ -5385,6 +5385,139 @@ mod tests {
         }
     }
 
+    // The Search API on a SPANN collection: a dense KNN rank answers as on the same records in an HNSW collection, and
+    // as the exact nearest, with their distance and embedding, with and without a filter.
+    #[tokio::test]
+    async fn a_spann_collection_answers_search_as_an_hnsw_collection() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let records = (0..300)
+            .map(|i| {
+                let x = i as f32;
+                (
+                    format!("r{i}"),
+                    vec![(x * 0.37).sin(), (x * 0.11).cos(), x / 300.0],
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut collections = Vec::new();
+        for (name, index) in [
+            ("search-spann", KnnIndex::Spann),
+            ("search-hnsw", KnnIndex::Hnsw),
+        ] {
+            let collection_id = frontend
+                .create_collection(
+                    CreateCollectionRequest::try_new(
+                        TENANT.to_string(),
+                        DatabaseName::new(DATABASE).unwrap(),
+                        name.to_string(),
+                        None,
+                        None,
+                        Some(Schema::new_default(index)),
+                        false,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .collection_id;
+            frontend
+                .add(
+                    AddCollectionRecordsRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection_id,
+                        records.iter().map(|(id, _)| id.clone()).collect(),
+                        records.iter().map(|(_, vector)| vector.clone()).collect(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            collections.push(collection_id);
+        }
+        let segments = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collections[0])
+            .await
+            .unwrap();
+        assert_eq!(segments.vector_segment.r#type, SegmentType::Spann);
+
+        let even = records.iter().step_by(2).cloned().collect::<Vec<_>>();
+        let query = vec![0.3, -0.2, 0.5];
+        let payload = |query_ids: Option<Vec<String>>| SearchPayload {
+            filter: Filter {
+                query_ids,
+                where_clause: None,
+            },
+            rank: chroma_types::operator::Rank {
+                expr: Some(chroma_types::operator::RankExpr::Knn {
+                    query: chroma_types::operator::QueryVector::Dense(query.clone()),
+                    key: chroma_types::operator::Key::Embedding,
+                    limit: 5,
+                    default: None,
+                    return_rank: false,
+                }),
+            },
+            limit: Limit {
+                offset: 0,
+                limit: Some(5),
+            },
+            select: chroma_types::operator::Select {
+                keys: [
+                    chroma_types::operator::Key::Score,
+                    chroma_types::operator::Key::Embedding,
+                ]
+                .into_iter()
+                .collect(),
+            },
+            ..Default::default()
+        };
+        let mut answers = Vec::new();
+        for &collection_id in &collections {
+            let response = frontend
+                .search(
+                    SearchRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection_id,
+                        vec![
+                            payload(None),
+                            payload(Some(even.iter().map(|(id, _)| id.clone()).collect())),
+                        ],
+                        chroma_types::plan::ReadLevel::default(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            answers.push(response);
+        }
+        let distance = |vector: &[f32]| -> f32 {
+            vector
+                .iter()
+                .zip(&query)
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum()
+        };
+        for (payload, candidates) in [(0, &records), (1, &even)] {
+            let expected = exact_nearest(candidates, &query, 5);
+            for answer in &answers {
+                assert_eq!(answer.ids[payload], expected);
+                let scores = answer.scores[payload].as_ref().unwrap();
+                let embeddings = answer.embeddings[payload].as_ref().unwrap();
+                for (position, id) in expected.iter().enumerate() {
+                    let vector = &records.iter().find(|(record, _)| record == id).unwrap().1;
+                    assert_eq!(embeddings[position].as_ref(), Some(vector));
+                    assert!((scores[position].unwrap() - distance(vector)).abs() < 1e-4);
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_collection_created_again_before_the_sweep_is_new_and_works() {
         let root = tempfile::tempdir().unwrap();

@@ -54,6 +54,10 @@ pub enum SqliteMetadataError {
     LocalHnsw(Box<LocalHnswSegmentReaderError>),
     #[error("Error reading phantom record: {0}")]
     PhantomRecord(u32),
+    #[error("Error reading the dense vectors: {0}")]
+    DenseVectors(Box<dyn ChromaError>),
+    #[error("No embedding for the record {0}")]
+    MissingEmbedding(String),
     #[error("Could not encode or decode sparse metadata: {0}")]
     SparseMetadataJson(serde_json::Error),
     #[error("Could not serialize schema: {0}")]
@@ -64,8 +68,91 @@ impl ChromaError for SqliteMetadataError {
     fn code(&self) -> ErrorCodes {
         match self {
             Self::LocalHnsw(err) => err.code(),
+            Self::DenseVectors(err) => err.code(),
             _ => ErrorCodes::Internal,
         }
+    }
+}
+
+/// The dense vectors of a collection for the search: its local HNSW index, or on a single node the SPANN index of a
+/// collection that has one.
+#[async_trait::async_trait]
+pub trait DenseVectorReader: Send + Sync {
+    /// The `limit` nearest records of the query, among the allowed user ids or all the records without them: by offset
+    /// in the index, user id and distance.
+    async fn nearest(
+        &self,
+        collection: &chroma_types::CollectionAndSegments,
+        query: Vec<f32>,
+        allowed_user_ids: Option<&[String]>,
+        limit: u32,
+    ) -> Result<Vec<(u32, String, f32)>, SqliteMetadataError>;
+
+    /// The embedding of a record, by user id.
+    async fn embedding(&self, user_id: &str) -> Result<Vec<f32>, SqliteMetadataError>;
+}
+
+/// A dense KNN leaf on the local HNSW index (rust/worker/src/execution/operators/knn_hnsw.rs).
+#[async_trait::async_trait]
+impl DenseVectorReader for LocalHnswSegmentReader {
+    async fn nearest(
+        &self,
+        collection: &chroma_types::CollectionAndSegments,
+        query: Vec<f32>,
+        allowed_user_ids: Option<&[String]>,
+        limit: u32,
+    ) -> Result<Vec<(u32, String, f32)>, SqliteMetadataError> {
+        // The HNSW index knows the records by label.
+        let mut allowed_labels = Vec::new();
+        for user_id in allowed_user_ids.unwrap_or_default() {
+            allowed_labels.push(
+                self.get_offset_id_by_user_id(user_id)
+                    .await
+                    .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))?,
+            );
+        }
+        let space = collection
+            .collection
+            .schema
+            .as_ref()
+            .map(|schema| {
+                schema.get_internal_hnsw_config_with_legacy_fallback(&collection.vector_segment)
+            })
+            .transpose()
+            .map_err(|err| {
+                SqliteMetadataError::LocalHnsw(Box::new(
+                    LocalHnswSegmentReaderError::InvalidHnswConfiguration(err),
+                ))
+            })?
+            .flatten()
+            .ok_or(SqliteMetadataError::LocalHnsw(Box::new(
+                LocalHnswSegmentReaderError::MissingHnswConfiguration,
+            )))?
+            .space;
+        let query = if let chroma_types::Space::Cosine = space {
+            chroma_distance::normalize(&query)
+        } else {
+            query
+        };
+        let neighbors = self
+            .query_embedding(&allowed_labels, query, limit)
+            .await
+            .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))?;
+        let mut nearest = Vec::with_capacity(neighbors.len());
+        for neighbor in neighbors {
+            let user_id = self
+                .get_user_id_by_offset_id(neighbor.offset_id)
+                .await
+                .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))?;
+            nearest.push((neighbor.offset_id, user_id, neighbor.measure));
+        }
+        Ok(nearest)
+    }
+
+    async fn embedding(&self, user_id: &str) -> Result<Vec<f32>, SqliteMetadataError> {
+        self.get_embedding_by_user_id(&user_id.to_string())
+            .await
+            .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))
     }
 }
 
@@ -1296,9 +1383,7 @@ impl SqliteMetadataReader {
                 let (sql, values) = Query::select()
                     .columns([Alias::new("id"), Alias::new("key"), Alias::new("value")])
                     .from(Alias::new("embedding_metadata_sparse"))
-                    .and_where(
-                        Expr::col(Alias::new("id")).is_in(batch.iter().map(|id| *id as i64)),
-                    )
+                    .and_where(Expr::col(Alias::new("id")).is_in(batch.iter().map(|id| *id as i64)))
                     .build_sqlx(SqliteQueryBuilder);
                 rows.extend(sqlx::query_with(&sql, values).fetch_all(&mut *conn).await?);
             }
@@ -1348,7 +1433,7 @@ impl SqliteMetadataReader {
     pub async fn search(
         &self,
         collection: chroma_types::CollectionAndSegments,
-        hnsw_reader: Option<&LocalHnswSegmentReader>,
+        vectors: Option<&dyn DenseVectorReader>,
         payloads: Vec<chroma_types::plan::SearchPayload>,
     ) -> Result<chroma_types::operator::SearchResult, SqliteMetadataError> {
         let mut tx = self.db.get_conn().begin().await?;
@@ -1358,7 +1443,7 @@ impl SqliteMetadataReader {
             .fetch_optional(&mut *tx)
             .await?;
         let result = self
-            .search_with_connection(collection, hnsw_reader, payloads, &mut tx)
+            .search_with_connection(collection, vectors, payloads, &mut tx)
             .await?;
         tx.commit().await?;
         Ok(result)
@@ -1367,7 +1452,7 @@ impl SqliteMetadataReader {
     async fn search_with_connection(
         &self,
         collection: chroma_types::CollectionAndSegments,
-        hnsw_reader: Option<&LocalHnswSegmentReader>,
+        vectors: Option<&dyn DenseVectorReader>,
         payloads: Vec<chroma_types::plan::SearchPayload>,
         conn: &mut sqlx::SqliteConnection,
     ) -> Result<chroma_types::operator::SearchResult, SqliteMetadataError> {
@@ -1387,7 +1472,7 @@ impl SqliteMetadataReader {
                                 self.dense_knn(
                                     conn,
                                     &collection,
-                                    hnsw_reader,
+                                    vectors,
                                     &payload.filter,
                                     query,
                                     knn.limit,
@@ -1448,7 +1533,7 @@ impl SqliteMetadataReader {
                     .collect(),
             };
             results.push(
-                self.select(conn, &collection, hnsw_reader, records, &payload.select)
+                self.select(conn, &collection, vectors, records, &payload.select)
                     .await?,
             );
         }
@@ -1505,24 +1590,23 @@ impl SqliteMetadataReader {
             .collect()
     }
 
-    /// A dense KNN leaf on the local HNSW index (rust/worker/src/execution/operators/knn_hnsw.rs): the `limit`
-    /// nearest records that pass the filter, with their distance, by SQLite row.
+    /// A dense KNN leaf: the `limit` nearest records that pass the filter, with their distance, by SQLite row.
     async fn dense_knn(
         &self,
         conn: &mut sqlx::SqliteConnection,
         collection: &chroma_types::CollectionAndSegments,
-        hnsw_reader: Option<&LocalHnswSegmentReader>,
+        vectors: Option<&dyn DenseVectorReader>,
         filter: &Filter,
         query: Vec<f32>,
         limit: u32,
     ) -> Result<Vec<chroma_types::operator::RecordMeasure>, SqliteMetadataError> {
         use chroma_types::operator::RecordMeasure;
-        let Some(hnsw_reader) = hnsw_reader else {
+        let Some(vectors) = vectors else {
             return Ok(Vec::new());
         };
-        // Records by user id: the HNSW index knows them by label, the other leaves and the rank by SQLite row.
+        // Records by user id: the index knows them by its own offset, the other leaves and the rank by SQLite row.
         let mut rows_by_user_id = HashMap::new();
-        let mut allowed_labels = Vec::new();
+        let mut allowed_user_ids = None;
         if filter.query_ids.is_some() || filter.where_clause.is_some() {
             let allowed = self
                 .filtered_records(conn, collection, filter, None)
@@ -1530,52 +1614,20 @@ impl SqliteMetadataReader {
             if allowed.is_empty() {
                 return Ok(Vec::new());
             }
+            let mut user_ids = Vec::with_capacity(allowed.len());
             for (row, user_id) in allowed {
-                allowed_labels.push(
-                    hnsw_reader
-                        .get_offset_id_by_user_id(&user_id)
-                        .await
-                        .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))?,
-                );
+                user_ids.push(user_id.clone());
                 rows_by_user_id.insert(user_id, row);
             }
+            allowed_user_ids = Some(user_ids);
         }
-        let space = collection
-            .collection
-            .schema
-            .as_ref()
-            .map(|schema| {
-                schema.get_internal_hnsw_config_with_legacy_fallback(&collection.vector_segment)
-            })
-            .transpose()
-            .map_err(|err| {
-                SqliteMetadataError::LocalHnsw(Box::new(
-                    LocalHnswSegmentReaderError::InvalidHnswConfiguration(err),
-                ))
-            })?
-            .flatten()
-            .ok_or(SqliteMetadataError::LocalHnsw(Box::new(
-                LocalHnswSegmentReaderError::MissingHnswConfiguration,
-            )))?
-            .space;
-        let query = if let chroma_types::Space::Cosine = space {
-            chroma_distance::normalize(&query)
-        } else {
-            query
-        };
-        let neighbors = hnsw_reader
-            .query_embedding(&allowed_labels, query, limit)
-            .await
-            .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))?;
-        let mut user_ids = Vec::with_capacity(neighbors.len());
-        for neighbor in &neighbors {
-            user_ids.push(
-                hnsw_reader
-                    .get_user_id_by_offset_id(neighbor.offset_id)
-                    .await
-                    .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))?,
-            );
-        }
+        let neighbors = vectors
+            .nearest(collection, query, allowed_user_ids.as_deref(), limit)
+            .await?;
+        let user_ids = neighbors
+            .iter()
+            .map(|(_, user_id, _)| user_id.clone())
+            .collect::<Vec<_>>();
         if rows_by_user_id.is_empty() {
             for batch in user_ids.chunks(500) {
                 let (sql, values) = Query::select()
@@ -1588,9 +1640,7 @@ impl SqliteMetadataReader {
                         Expr::col((Embeddings::Table, Embeddings::SegmentId))
                             .eq(collection.metadata_segment.id.to_string()),
                     )
-                    .and_where(
-                        Expr::col((Embeddings::Table, Embeddings::EmbeddingId)).is_in(batch),
-                    )
+                    .and_where(Expr::col((Embeddings::Table, Embeddings::EmbeddingId)).is_in(batch))
                     .build_sqlx(SqliteQueryBuilder);
                 for row in sqlx::query_with(&sql, values).fetch_all(&mut *conn).await? {
                     rows_by_user_id.insert(row.try_get::<String, _>(1)?, row.try_get::<u32, _>(0)?);
@@ -1599,15 +1649,14 @@ impl SqliteMetadataReader {
         }
         let mut records = neighbors
             .into_iter()
-            .zip(user_ids)
-            .map(|(neighbor, user_id)| {
+            .map(|(offset_id, user_id, measure)| {
                 rows_by_user_id
                     .get(&user_id)
                     .map(|row| RecordMeasure {
                         offset_id: *row,
-                        measure: neighbor.measure,
+                        measure,
                     })
-                    .ok_or(SqliteMetadataError::PhantomRecord(neighbor.offset_id))
+                    .ok_or(SqliteMetadataError::PhantomRecord(offset_id))
             })
             .collect::<Result<Vec<_>, _>>()?;
         // As the merge of the distributed KNN results: by distance, then by record.
@@ -1674,8 +1723,13 @@ impl SqliteMetadataReader {
         use std::collections::BinaryHeap;
         let query = match collection.collection.schema.as_ref() {
             Some(schema) if sparse_bm25_enabled(schema, key) => {
-                Self::idf_scaled_query(conn, &collection.metadata_segment.id.to_string(), key, query)
-                    .await?
+                Self::idf_scaled_query(
+                    conn,
+                    &collection.metadata_segment.id.to_string(),
+                    key,
+                    query,
+                )
+                .await?
             }
             _ => query.clone(),
         };
@@ -1835,7 +1889,7 @@ impl SqliteMetadataReader {
         &self,
         conn: &mut sqlx::SqliteConnection,
         collection: &chroma_types::CollectionAndSegments,
-        hnsw_reader: Option<&LocalHnswSegmentReader>,
+        vectors: Option<&dyn DenseVectorReader>,
         records: Vec<chroma_types::operator::RecordMeasure>,
         select: &chroma_types::operator::Select,
     ) -> Result<chroma_types::operator::SearchPayloadResult, SqliteMetadataError> {
@@ -1884,13 +1938,8 @@ impl SqliteMetadataReader {
             let data = hydrated
                 .remove(&record.offset_id)
                 .ok_or(SqliteMetadataError::PhantomRecord(record.offset_id))?;
-            let embedding = match (select_embedding, hnsw_reader) {
-                (true, Some(reader)) => Some(
-                    reader
-                        .get_embedding_by_user_id(&data.id)
-                        .await
-                        .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))?,
-                ),
+            let embedding = match (select_embedding, vectors) {
+                (true, Some(vectors)) => Some(vectors.embedding(&data.id).await?),
                 (true, None) => {
                     return Err(SqliteMetadataError::LocalHnsw(Box::new(
                         LocalHnswSegmentReaderError::UninitializedSegment,
@@ -2452,7 +2501,11 @@ mod tests {
         .await;
         assert_eq!(
             sparse_terms(&reader.db).await,
-            vec![("a".into(), 1, 0.5), ("a".into(), 7, 0.25), ("b".into(), 2, 1.0)]
+            vec![
+                ("a".into(), 1, 0.5),
+                ("a".into(), 7, 0.25),
+                ("b".into(), 2, 1.0)
+            ]
         );
         let writer = SqliteMetadataWriter {
             db: reader.db.clone(),
@@ -2499,7 +2552,11 @@ mod tests {
             SparseVectorValueType,
         };
         let mut schema = Schema::new_default(KnnIndex::Hnsw);
-        schema.keys.entry("sparse".into()).or_default().sparse_vector = Some(SparseVectorValueType {
+        schema
+            .keys
+            .entry("sparse".into())
+            .or_default()
+            .sparse_vector = Some(SparseVectorValueType {
             sparse_vector_index: Some(SparseVectorIndexType {
                 enabled: true,
                 config: SparseVectorIndexConfig {
@@ -2516,12 +2573,43 @@ mod tests {
     // The BM25 vectors of ChromaBm25EmbeddingFunction (chromadb 1.5.9, k 1.2, b 0.75, avg_doc_length 256) for the
     // four documents of the Cloud comparison (CLOUD-PROVE.md), and of the query "fox".
     fn bm25_documents() -> Vec<(&'static str, Vec<(u32, f32)>)> {
-        let doc = |indices: &[u32], value: f32| indices.iter().map(|i| (*i, value)).collect::<Vec<_>>();
+        let doc =
+            |indices: &[u32], value: f32| indices.iter().map(|i| (*i, value)).collect::<Vec<_>>();
         vec![
-            ("fox1", doc(&[226376294, 741580288, 771291085, 1312749093, 1621867415, 1913189942], 1.6652868)),
-            ("fox2", doc(&[983533787, 1440641117, 1621867415, 1774389278, 1935863057, 2084400053], 1.6652868)),
-            ("ml", doc(&[34379837, 1228389567, 1299890214, 1644170059, 2088942923], 1.6697302)),
-            ("pie", doc(&[207604854, 662344706, 1085451005, 1180591805, 1481737067, 1985449994], 1.6652868)),
+            (
+                "fox1",
+                doc(
+                    &[
+                        226376294, 741580288, 771291085, 1312749093, 1621867415, 1913189942,
+                    ],
+                    1.6652868,
+                ),
+            ),
+            (
+                "fox2",
+                doc(
+                    &[
+                        983533787, 1440641117, 1621867415, 1774389278, 1935863057, 2084400053,
+                    ],
+                    1.6652868,
+                ),
+            ),
+            (
+                "ml",
+                doc(
+                    &[34379837, 1228389567, 1299890214, 1644170059, 2088942923],
+                    1.6697302,
+                ),
+            ),
+            (
+                "pie",
+                doc(
+                    &[
+                        207604854, 662344706, 1085451005, 1180591805, 1481737067, 1985449994,
+                    ],
+                    1.6652868,
+                ),
+            ),
         ]
     }
 
@@ -2554,7 +2642,11 @@ mod tests {
         let (reader, mut cas) = setup_with_logs(logs).await;
         cas.collection.schema = Some(bm25_schema());
         let result = reader
-            .search(cas, None, vec![exact_payload(vec![(1621867415, 1.6877435)], 10)])
+            .search(
+                cas,
+                None,
+                vec![exact_payload(vec![(1621867415, 1.6877435)], 10)],
+            )
             .await
             .unwrap();
         result.results[0]
@@ -2569,13 +2661,19 @@ mod tests {
     async fn test_sparse_bm25_scores_of_chroma_cloud() {
         // 4 records, n_t 2: the distributed cluster on AKS answered -0.9481 after compaction.
         let four = bm25_fox(0).await;
-        assert_eq!(four.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), vec!["fox1", "fox2"]);
+        assert_eq!(
+            four.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["fox1", "fox2"]
+        );
         for (_, score) in &four {
             assert!((score - (-0.9481)).abs() < 5e-5, "{score}");
         }
         // 304 records, n_t 2: Chroma Cloud answered -12.50207 (CLOUD-PROVE.md, test B, after indexing).
         let many = bm25_fox(300).await;
-        assert_eq!(many.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), vec!["fox1", "fox2"]);
+        assert_eq!(
+            many.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["fox1", "fox2"]
+        );
         for (_, score) in &many {
             assert!((score - (-12.50207)).abs() < 5e-6, "{score}");
         }
@@ -2602,7 +2700,11 @@ mod tests {
         )
         .await;
         let result = reader
-            .search(cas, None, vec![exact_payload(vec![(1621867415, 1.6877435)], 10)])
+            .search(
+                cas,
+                None,
+                vec![exact_payload(vec![(1621867415, 1.6877435)], 10)],
+            )
             .await
             .unwrap();
         for record in &result.results[0].records {
@@ -2613,7 +2715,9 @@ mod tests {
     // The Search beyond one leaf: two leaves fused with their defaults, a group by on the metadata, and no rank.
     #[tokio::test]
     async fn test_search_fuses_leaves_groups_and_keeps_storage_order() {
-        use chroma_types::operator::{Aggregate, GroupBy, Key, QueryVector, Rank, RankExpr, Select};
+        use chroma_types::operator::{
+            Aggregate, GroupBy, Key, QueryVector, Rank, RankExpr, Select,
+        };
         let logs = [
             ("a", vec![(1, 1.0)], "x"),
             ("b", vec![(1, 0.5), (2, 1.0)], "x"),
@@ -2814,14 +2918,8 @@ mod tests {
             vec!["a"]
         );
         for (wire_filter, expected) in [
-            (
-                serde_json::json!({"#id":{"$in":["a","b","c"]}}),
-                vec!["a"],
-            ),
-            (
-                serde_json::json!({"#id":{"$nin":["a","d","e"]}}),
-                vec![],
-            ),
+            (serde_json::json!({"#id":{"$in":["a","b","c"]}}), vec!["a"]),
+            (serde_json::json!({"#id":{"$nin":["a","d","e"]}}), vec![]),
             (serde_json::json!({"#id":{"$eq":"a"}}), vec!["a"]),
             (
                 serde_json::json!({"$and":[{"#id":{"$in":["a","d"]}},{"label":{"$eq":"a"}}]}),
@@ -2831,10 +2929,7 @@ mod tests {
                 serde_json::json!({"$or":[{"#id":{"$eq":"a"}},{"label":{"$eq":"d"}}]}),
                 vec!["d", "a"],
             ),
-            (
-                serde_json::json!({"#id":{"$ne":"a"}}),
-                vec!["d", "e"],
-            ),
+            (serde_json::json!({"#id":{"$ne":"a"}}), vec!["d", "e"]),
         ] {
             let mut payload = exact_payload(vec![(1, 1.0)], 10);
             payload.filter = serde_json::from_value(wire_filter).unwrap();
