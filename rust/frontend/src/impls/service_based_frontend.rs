@@ -5518,6 +5518,59 @@ mod tests {
         }
     }
 
+    // Chroma 1.5.9 and the VecturaDB releases before SPANN delete a SPANN collection from the catalog and leave its
+    // files, with no row in index_cleanup: the sweep removes the folders of the segments that the catalog no longer
+    // has, and leaves those of the others.
+    #[tokio::test]
+    async fn the_sweep_removes_the_files_of_spann_segments_the_catalog_no_longer_has() {
+        let root = tempfile::tempdir().unwrap();
+        let saved = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let kept = spann_collection_with_records(&mut frontend, "spann-kept").await;
+        let kept_files = files_under(root.path().join("tenant").as_path()).len();
+        spann_collection_with_records(&mut frontend, "spann-deleted-elsewhere").await;
+        copy_folder(&root.path().join("tenant"), &saved.path().join("tenant"));
+        frontend
+            .delete_collection(delete_collection_request("spann-deleted-elsewhere"))
+            .await
+            .unwrap();
+        // As after a deletion by a server that knows nothing of these files.
+        copy_folder(&saved.path().join("tenant"), &root.path().join("tenant"));
+        let path = root.path().join("chroma.sqlite3");
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    use sqlx::Connection;
+                    let options = sqlx::sqlite::SqliteConnectOptions::new()
+                        .filename(path)
+                        .busy_timeout(std::time::Duration::from_secs(5));
+                    let mut connection = sqlx::SqliteConnection::connect_with(&options)
+                        .await
+                        .unwrap();
+                    sqlx::query("DELETE FROM index_cleanup")
+                        .execute(&mut connection)
+                        .await
+                        .unwrap();
+                })
+        })
+        .join()
+        .unwrap();
+        assert!(files_under(root.path().join("tenant").as_path()).len() > kept_files);
+        frontend.executor.cleanup_deleted_indexes().await.unwrap();
+        let left = files_under(root.path().join("tenant").as_path());
+        assert_eq!(left.len(), kept_files);
+        assert!(left
+            .iter()
+            .all(|file| file.to_string_lossy().contains(&kept.to_string())));
+        assert_eq!(
+            query_ids(&mut frontend, kept, vec![3.0, 3f32.sin()], 1).await,
+            vec!["r3".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn a_collection_created_again_before_the_sweep_is_new_and_works() {
         let root = tempfile::tempdir().unwrap();

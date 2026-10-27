@@ -576,10 +576,70 @@ impl LocalSegmentManager {
         }
         // The rows that collection deletions leave wait for this sweep: one statement per 500 of them.
         let forgotten = self.forget_deleted_hnsw_indexes(&removed).await;
+        if let Err(err) = self.remove_orphan_blockfile_segments().await {
+            tracing::warn!(error = %err, "cleanup of SPANN files failed; will retry");
+            first_error.get_or_insert(err);
+        }
         match first_error {
             Some(err) => Err(err),
             None => forgotten,
         }
+    }
+
+    // The folders of the segments of SPANN collections that the catalog no longer has, removed: a server that knows
+    // nothing of them, Chroma 1.5.9 or a VecturaDB release before SPANN, deletes a SPANN collection and leaves its files.
+    // A segment has its row before its first file, so a folder without a row is what a deletion left. The empty folders
+    // of a collection go only when the catalog no longer has the collection, which no flush writes to.
+    async fn remove_orphan_blockfile_segments(&self) -> Result<(), LocalSegmentManagerError> {
+        let Some(root) = &self.persist_root else {
+            return Ok(());
+        };
+        let root = Path::new(root);
+        for tenant in entries(&root.join("tenant"), true).await? {
+            for database in entries(&tenant.join("database"), true).await? {
+                for collection in entries(&database.join("collection"), true).await? {
+                    let segments = collection.join("segment");
+                    for segment in entries(&segments, true).await? {
+                        let Some(id) = segment
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .and_then(|name| uuid::Uuid::parse_str(name).ok())
+                        else {
+                            continue;
+                        };
+                        if self.segment_exists(SegmentUuid(id)).await? {
+                            continue;
+                        }
+                        match tokio::fs::remove_dir_all(&segment).await {
+                            Ok(()) => {}
+                            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+                    let Some(collection_id) = collection
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| uuid::Uuid::parse_str(name).ok())
+                    else {
+                        continue;
+                    };
+                    let collection_exists: bool =
+                        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?)")
+                            .bind(collection_id.to_string())
+                            .fetch_one(self.sqlite.get_conn())
+                            .await?;
+                    if !collection_exists {
+                        // A folder that still holds something stays.
+                        for empty in [segments, collection] {
+                            if tokio::fs::remove_dir(&empty).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn reset(&self) -> Result<(), LocalSegmentManagerError> {
