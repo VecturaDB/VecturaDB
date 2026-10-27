@@ -14,6 +14,7 @@ use chroma_segment::{
     sqlite_metadata::SqliteMetadataReader,
 };
 use chroma_sqlite::db::SqliteDb;
+use chroma_sysdb::SysDb;
 use chroma_system::ComponentHandle;
 use chroma_types::{
     operator::{
@@ -35,6 +36,8 @@ pub struct LocalExecutor {
     metadata_reader: SqliteMetadataReader,
     compactor_handle: ComponentHandle<LocalCompactionManager>,
     spann: bool,
+    // The catalog, for the files of the last flush of a SPANN collection.
+    sysdb: Option<SysDb>,
 }
 
 impl LocalExecutor {
@@ -48,13 +51,37 @@ impl LocalExecutor {
             metadata_reader: SqliteMetadataReader::new(sqlite_db),
             compactor_handle,
             spann: false,
+            sysdb: None,
         }
     }
 
     /// SPANN collections, when the option asks for them and the data path can hold their files.
-    pub fn with_spann(mut self, spann: bool) -> Self {
+    pub fn with_spann(mut self, spann: bool, sysdb: SysDb) -> Self {
         self.spann = spann && self.hnsw_manager.spann_provider().is_some();
+        self.sysdb = Some(sysdb);
         self
+    }
+
+    // The segments of a SPANN collection with the files of its last flush: a cache of collections can hold the files
+    // of an older one.
+    async fn last_flush(
+        &self,
+        collection_and_segments: &CollectionAndSegments,
+    ) -> Result<CollectionAndSegments, ExecutorError> {
+        let mut collection_and_segments = collection_and_segments.clone();
+        if let Some(sysdb) = &self.sysdb {
+            let stored = sysdb
+                .clone()
+                .get_collection_with_segments(
+                    None,
+                    collection_and_segments.collection.collection_id,
+                )
+                .await
+                .map_err(|err| ExecutorError::Internal(err.boxed()))?;
+            collection_and_segments.record_segment.file_path = stored.record_segment.file_path;
+            collection_and_segments.vector_segment.file_path = stored.vector_segment.file_path;
+        }
+        Ok(collection_and_segments)
     }
 
     pub fn get_supported_segment_types(&self) -> Vec<SegmentType> {
@@ -246,7 +273,8 @@ impl LocalExecutor {
             .await
             .map_err(|err| ExecutorError::Internal(Box::new(err)))?;
         if load_embedding && collection_and_segments.vector_segment.r#type == SegmentType::Spann {
-            if let Some(records) = Box::pin(self.spann_records(&collection_and_segments)).await? {
+            let flushed = self.last_flush(&collection_and_segments).await?;
+            if let Some(records) = Box::pin(self.spann_records(&flushed)).await? {
                 for record in &mut result.result.records {
                     let offset_id = records
                         .get_offset_id_for_user_id(
@@ -539,6 +567,7 @@ impl LocalExecutor {
     ) -> Result<(Vec<KnnProjectionOutput>, Vec<String>), ExecutorError> {
         let internal = |err: Box<dyn ChromaError>| ExecutorError::Internal(err);
         let empty = (vec![Default::default(); embeddings.len()], Vec::new());
+        let collection_and_segments = &self.last_flush(collection_and_segments).await?;
         let (Some(provider), Some(dimension)) = (
             self.hnsw_manager.spann_provider(),
             collection_and_segments.collection.dimension,
@@ -719,7 +748,9 @@ impl Configurable<LocalExecutorConfig> for LocalExecutor {
         let compactor_handle = registry
             .get::<ComponentHandle<LocalCompactionManager>>()
             .map_err(|err| err.boxed())?;
-        Ok(Self::new(hnsw_manager, sqlite_db, compactor_handle.clone()).with_spann(config.spann))
+        let sysdb = registry.get::<SysDb>().map_err(|err| err.boxed())?;
+        Ok(Self::new(hnsw_manager, sqlite_db, compactor_handle.clone())
+            .with_spann(config.spann, sysdb))
     }
 }
 

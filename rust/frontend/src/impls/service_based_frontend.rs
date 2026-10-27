@@ -4731,6 +4731,79 @@ mod tests {
         }
     }
 
+    // A cache of collections in memory keeps the segments of a collection for a while, with the files of an older
+    // flush; a query right after a write still reads the files of the last flush.
+    #[tokio::test]
+    async fn a_spann_query_reads_the_last_flush_through_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        let system = System::new();
+        let mut config = FrontendConfig::sqlite_in_memory();
+        config.sqlitedb.as_mut().unwrap().url =
+            Some(root.path().join("chroma.sqlite3").to_str().unwrap().into());
+        config.segment_manager.as_mut().unwrap().persist_path =
+            Some(root.path().to_str().unwrap().into());
+        config.executor = crate::executor::config::ExecutorConfig::Local(
+            crate::executor::config::LocalExecutorConfig { spann: true },
+        );
+        config.collections_with_segments_provider.cache =
+            chroma_cache::CacheConfig::Memory(chroma_cache::FoyerCacheConfig {
+                capacity: 100,
+                ..Default::default()
+            });
+        let records = (0..200)
+            .map(|i| {
+                let x = i as f32;
+                (format!("r{i}"), vec![x, (x * 0.3).sin(), (x * 0.7).cos()])
+            })
+            .collect::<Vec<_>>();
+        let mut frontend = ServiceBasedFrontend::try_from_config(&(config, system), &registry)
+            .await
+            .unwrap();
+        let collection_id = frontend
+            .create_collection(
+                CreateCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    "spann-cache".to_string(),
+                    None,
+                    None,
+                    Some(Schema::new_default(KnnIndex::Spann)),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collection_id;
+        for (round, chunk) in records.chunks(100).enumerate() {
+            frontend
+                .add(
+                    AddCollectionRecordsRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection_id,
+                        chunk.iter().map(|(id, _)| id.clone()).collect(),
+                        chunk.iter().map(|(_, vector)| vector.clone()).collect(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            // Each query reads the records of every add so far.
+            let written = &records[..100 * (round + 1)];
+            let query = written.last().unwrap().1.clone();
+            assert_eq!(
+                query_ids(&mut frontend, collection_id, query.clone(), 3).await,
+                exact_nearest(written, &query, 3),
+                "after add {round}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn database_deletion_leaves_unrelated_cleanup_to_background() {
         let registry = Registry::new();
