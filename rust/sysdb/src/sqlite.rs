@@ -17,6 +17,7 @@ use chroma_types::{
     InternalUpdateCollectionConfiguration, ListDatabasesError, Metadata, MetadataValue, ResetError,
     ResetResponse, Schema, SchemaError, Segment, SegmentFlushInfo, SegmentScope, SegmentType,
     SegmentUuid, UpdateCollectionError, UpdateTenantError, UpdateTenantResponse,
+    UpdateVectorIndexConfiguration,
 };
 use thiserror::Error;
 
@@ -547,6 +548,15 @@ impl SqliteSysDb {
             let collection = collections.into_iter().next().unwrap();
             // if schema exists, update schema instead of configuration
             if let Some(mut existing_schema) = collection.schema {
+                // As distributed Chroma, which fails the update of the HNSW settings of a SPANN collection.
+                if existing_schema.get_internal_spann_config().is_some()
+                    && matches!(
+                        configuration.vector_index,
+                        Some(UpdateVectorIndexConfiguration::Hnsw(_))
+                    )
+                {
+                    return Err(UpdateCollectionError::HnswUpdateOfSpann);
+                }
                 existing_schema.update(&configuration);
                 schema_str = Some(
                     serde_json::to_string(&existing_schema)

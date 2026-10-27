@@ -5571,6 +5571,74 @@ mod tests {
         );
     }
 
+    // As Chroma Cloud (go/pkg/sysdb/coordinator/model/collection_configuration.go): an HNSW update of a SPANN collection
+    // fails, with its message, as a bad request where Chroma Cloud answers 500; a SPANN update applies, and an HNSW
+    // collection takes an HNSW update as before.
+    #[tokio::test]
+    async fn an_hnsw_update_of_a_spann_collection_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let spann = spann_collection_with_records(&mut frontend, "spann-update").await;
+        let hnsw = create_collection_for(&mut frontend, TENANT, DATABASE, "hnsw-update").await;
+        let update = |collection_id, vector_index| {
+            UpdateCollectionRequest::try_new(
+                Some(DatabaseName::new(DATABASE).unwrap()),
+                collection_id,
+                None,
+                None,
+                Some(chroma_types::InternalUpdateCollectionConfiguration {
+                    vector_index: Some(vector_index),
+                    embedding_function: None,
+                }),
+            )
+            .unwrap()
+        };
+        let hnsw_update = || {
+            chroma_types::UpdateVectorIndexConfiguration::Hnsw(Some(
+                chroma_types::UpdateHnswConfiguration {
+                    ef_search: Some(50),
+                    ..Default::default()
+                },
+            ))
+        };
+        let err = frontend
+            .update_collection(update(spann, hnsw_update()))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), ErrorCodes::InvalidArgument);
+        assert!(err
+            .to_string()
+            .contains("trying to update hnsw config but schema has spann"));
+        frontend
+            .update_collection(update(
+                spann,
+                chroma_types::UpdateVectorIndexConfiguration::Spann(Some(
+                    chroma_types::UpdateSpannConfiguration {
+                        search_nprobe: Some(32),
+                        ef_search: None,
+                    },
+                )),
+            ))
+            .await
+            .unwrap();
+        let config = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, spann)
+            .await
+            .unwrap()
+            .collection
+            .schema
+            .unwrap()
+            .get_internal_spann_config()
+            .unwrap();
+        assert_eq!(config.search_nprobe, 32);
+        frontend
+            .update_collection(update(hnsw.collection_id, hnsw_update()))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn a_collection_created_again_before_the_sweep_is_new_and_works() {
         let root = tempfile::tempdir().unwrap();

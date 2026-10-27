@@ -1062,6 +1062,9 @@ pub enum UpdateCollectionError {
     SpannNotImplemented,
     #[error("Could not serialize schema: {0}")]
     Schema(#[source] serde_json::Error),
+    // The message of distributed Chroma (go/pkg/sysdb/coordinator/model/collection_configuration.go).
+    #[error("trying to update hnsw config but schema has spann")]
+    HnswUpdateOfSpann,
 }
 
 impl ChromaError for UpdateCollectionError {
@@ -1075,6 +1078,7 @@ impl ChromaError for UpdateCollectionError {
             UpdateCollectionError::InvalidConfig(_) => ErrorCodes::InvalidArgument,
             UpdateCollectionError::SpannNotImplemented => ErrorCodes::InvalidArgument,
             UpdateCollectionError::Schema(_) => ErrorCodes::Internal,
+            UpdateCollectionError::HnswUpdateOfSpann => ErrorCodes::InvalidArgument,
         }
     }
 }
