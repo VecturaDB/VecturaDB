@@ -4442,33 +4442,10 @@ mod tests {
         }
     }
 
-    struct SharedLog(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for SharedLog {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    // The reads of the catalog for a collection during its first add, from the log line of the cache of collections.
+    // The reads of the catalog for a collection during its first add, as the cache of collections counts them.
     async fn catalog_reads_of_a_first_add(
         quota_enforcer: Arc<dyn crate::quota::QuotaEnforcer>,
     ) -> usize {
-        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let writer = {
-            let log = log.clone();
-            move || SharedLog(log.clone())
-        };
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer)
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
         let port = test_server_with(
             FrontendServerConfig::single_node_default(),
             Arc::new(()),
@@ -4489,10 +4466,14 @@ mod tests {
             .await
             .unwrap();
         let id = created["id"].as_str().unwrap().to_string();
+        let collection_id = chroma_types::CollectionUuid(uuid::Uuid::parse_str(&id).unwrap());
         let misses = || {
-            String::from_utf8_lossy(&log.lock().unwrap())
-                .matches(&format!("Cache miss for collection {id}"))
-                .count()
+            crate::get_collection_with_segments_provider::CATALOG_READS
+                .lock()
+                .unwrap()
+                .get(&collection_id)
+                .copied()
+                .unwrap_or_default()
         };
         let before = misses();
         client
