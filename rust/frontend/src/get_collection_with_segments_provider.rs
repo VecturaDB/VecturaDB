@@ -14,6 +14,13 @@ use std::{
 };
 use thiserror::Error;
 
+/// The reads of the catalog for each collection, by the tests that count them; tests run in parallel, so a count is
+/// kept per collection rather than in the shared state of tracing.
+#[cfg(test)]
+pub(crate) static CATALOG_READS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<CollectionUuid, usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct CacheInvalidationRetryConfig {
     pub delay_ms: u32,
@@ -180,6 +187,14 @@ impl CollectionsWithSegmentsProvider {
                 }
             }
             tracing::info!("Cache miss for collection {}", collection_id);
+            #[cfg(test)]
+            {
+                *CATALOG_READS
+                    .lock()
+                    .unwrap()
+                    .entry(collection_id)
+                    .or_default() += 1;
+            }
             self.sysdb_client
                 .get_collection_with_segments(database_name, collection_id)
                 .await?
