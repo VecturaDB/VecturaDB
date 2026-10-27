@@ -2091,15 +2091,29 @@ impl ServiceBasedFrontend {
                     &owned_schema
                 }
             };
-            schema
-                .get_internal_hnsw_config_with_legacy_fallback(&collection.vector_segment)
-                .map_err(|err| PushLogsError::Other(err.boxed()))?
-                .ok_or_else(|| PushLogsError::Other(chroma_segment::local_hnsw::LocalHnswSegmentWriterError::MissingHnswConfiguration.boxed()))?;
-            // Reject an unreadable persisted index before committing more logs.
-            self.executor
-                .validate_index(&collection)
-                .await
-                .map_err(|err| PushLogsError::Other(err.boxed()))?;
+            if collection.vector_segment.r#type == SegmentType::Spann {
+                // A SPANN collection writes through its record and SPANN segments, which need the option.
+                if !self
+                    .get_supported_segment_types()
+                    .contains(&SegmentType::Spann)
+                {
+                    return Err(PushLogsError::Other(Box::new(
+                        ValidationError::InvalidArgument(
+                            "SPANN collections need the executor option spann".to_string(),
+                        ),
+                    )));
+                }
+            } else {
+                schema
+                    .get_internal_hnsw_config_with_legacy_fallback(&collection.vector_segment)
+                    .map_err(|err| PushLogsError::Other(err.boxed()))?
+                    .ok_or_else(|| PushLogsError::Other(chroma_segment::local_hnsw::LocalHnswSegmentWriterError::MissingHnswConfiguration.boxed()))?;
+                // Reject an unreadable persisted index before committing more logs.
+                self.executor
+                    .validate_index(&collection)
+                    .await
+                    .map_err(|err| PushLogsError::Other(err.boxed()))?;
+            }
         }
         self.log_client
             .push_logs(tenant_id, database_name, collection_id, records, cmek, None)

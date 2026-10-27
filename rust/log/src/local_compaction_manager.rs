@@ -7,18 +7,23 @@ use async_trait::async_trait;
 use chroma_config::registry::{Injectable, Registry};
 use chroma_config::Configurable;
 use chroma_error::{ChromaError, ErrorCodes};
+use chroma_segment::blockfile_record::{
+    RecordSegmentReaderOptions, RecordSegmentReaderShard, RecordSegmentReaderShardCreationError,
+    RecordSegmentWriterShard,
+};
 use chroma_segment::local_hnsw::LocalHnswSegmentReaderError;
 use chroma_segment::local_segment_manager::{LocalSegmentManager, LocalSegmentManagerError};
 use chroma_segment::sqlite_metadata::{
     SqliteMetadataError, SqliteMetadataReader, SqliteMetadataWriter,
 };
+use chroma_segment::types::materialize_logs;
 use chroma_sqlite::db::SqliteDb;
 use chroma_sysdb::SysDb;
 use chroma_system::Handler;
 use chroma_system::{Component, ComponentContext};
 use chroma_types::{
-    Chunk, CollectionUuid, DatabaseName, GetCollectionWithSegmentsError, LogRecord, Schema,
-    SchemaError, SegmentUuid,
+    Chunk, CollectionAndSegments, CollectionUuid, DatabaseName, GetCollectionWithSegmentsError,
+    LogRecord, Schema, SchemaError, SegmentFlushInfo, SegmentShard, SegmentType, SegmentUuid,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -146,6 +151,10 @@ pub enum CompactionManagerError {
     UnsafeHnswCheckpoint(#[source] std::io::Error),
     #[error("Failed to reconcile collection schema: {0}")]
     SchemaReconcileError(#[from] SchemaError),
+    #[error("SPANN collections need a persistent data path")]
+    SpannUnavailable,
+    #[error("Error writing the SPANN index: {0}")]
+    SpannWriteError(Box<dyn ChromaError>),
 }
 
 impl ChromaError for CompactionManagerError {
@@ -161,6 +170,8 @@ impl ChromaError for CompactionManagerError {
             CompactionManagerError::HnswReaderConstructionError(e) => e.code(),
             CompactionManagerError::PurgeLogsFailure => ErrorCodes::Internal,
             CompactionManagerError::UnsafeHnswCheckpoint(_) => ErrorCodes::FailedPrecondition,
+            CompactionManagerError::SpannUnavailable => ErrorCodes::FailedPrecondition,
+            CompactionManagerError::SpannWriteError(e) => e.code(),
             CompactionManagerError::SchemaReconcileError(e) => e.code(),
         }
     }
@@ -204,14 +215,20 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
             Some(dim) => dim,
             None => return Ok(()),
         };
-        let hnsw_reader = self
-            .hnsw_segment_manager
-            .get_hnsw_reader(
-                &collection_and_segments.collection,
-                &collection_and_segments.vector_segment,
-                dim as usize,
-            )
-            .await;
+        let spann = collection_and_segments.vector_segment.r#type == SegmentType::Spann;
+        let hnsw_reader = if spann {
+            Err(LocalSegmentManagerError::LocalHnswSegmentReaderError(
+                LocalHnswSegmentReaderError::UninitializedSegment,
+            ))
+        } else {
+            self.hnsw_segment_manager
+                .get_hnsw_reader(
+                    &collection_and_segments.collection,
+                    &collection_and_segments.vector_segment,
+                    dim as usize,
+                )
+                .await
+        };
         let hnsw_reader = match hnsw_reader {
             Ok(reader) => Some(reader),
             Err(LocalSegmentManagerError::LocalHnswSegmentReaderError(
@@ -236,6 +253,14 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
         let mt_max_seq_id = metadata_reader
             .current_max_seq_id(&collection_and_segments.metadata_segment.id)
             .await?;
+        // A SPANN index is at the log position of its last flush, which flush_compaction records.
+        let hnsw_max_seq_id = if spann {
+            metadata_reader
+                .current_max_seq_id(&collection_and_segments.vector_segment.id)
+                .await?
+        } else {
+            hnsw_max_seq_id
+        };
         // Get the logs from log service beyond this offset to backfill.
         let dbname = DatabaseName::new(collection_and_segments.collection.database.clone())
             .ok_or(CompactionManagerError::PullLogsFailure)?;
@@ -302,6 +327,11 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
         tx.commit()
             .await
             .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
+        if spann {
+            return self
+                .apply_spann(&collection_and_segments, dim as usize, hnsw_data_chunk)
+                .await;
+        }
         // Next apply it to the hnsw writer.
         let mut hnsw_writer = self
             .hnsw_segment_manager
@@ -344,6 +374,116 @@ impl Handler<PurgeLogsMessage> for LocalCompactionManager {
 }
 
 impl LocalCompactionManager {
+    // As the compaction of distributed Chroma: the records are materialized against the record segment, applied to it
+    // and to the SPANN index, and the new files of both are recorded with the log position they cover in one flush.
+    async fn apply_spann(
+        &mut self,
+        collection_and_segments: &CollectionAndSegments,
+        dimensionality: usize,
+        logs: Chunk<LogRecord>,
+    ) -> Result<(), CompactionManagerError> {
+        let Some(log_position) = logs.iter().map(|(log, _)| log.log_offset).max() else {
+            return Ok(());
+        };
+        let write = |err: Box<dyn ChromaError>| CompactionManagerError::SpannWriteError(err);
+        let provider = self
+            .hnsw_segment_manager
+            .spann_provider()
+            .ok_or(CompactionManagerError::SpannUnavailable)?;
+        let collection = &collection_and_segments.collection;
+        let record_shard = SegmentShard::try_from((&collection_and_segments.record_segment, 0))
+            .map_err(|err| write(err.boxed()))?;
+        let vector_shard = SegmentShard::try_from((&collection_and_segments.vector_segment, 0))
+            .map_err(|err| write(err.boxed()))?;
+        let record_reader = match RecordSegmentReaderShard::from_segment(
+            &record_shard,
+            &provider.blockfile_provider,
+            None,
+        )
+        .await
+        {
+            Ok(reader) => Some(reader),
+            Err(err)
+                if matches!(
+                    *err,
+                    RecordSegmentReaderShardCreationError::UninitializedSegment
+                ) =>
+            {
+                None
+            }
+            Err(err) => return Err(write(err.boxed())),
+        };
+        let materialized = materialize_logs(
+            &record_reader,
+            logs,
+            None,
+            &RecordSegmentReaderOptions::default(),
+        )
+        .await
+        .map_err(|err| write(err.boxed()))?;
+        let record_writer = RecordSegmentWriterShard::from_segment(
+            &collection.tenant,
+            &collection.database_id,
+            &record_shard,
+            &provider.blockfile_provider,
+            None,
+            None,
+        )
+        .await
+        .map_err(|err| write(err.boxed()))?;
+        record_writer
+            .apply_materialized_log_chunk(&record_reader, &materialized)
+            .await
+            .map_err(|err| write(err.boxed()))?;
+        let spann_writer = provider
+            .write(collection, &vector_shard, dimensionality, None)
+            .await
+            .map_err(|err| write(err.boxed()))?;
+        spann_writer
+            .apply_materialized_log_chunk(&record_reader, &materialized)
+            .await
+            .map_err(|err| write(err.boxed()))?;
+        let record_files = Box::pin(record_writer.commit())
+            .await
+            .map_err(|err| write(err.boxed()))?
+            .flush()
+            .await
+            .map_err(|err| write(err.boxed()))?;
+        let vector_files = Box::pin(spann_writer.commit())
+            .await
+            .map_err(write)?
+            .flush()
+            .await
+            .map_err(write)?;
+        let database_name = DatabaseName::new(collection.database.clone())
+            .ok_or(CompactionManagerError::PullLogsFailure)?;
+        self.sysdb
+            .flush_compaction(
+                collection.tenant.clone(),
+                database_name,
+                collection.collection_id,
+                log_position,
+                collection.version,
+                vec![
+                    SegmentFlushInfo {
+                        segment_id: collection_and_segments.record_segment.id,
+                        file_paths: record_files,
+                    },
+                    SegmentFlushInfo {
+                        segment_id: collection_and_segments.vector_segment.id,
+                        file_paths: vector_files,
+                    },
+                ]
+                .into(),
+                0,
+                0,
+                None,
+            )
+            .await
+            .map_err(|err| write(err.boxed()))?;
+        Ok(())
+    }
+
     async fn purge_logs(
         &mut self,
         collection_id: CollectionUuid,
@@ -369,7 +509,7 @@ impl LocalCompactionManager {
                 return Ok(());
             }
         }
-        if max_seq_id > 0 {
+        if max_seq_id > 0 && collection_segments.vector_segment.r#type != SegmentType::Spann {
             self.metrics.checkpoint_inspections.add(1, &[]);
             match self
                 .hnsw_segment_manager
