@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 //! Validate persisted bytes before passing them to the native HNSW loader.
 use std::{
     collections::HashSet,
@@ -8,6 +9,35 @@ use std::{
 };
 
 use super::{IdMap, HNSW_HEADER_FILE, HNSW_INDEX_FILES, HNSW_PERSISTENCE_VERSION, METADATA_FILE};
+
+/// The files of a checkpoint changed between the two reads of their fingerprint around an inspection: it cannot be
+/// verified now. Network file systems such as SMB can report new attributes for files nobody wrote.
+#[derive(Debug)]
+pub struct CheckpointChanged;
+
+impl std::fmt::Display for CheckpointChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("checkpoint changed during inspection")
+    }
+}
+
+impl std::error::Error for CheckpointChanged {}
+
+pub(super) fn checkpoint_changed() -> io::Error {
+    io::Error::other(CheckpointChanged)
+}
+
+/// Whether a validation failed only because the checkpoint changed while it was inspected.
+pub fn is_checkpoint_changed(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|inner| inner.is::<CheckpointChanged>())
+}
+
+/// Test hook: the checkpoint folder whose id map gets a new modification time between the inspection and the second
+/// read of the fingerprint, as a file system that reports attributes late.
+#[cfg(feature = "test-hooks")]
+pub static TOUCH_AFTER_INSPECTION: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
 
 // This is a change detector, not a content checksum. Unix identity and change
 // timestamps also detect replacement or edits that restore the modification time.
@@ -90,8 +120,15 @@ pub(crate) fn validate_checkpoint(path: &Path, watermark: u64) -> io::Result<Ver
         ));
     }
     validate_checkpoint_seq_id(inspection.checkpoint_seq_id, watermark)?;
+    #[cfg(feature = "test-hooks")]
+    if TOUCH_AFTER_INSPECTION.lock().unwrap().as_deref() == Some(path) {
+        File::options()
+            .append(true)
+            .open(path.join(METADATA_FILE))?
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))?;
+    }
     if before != CheckpointFingerprint::read(path)? {
-        return Err(io::Error::other("checkpoint changed during inspection"));
+        return Err(checkpoint_changed());
     }
     Ok(VerifiedCheckpoint {
         fingerprint: before,

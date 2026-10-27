@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 [package]
 name = "chroma-segment"
 version = "0.1.0"
@@ -6,6 +7,8 @@ edition = "2021"
 [features]
 default = []
 usearch = ["chroma-index/usearch", "faer"]
+# Hooks that tests of other crates use to reproduce the timing of slow or network file systems.
+test-hooks = []
 
 [dependencies]
 async-trait = { workspace = true }
