@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 import multiprocessing
 import os
 import socket
@@ -1031,20 +1032,6 @@ def multi_region_test(test_func: Callable[..., Any]) -> Any:
 
 # For backward compatibility, also provide test_with_multi_region
 test_with_multi_region = multi_region_test
-
-
-def pytest_itemcollected(item: pytest.Item) -> None:
-    """Modify test names to show database type"""
-    if hasattr(item, "iter_markers"):
-        for marker in item.iter_markers():
-            if marker.name == "test_with_multi_region":
-                # Add multi-region suffix to test node ID
-                suffix = "[multi-region]" if MULTI_REGION_ENABLED else "[single-region]"
-                item._nodeid = f"{item._nodeid}{suffix}"
-                break
-        else:
-            # No multi-region marker, show single-region
-            item._nodeid = f"{item._nodeid}[single-region]"
 
 
 @pytest.fixture(scope="function")
