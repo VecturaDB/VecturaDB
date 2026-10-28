@@ -118,6 +118,7 @@ docker run -p 127.0.0.1:8000:8000 -v ./data:/data -e CHROMA_EXECUTOR__LOCAL__SPA
 
 - With the option on, a collection created with a SPANN configuration or schema gets a SPANN index; any other collection gets HNSW, as before.
 - With the option off, a SPANN request gets HNSW, as on single-node Chroma. A SPANN collection created before still answers reads; a write to it fails with `SPANN collections need the executor option spann`.
+- A read of a SPANN collection that fails with an error that distributed Chroma retries reads again: at once after a NotFound, otherwise after the backoff of `executor: local: retry` (`factor`, `min_delay_ms`, `max_delay_ms`, `max_attempts`, `jitter`), by default that of distributed Chroma: 2.0, 100 ms, 5000 ms, 5 times, with jitter.
 - Chroma 1.5.9 and VecturaDB 1.0.0-preview.3.post1 open a data path with SPANN collections and serve the other collections as before. A SPANN collection answers there with an error, 500: do not write to it with them. Deleting it there works; VecturaDB removes its files at the next startup.
 
 ## Clients

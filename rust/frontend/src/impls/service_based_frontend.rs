@@ -4454,14 +4454,25 @@ mod tests {
         spann: bool,
         registry: &Registry,
     ) -> ServiceBasedFrontend {
+        let executor = crate::executor::config::LocalExecutorConfig {
+            spann,
+            ..Default::default()
+        };
+        frontend_with_local_executor(root, executor, registry).await
+    }
+
+    // A single node on a data path, with the config of its executor given.
+    async fn frontend_with_local_executor(
+        root: &std::path::Path,
+        executor: crate::executor::config::LocalExecutorConfig,
+        registry: &Registry,
+    ) -> ServiceBasedFrontend {
         let system = System::new();
         let mut config = FrontendConfig::sqlite_in_memory();
         config.sqlitedb.as_mut().unwrap().url =
             Some(root.join("chroma.sqlite3").to_str().unwrap().into());
         config.segment_manager.as_mut().unwrap().persist_path = Some(root.to_str().unwrap().into());
-        config.executor = crate::executor::config::ExecutorConfig::Local(
-            crate::executor::config::LocalExecutorConfig { spann },
-        );
+        config.executor = crate::executor::config::ExecutorConfig::Local(executor);
         ServiceBasedFrontend::try_from_config(&(config, system), registry)
             .await
             .unwrap()
@@ -4768,7 +4779,10 @@ mod tests {
         config.segment_manager.as_mut().unwrap().persist_path =
             Some(root.path().to_str().unwrap().into());
         config.executor = crate::executor::config::ExecutorConfig::Local(
-            crate::executor::config::LocalExecutorConfig { spann: true },
+            crate::executor::config::LocalExecutorConfig {
+                spann: true,
+                ..Default::default()
+            },
         );
         config.collections_with_segments_provider.cache =
             chroma_cache::CacheConfig::Memory(chroma_cache::FoyerCacheConfig {
@@ -6921,6 +6935,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    // A SPANN read reads again as the retry of the config of its executor says, as a read of distributed Chroma does:
+    // with one attempt more at most, a second NotFound in a row is the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_read_reads_again_as_the_config_of_its_executor_says() {
+        use crate::executor::local::FAIL_BEFORE_FILES;
+        use chroma_error::ErrorCodes;
+        let root = tempfile::tempdir().unwrap();
+        let executor = crate::executor::config::LocalExecutorConfig {
+            spann: true,
+            retry: crate::executor::config::RetryConfig {
+                factor: 1.0,
+                min_delay_ms: 1,
+                max_delay_ms: 1,
+                max_attempts: 1,
+                jitter: false,
+            },
+        };
+        let mut frontend =
+            frontend_with_local_executor(root.path(), executor, &Registry::new()).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        let fail = |count: usize| {
+            FAIL_BEFORE_FILES
+                .lock()
+                .unwrap()
+                .extend(std::iter::repeat_n(
+                    (collection_id, ErrorCodes::NotFound),
+                    count,
+                ));
+        };
+        fail(1);
+        let once = spann_read(&mut frontend, collection_id, SpannRead::Get).await;
+        fail(2);
+        let twice = spann_read(&mut frontend, collection_id, SpannRead::Get).await;
+        assert!(once.is_ok(), "{once:?}");
+        assert!(twice.is_err(), "{twice:?}");
     }
 
     // A write to a SPANN collection whose last flush cannot be read is rejected before it reaches the log, as a write to

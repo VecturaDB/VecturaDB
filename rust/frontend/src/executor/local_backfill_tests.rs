@@ -622,6 +622,7 @@ async fn repeated_reads_of_a_spann_collection_skip_replay() {
     config.executor =
         super::super::config::ExecutorConfig::Local(super::super::config::LocalExecutorConfig {
             spann: true,
+            ..Default::default()
         });
     let mut frontend = crate::impls::service_based_frontend::ServiceBasedFrontend::try_from_config(
         &(config, System::new()),

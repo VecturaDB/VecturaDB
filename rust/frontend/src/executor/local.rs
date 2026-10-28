@@ -40,6 +40,7 @@ pub struct LocalExecutor {
     metadata_reader: SqliteMetadataReader,
     compactor_handle: ComponentHandle<LocalCompactionManager>,
     spann: bool,
+    retry: RetryConfig,
 }
 
 impl LocalExecutor {
@@ -53,12 +54,19 @@ impl LocalExecutor {
             metadata_reader: SqliteMetadataReader::new(sqlite_db),
             compactor_handle,
             spann: false,
+            retry: RetryConfig::default(),
         }
     }
 
     /// SPANN collections, when the option asks for them and the data path can hold their files.
     pub fn with_spann(mut self, spann: bool) -> Self {
         self.spann = spann && self.hnsw_manager.spann_provider().is_some();
+        self
+    }
+
+    /// How a read of a SPANN collection reads again, from the config, as the retry of the distributed executor.
+    pub fn with_retry(mut self, retry: RetryConfig) -> Self {
+        self.retry = retry;
         self
     }
 
@@ -186,7 +194,7 @@ impl LocalExecutor {
     {
         if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
             // A read that fails with an error that distributed Chroma retries reads again, as a get does.
-            let mut delays = spann_backoff();
+            let mut delays = spann_backoff(&self.retry);
             let mut plan = plan;
             loop {
                 match Box::pin(self.spann_count(plan.clone())).await {
@@ -299,7 +307,7 @@ impl LocalExecutor {
             // As the executor of distributed Chroma (distributed.rs): a read that fails with an error it retries, as the
             // NotFound of the files of its flush that later flushes removed, reads again from the plan that the frontend
             // gives back.
-            let mut delays = spann_backoff();
+            let mut delays = spann_backoff(&self.retry);
             let mut plan = plan;
             loop {
                 match Box::pin(self.spann_get(plan.clone())).await {
@@ -458,7 +466,7 @@ impl LocalExecutor {
     {
         if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
             // A read that fails with an error that distributed Chroma retries reads again, as a get does.
-            let mut delays = spann_backoff();
+            let mut delays = spann_backoff(&self.retry);
             let mut plan = plan;
             loop {
                 match Box::pin(self.spann_knn(plan.clone())).await {
@@ -862,7 +870,7 @@ impl LocalExecutor {
     {
         if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
             // A read that fails with an error that distributed Chroma retries reads again, as a get does.
-            let mut delays = spann_backoff();
+            let mut delays = spann_backoff(&self.retry);
             let mut plan = plan;
             loop {
                 match Box::pin(self.spann_search(plan.clone())).await {
@@ -977,10 +985,9 @@ async fn spann_projection(
     }
 }
 
-// The backoff of the reads of SPANN collections: that of the executor of distributed Chroma, from its retry config by
-// default.
-fn spann_backoff() -> ExponentialBackoff {
-    ExponentialBuilder::from(&RetryConfig::default()).build()
+// The backoff of the reads of SPANN collections, from a retry config as the executor of distributed Chroma builds it.
+fn spann_backoff(retry: &RetryConfig) -> ExponentialBackoff {
+    ExponentialBuilder::from(retry).build()
 }
 
 // After a failed read of a SPANN collection, the plan to read again, as the executor of distributed Chroma decides it
@@ -1184,7 +1191,9 @@ impl Configurable<LocalExecutorConfig> for LocalExecutor {
         let compactor_handle = registry
             .get::<ComponentHandle<LocalCompactionManager>>()
             .map_err(|err| err.boxed())?;
-        Ok(Self::new(hnsw_manager, sqlite_db, compactor_handle.clone()).with_spann(config.spann))
+        Ok(Self::new(hnsw_manager, sqlite_db, compactor_handle.clone())
+            .with_spann(config.spann)
+            .with_retry(config.retry.clone()))
     }
 }
 
