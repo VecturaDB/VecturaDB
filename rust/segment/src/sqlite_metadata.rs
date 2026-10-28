@@ -168,6 +168,12 @@ pub struct MetadataSnapshot {
 }
 
 impl MetadataSnapshot {
+    /// The end of the snapshot, after which writers commit.
+    pub async fn close(self) -> Result<(), SqliteMetadataError> {
+        self.tx.commit().await?;
+        Ok(())
+    }
+
     /// The files of the segments of a collection, by segment id, as its last flush recorded them.
     pub async fn segment_files(
         &mut self,

@@ -4436,7 +4436,7 @@ mod tests {
 
     // A single node on a data path, with SPANN collections when spann is on.
     async fn frontend_with_spann(root: &std::path::Path, spann: bool) -> ServiceBasedFrontend {
-        frontend_with_spann_registry(root, spann, Registry::new()).await
+        frontend_with_spann_registry(root, spann, &Registry::new()).await
     }
 
     // A SPANN frontend that keeps the files of a replaced version for the grace given.
@@ -4446,13 +4446,13 @@ mod tests {
     ) -> ServiceBasedFrontend {
         let registry = Registry::new();
         registry.register(chroma_log::SpannVersionGrace(grace));
-        frontend_with_spann_registry(root, true, registry).await
+        frontend_with_spann_registry(root, true, &registry).await
     }
 
     async fn frontend_with_spann_registry(
         root: &std::path::Path,
         spann: bool,
-        registry: Registry,
+        registry: &Registry,
     ) -> ServiceBasedFrontend {
         let system = System::new();
         let mut config = FrontendConfig::sqlite_in_memory();
@@ -4462,7 +4462,7 @@ mod tests {
         config.executor = crate::executor::config::ExecutorConfig::Local(
             crate::executor::config::LocalExecutorConfig { spann },
         );
-        ServiceBasedFrontend::try_from_config(&(config, system), &registry)
+        ServiceBasedFrontend::try_from_config(&(config, system), registry)
             .await
             .unwrap()
     }
@@ -5952,6 +5952,463 @@ mod tests {
             wrong.len(),
             &wrong[..wrong.len().min(8)]
         );
+    }
+
+    // The reads of a SPANN collection that the executor stops between their snapshot of SQLite and their files.
+    #[derive(Clone, Copy, Debug)]
+    enum SpannRead {
+        Get,
+        Query,
+        Search,
+    }
+
+    // A record as a read answers it: its id, its document and its embedding.
+    type ReadRecord = (String, Option<String>, Option<Vec<f32>>);
+
+    // What a read of a SPANN collection answers, by list of records, each list by id: one list for a get or a query, two
+    // for a search, ranked by a KNN and listed without a rank.
+    async fn spann_read(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        read: SpannRead,
+    ) -> Result<Vec<Vec<ReadRecord>>, String> {
+        let include = || {
+            chroma_types::IncludeList(vec![
+                chroma_types::Include::Document,
+                chroma_types::Include::Embedding,
+            ])
+        };
+        let mut answers: Vec<Vec<ReadRecord>> = match read {
+            SpannRead::Get => {
+                let response = frontend
+                    .get(
+                        GetRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            None,
+                            None,
+                            None,
+                            0,
+                            include(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .map_err(|err| format!("get: {err}"))?;
+                let documents = response.documents.unwrap_or_default();
+                let embeddings = response.embeddings.unwrap_or_default();
+                vec![response
+                    .ids
+                    .into_iter()
+                    .enumerate()
+                    .map(|(at, id)| {
+                        (
+                            id,
+                            documents.get(at).cloned().flatten(),
+                            embeddings.get(at).cloned(),
+                        )
+                    })
+                    .collect()]
+            }
+            SpannRead::Query => {
+                let response = frontend
+                    .query(
+                        QueryRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            None,
+                            None,
+                            vec![vec![0.0, 0.0]],
+                            500,
+                            include(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .map_err(|err| format!("query: {err}"))?;
+                let documents = response.documents.unwrap_or_default();
+                let embeddings = response.embeddings.unwrap_or_default();
+                vec![response
+                    .ids
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(at, id)| {
+                        (
+                            id,
+                            documents
+                                .first()
+                                .and_then(|list| list.get(at))
+                                .cloned()
+                                .flatten(),
+                            embeddings
+                                .first()
+                                .and_then(|list| list.get(at))
+                                .cloned()
+                                .flatten(),
+                        )
+                    })
+                    .collect()]
+            }
+            SpannRead::Search => {
+                let ranked = SearchPayload {
+                    filter: Filter {
+                        query_ids: None,
+                        where_clause: None,
+                    },
+                    rank: chroma_types::operator::Rank {
+                        expr: Some(chroma_types::operator::RankExpr::Knn {
+                            query: chroma_types::operator::QueryVector::Dense(vec![0.0, 0.0]),
+                            key: chroma_types::operator::Key::Embedding,
+                            limit: 500,
+                            default: None,
+                            return_rank: false,
+                        }),
+                    },
+                    limit: Limit {
+                        offset: 0,
+                        limit: Some(500),
+                    },
+                    select: chroma_types::operator::Select {
+                        keys: [
+                            chroma_types::operator::Key::Document,
+                            chroma_types::operator::Key::Embedding,
+                        ]
+                        .into_iter()
+                        .collect(),
+                    },
+                    ..Default::default()
+                };
+                let listed = SearchPayload {
+                    rank: chroma_types::operator::Rank { expr: None },
+                    ..ranked.clone()
+                };
+                let response = frontend
+                    .search(
+                        SearchRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            vec![ranked, listed],
+                            chroma_types::plan::ReadLevel::default(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .map_err(|err| format!("search: {err}"))?;
+                response
+                    .ids
+                    .iter()
+                    .enumerate()
+                    .map(|(search, ids)| {
+                        let documents = response.documents[search].clone().unwrap_or_default();
+                        let embeddings = response.embeddings[search].clone().unwrap_or_default();
+                        ids.iter()
+                            .enumerate()
+                            .map(|(at, id)| {
+                                (
+                                    id.clone(),
+                                    documents.get(at).cloned().flatten(),
+                                    embeddings.get(at).cloned().flatten(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect()
+            }
+        };
+        for answer in &mut answers {
+            answer.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        Ok(answers)
+    }
+
+    // How long a stopped read and the writes around it may take: a few seconds, far below the busy timeout of SQLite.
+    const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    // The records of the collection of the stopped reads after the writes given: the ten of the add and one more for
+    // each write, with r0 changed by each write, its document and its embedding.
+    fn records_after(writes: usize) -> Vec<ReadRecord> {
+        (0..10 + writes)
+            .map(|i| match (i, writes) {
+                (0, 1..) => (
+                    "r0".to_string(),
+                    Some(format!("document r0 {writes}")),
+                    Some(vec![100.0 * writes as f32; 2]),
+                ),
+                _ => (
+                    format!("r{i}"),
+                    Some(format!("document r{i}")),
+                    Some(vec![i as f32, (i as f32).sin()]),
+                ),
+            })
+            .collect()
+    }
+
+    // The records of each list of an answer that differ from the records after the writes given, and those missing: a
+    // record of one moment with the document or the embedding of another is of none.
+    fn differences_from(answer: &[Vec<ReadRecord>], writes: usize) -> Vec<String> {
+        let expected = records_after(writes);
+        let mut wrong = Vec::new();
+        for (list, records) in answer.iter().enumerate() {
+            wrong.extend(
+                records
+                    .iter()
+                    .filter(|record| !expected.contains(record))
+                    .map(|record| format!("list {list}: {record:?}")),
+            );
+            wrong.extend(
+                expected
+                    .iter()
+                    .filter(|record| records.iter().all(|answered| answered.0 != record.0))
+                    .map(|record| format!("list {list}: {} missing", record.0)),
+            );
+        }
+        wrong
+    }
+
+    // The task of a read of a SPANN collection.
+    type ReadTask = tokio::task::JoinHandle<Result<Vec<Vec<ReadRecord>>, String>>;
+
+    // A read of the collection, started and stopped by the executor between its snapshot of SQLite and its files: the
+    // sender that lets it go on and the task of the read, or None when it did not stop.
+    async fn stopped_read(
+        frontend: &ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        read: SpannRead,
+    ) -> Option<(tokio::sync::oneshot::Sender<()>, ReadTask)> {
+        use crate::executor::local::{StopBeforeFiles, STOP_BEFORE_FILES};
+        let (stopped, at_stop) = tokio::sync::oneshot::channel();
+        let (go_on, waiting) = tokio::sync::oneshot::channel();
+        STOP_BEFORE_FILES.lock().unwrap().push(StopBeforeFiles {
+            collection_id,
+            stopped,
+            go_on: waiting,
+        });
+        let reading = tokio::spawn({
+            let mut frontend = frontend.clone();
+            async move { spann_read(&mut frontend, collection_id, read).await }
+        });
+        tokio::time::timeout(STOP_WAIT, at_stop).await.ok()?.ok()?;
+        Some((go_on, reading))
+    }
+
+    // What went otherwise than an answer with the records after the writes given, for a stopped read that went on.
+    async fn answer_differences(reading: ReadTask, writes: usize) -> Vec<String> {
+        match tokio::time::timeout(STOP_WAIT, reading).await {
+            Err(_) => vec![format!(
+                "the read did not end within {STOP_WAIT:?} once it went on"
+            )],
+            Ok(Err(err)) => vec![format!("the read failed: {err}")],
+            Ok(Ok(Err(err))) => vec![err],
+            Ok(Ok(Ok(answer))) => differences_from(&answer, writes),
+        }
+    }
+
+    // A collection of ten records with a document each, for the stopped reads.
+    async fn collection_to_stop(frontend: &mut ServiceBasedFrontend) -> CollectionUuid {
+        let collection_id = frontend
+            .create_collection(
+                CreateCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    "stops".to_string(),
+                    None,
+                    None,
+                    Some(Schema::new_default(KnnIndex::Spann)),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collection_id;
+        add_with_documents(frontend, collection_id, 0..10, "r").await;
+        collection_id
+    }
+
+    // A read of a SPANN collection of ten records, stopped by the executor between its snapshot of SQLite and its files
+    // while writes run, each with its flush: each changes the document and the embedding of r0, and adds a record, so
+    // that a read that takes its records, or their documents or embeddings, at another moment than its files answers a
+    // record of none, or a record more or less. The files of a replaced version stay for the grace given. The caches of
+    // the blockfiles are emptied once the writes end, so that the read takes its files from disk. A read that holds
+    // SQLite through its stop makes the writes wait: it fails at once, not after the busy timeout of SQLite. Returns
+    // what went otherwise than an answer with the records after the writes given.
+    async fn read_across_flushes(
+        read: SpannRead,
+        writes: usize,
+        grace: std::time::Duration,
+        answer_after: usize,
+    ) -> Vec<String> {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        registry.register(chroma_log::SpannVersionGrace(grace));
+        let mut frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        let Some((go_on, reading)) = stopped_read(&frontend, collection_id, read).await else {
+            return vec!["the read did not stop before its files".to_string()];
+        };
+        let mut writing = tokio::spawn(async move {
+            for write in 1..=writes {
+                let added = 9 + write;
+                frontend
+                    .upsert(
+                        UpsertCollectionRecordsRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            vec!["r0".to_string(), format!("r{added}")],
+                            vec![
+                                vec![100.0 * write as f32; 2],
+                                vec![added as f32, (added as f32).sin()],
+                            ],
+                            Some(vec![
+                                Some(format!("document r0 {write}")),
+                                Some(format!("document r{added}")),
+                            ]),
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let written = tokio::time::timeout(STOP_WAIT, &mut writing).await;
+        if written.is_ok() {
+            registry
+                .get::<chroma_segment::local_segment_manager::LocalSegmentManager>()
+                .unwrap()
+                .spann_provider()
+                .unwrap()
+                .blockfile_provider
+                .clear()
+                .await
+                .unwrap();
+        }
+        let _ = go_on.send(());
+        let mut wrong = answer_differences(reading, answer_after).await;
+        match written {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => wrong.push(format!("the writes failed: {err}")),
+            Err(_) => {
+                let ended = tokio::time::timeout(STOP_WAIT, writing).await.is_ok();
+                wrong.push(format!(
+                    "the writes did not end within {STOP_WAIT:?} while the read stopped{}",
+                    if ended {
+                        ", and ended once it went on"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
+        wrong
+    }
+
+    // A get of a SPANN collection answers for the moment of its snapshot of SQLite while a write and its flush come
+    // between that snapshot and its files, as distributed Chroma reads one version of every segment: the files of a flush
+    // never change, and the version before the current one stays. The stop of the executor puts the write there without
+    // timing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_get_across_a_flush_answers_for_its_snapshot() {
+        let grace = chroma_log::SpannVersionGrace::default().0;
+        let wrong = read_across_flushes(SpannRead::Get, 1, grace, 0).await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // The same for a query, whose nearest records come with their documents.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_query_across_a_flush_answers_for_its_snapshot() {
+        let grace = chroma_log::SpannVersionGrace::default().0;
+        let wrong = read_across_flushes(SpannRead::Query, 1, grace, 0).await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // Two flushes between the snapshot of a get and its files: the version of its moment is then neither the current
+    // one nor the one before it, and stays for the grace.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_get_across_two_flushes_answers_for_its_snapshot() {
+        let grace = chroma_log::SpannVersionGrace::default().0;
+        let wrong = read_across_flushes(SpannRead::Get, 2, grace, 0).await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // A search of a SPANN collection keeps its snapshot of SQLite through its files, since it numbers the records by
+    // their rows of SQLite, and answers for it. A change of SQLite at the stop between that snapshot and the files waits
+    // for the search, and while it waits keeps out any new reader of SQLite until it commits: a search that read SQLite
+    // again after its files would see the change. The change waits for the search, never the search for the change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_search_answers_for_the_snapshot_it_keeps_through_its_files() {
+        use sqlx::ConnectOptions;
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        let (go_on, reading) = stopped_read(&frontend, collection_id, SpannRead::Search)
+            .await
+            .expect("the search did not stop before its files");
+        let options =
+            sqlx::sqlite::SqliteConnectOptions::new().filename(root.path().join("chroma.sqlite3"));
+        let mut change = options
+            .clone()
+            .busy_timeout(STOP_WAIT)
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut change)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE embedding_metadata SET string_value = 'changed r0' WHERE key = 'chroma:document' \
+             AND id IN (SELECT id FROM embeddings WHERE embedding_id = 'r0')",
+        )
+        .execute(&mut change)
+        .await
+        .unwrap();
+        let committing =
+            tokio::spawn(
+                async move { sqlx::query("COMMIT").execute(&mut change).await.map(|_| ()) },
+            );
+        // A reader that does not wait finds SQLite locked once the commit waits.
+        let mut reader = options
+            .busy_timeout(std::time::Duration::ZERO)
+            .connect()
+            .await
+            .unwrap();
+        let kept_out = tokio::time::timeout(STOP_WAIT, async {
+            while !committing.is_finished() {
+                if sqlx::query("SELECT count(*) FROM embeddings")
+                    .fetch_one(&mut reader)
+                    .await
+                    .is_err()
+                {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        let mut wrong = Vec::new();
+        if !kept_out {
+            wrong.push("the change of SQLite did not wait for the search".to_string());
+        }
+        let _ = go_on.send(());
+        wrong.extend(answer_differences(reading, 0).await);
+        match tokio::time::timeout(STOP_WAIT, committing).await {
+            Ok(Ok(Ok(()))) => {}
+            other => wrong.push(format!(
+                "the change of SQLite did not commit once the search ended: {other:?}"
+            )),
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     // A write to a SPANN collection whose last flush cannot be read is rejected before it reaches the log, as a write to
