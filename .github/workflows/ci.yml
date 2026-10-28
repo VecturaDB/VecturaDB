@@ -139,13 +139,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: linux, runner: ubuntu-24.04, target: x86_64 }
           - { os: linux, runner: ubuntu-24.04-arm, target: aarch64 }
           - { os: windows, runner: windows-latest, target: x64 }
           - { os: macos, runner: macos-14, target: x86_64 }
           - { os: macos, runner: macos-14, target: aarch64 }
     runs-on: ${{ matrix.runner }}
-    steps:
+    steps: &wheel-steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -186,6 +185,16 @@ jobs:
         with:
           name: wheel-${{ matrix.os }}-${{ matrix.target }}
           path: dist
+
+  # The wheel that the Python tests install, in a job of its own: they wait for it, not for the other wheels.
+  wheel-linux-x86_64:
+    name: Wheel ${{ matrix.os }} ${{ matrix.target }}
+    strategy:
+      matrix:
+        include:
+          - { os: linux, runner: ubuntu-24.04, target: x86_64 }
+    runs-on: ${{ matrix.runner }}
+    steps: *wheel-steps
 
   image:
     name: Docker image (built, not pushed)
@@ -253,7 +262,7 @@ jobs:
 
   python-tests:
     name: Python tests (single-node)
-    needs: wheels
+    needs: wheel-linux-x86_64
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
