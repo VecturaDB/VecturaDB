@@ -1,0 +1,5 @@
+[env]
+# SQLite with a page cache for each connection. libsqlite3-sys builds it with SQLITE_ENABLE_MEMORY_MANAGEMENT, under which
+# all the connections of a process share one page cache: a connection whose share another one has taken drops each page
+# right after reading it, so a read that alternates between the connections of the pool reads the database many times over.
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT"

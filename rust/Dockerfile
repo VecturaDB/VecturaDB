@@ -1,4 +1,5 @@
 # syntax=docker/dockerfile:1
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 
 # ============================================================================
 # chef: shared toolchain base (rust + protoc + cargo-chef).
@@ -101,6 +102,8 @@ ENV COOK_PACKAGES="chroma-cli garbage_collector chroma-load chroma-log-service s
 # the compiled output in ./target is intentionally a layer, not a mount, which
 # is what makes cargo-chef effective.
 COPY --from=planner /chroma/recipe.json recipe.json
+# The settings of the builds of the repository, SQLite among them, before the dependencies compile.
+COPY .cargo/ .cargo/
 RUN --mount=type=cache,sharing=locked,target=/usr/local/cargo/registry/ \
   --mount=type=cache,sharing=locked,target=/usr/local/cargo/git/ \
   if [ "$ENABLE_AVX512" = "1" ]; then \
