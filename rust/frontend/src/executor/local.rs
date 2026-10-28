@@ -28,6 +28,7 @@ use chroma_types::{
     plan::{Count, Get, Knn, Search},
     CollectionAndSegments, ExecutorError, Segment, SegmentShard, SegmentType, SegmentUuid, Space,
 };
+use futures::future::try_join_all;
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     future::Future,
@@ -427,28 +428,22 @@ impl LocalExecutor {
         {
             return Ok(result);
         }
-        // As the projection of distributed Chroma (rust/worker/src/execution/operators/projection.rs).
         let records = Box::pin(self.spann_records(&collection_and_segments))
             .await?
             .ok_or(ExecutorError::InconsistentData)?;
-        for record in &mut result.result.records {
-            let offset_id = records
-                .get_offset_id_for_user_id(&record.id, &RecordSegmentReaderOptions::default())
-                .await
-                .map_err(|err| ExecutorError::Internal(err.boxed()))?
-                .ok_or(ExecutorError::InconsistentData)?;
-            let data = records
-                .get_data_for_offset_id(offset_id)
-                .await
-                .map_err(|err| ExecutorError::Internal(err.boxed()))?
-                .ok_or(ExecutorError::InconsistentData)?;
-            record.document = data
-                .document
-                .filter(|_| projection.document)
-                .map(str::to_string);
-            record.embedding = projection.embedding.then(|| data.embedding.to_vec());
-            record.metadata = data.metadata.filter(|_| projection.metadata);
+        // The offsets of the records, one by one, as the filter of distributed Chroma takes those of its user ids
+        // (rust/worker/src/execution/operators/filter.rs).
+        let mut offset_ids = Vec::with_capacity(result.result.records.len());
+        for record in &result.result.records {
+            offset_ids.push(
+                records
+                    .get_offset_id_for_user_id(&record.id, &RecordSegmentReaderOptions::default())
+                    .await
+                    .map_err(|err| ExecutorError::Internal(err.boxed()))?
+                    .ok_or(ExecutorError::InconsistentData)?,
+            );
         }
+        result.result.records = spann_projection(&records, &offset_ids, &projection).await?;
         Ok(result)
     }
 
@@ -829,51 +824,29 @@ impl LocalExecutor {
                     .map_err(internal)?,
             )
         };
-        let projection = &proj.projection;
-        let needs_data = projection.document || projection.embedding || projection.metadata;
         let mut results = Vec::new();
         for embedding in embeddings {
-            let mut output = Vec::new();
-            for RecordMeasure { offset_id, measure } in vectors
+            let nearest = vectors
                 .nearest(embedding, k, allowed.as_ref())
                 .await
-                .map_err(internal)?
-            {
-                let record = if needs_data {
-                    let data = vectors
-                        .records
-                        .get_data_for_offset_id(offset_id)
-                        .await
-                        .map_err(|err| internal(err.boxed()))?
-                        .ok_or(ExecutorError::InconsistentData)?;
-                    ProjectionRecord {
-                        id: data.id.to_string(),
-                        document: data
-                            .document
-                            .filter(|_| projection.document)
-                            .map(str::to_string),
-                        embedding: projection.embedding.then(|| data.embedding.to_vec()),
-                        metadata: data.metadata.filter(|_| projection.metadata),
-                    }
-                } else {
-                    ProjectionRecord {
-                        id: vectors
-                            .records
-                            .get_user_id_for_offset_id(offset_id)
-                            .await
-                            .map_err(|err| internal(err.boxed()))?
-                            .to_string(),
-                        document: None,
-                        embedding: None,
-                        metadata: None,
-                    }
-                };
-                output.push(KnnProjectionRecord {
-                    record,
-                    distance: proj.distance.then_some(measure),
-                });
-            }
-            results.push(KnnProjectionOutput { records: output });
+                .map_err(internal)?;
+            let offset_ids = nearest
+                .iter()
+                .map(|record| record.offset_id)
+                .collect::<Vec<_>>();
+            let records = spann_projection(&vectors.records, &offset_ids, &proj.projection).await?;
+            results.push(KnnProjectionOutput {
+                records: records
+                    .into_iter()
+                    .zip(nearest)
+                    .map(
+                        |(record, RecordMeasure { measure, .. })| KnnProjectionRecord {
+                            record,
+                            distance: proj.distance.then_some(measure),
+                        },
+                    )
+                    .collect(),
+            });
         }
         Ok(results)
     }
@@ -949,6 +922,58 @@ impl LocalExecutor {
     pub async fn reset(&mut self) -> Result<(), Box<dyn ChromaError>> {
         self.hnsw_manager.reset().await.map_err(|err| err.boxed())?;
         Ok(())
+    }
+}
+
+// The records of the given offsets from the record segment, in their order, with their documents, embeddings and metadata
+// as the projection asks, as the projection of distributed Chroma reads them (rust/worker/src/execution/operators/
+// projection.rs): the blocks of the records loaded first, then the records read at once, or their user ids one by one
+// from the blocks loaded when no data is asked.
+async fn spann_projection(
+    records: &RecordSegmentReaderShard<'_>,
+    offset_ids: &[u32],
+    projection: &Projection,
+) -> Result<Vec<ProjectionRecord>, ExecutorError> {
+    if offset_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let internal = |err: Box<dyn ChromaError>| ExecutorError::Internal(err);
+    let offset_id_set = offset_ids.iter().copied().collect::<HashSet<_>>();
+    if projection.document || projection.embedding || projection.metadata {
+        records.load_id_to_data(offset_id_set.into_iter()).await;
+        try_join_all(offset_ids.iter().map(|offset_id| async move {
+            let data = records
+                .get_data_for_offset_id(*offset_id)
+                .await
+                .map_err(|err| internal(err.boxed()))?
+                .ok_or(ExecutorError::InconsistentData)?;
+            Ok::<_, ExecutorError>(ProjectionRecord {
+                id: data.id.to_string(),
+                document: data
+                    .document
+                    .filter(|_| projection.document)
+                    .map(str::to_string),
+                embedding: projection.embedding.then(|| data.embedding.to_vec()),
+                metadata: data.metadata.filter(|_| projection.metadata),
+            })
+        }))
+        .await
+    } else {
+        records.load_id_to_user_id(offset_id_set.into_iter()).await;
+        let mut projected = Vec::with_capacity(offset_ids.len());
+        for offset_id in offset_ids {
+            projected.push(ProjectionRecord {
+                id: records
+                    .get_user_id_for_offset_id(*offset_id)
+                    .await
+                    .map_err(|err| internal(err.boxed()))?
+                    .to_string(),
+                document: None,
+                embedding: None,
+                metadata: None,
+            });
+        }
+        Ok(projected)
     }
 }
 

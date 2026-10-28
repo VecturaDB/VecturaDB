@@ -6783,6 +6783,146 @@ mod tests {
         assert_eq!((adaptive, fixed), (5, 0));
     }
 
+    // A get and a query of a SPANN collection load the blocks of their records and read them at once, as the projection
+    // of distributed Chroma does: each record keeps its document, metadata and embedding, and the records keep the order
+    // of the get, by row, and of the query, by distance.
+    #[tokio::test]
+    async fn spann_reads_answer_each_record_with_its_data_in_order() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = frontend
+            .create_collection(
+                CreateCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    "projection".to_string(),
+                    None,
+                    None,
+                    Some(Schema::new_default(KnnIndex::Spann)),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collection_id;
+        let embedding = |i: usize| vec![i as f32, (i as f32).sin()];
+        let metadata = |i: usize| {
+            chroma_types::Metadata::from([
+                ("i".to_string(), MetadataValue::Int(i as i64)),
+                ("s".to_string(), MetadataValue::Str(format!("v{i}"))),
+            ])
+        };
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    (0..300).map(|i| format!("r{i}")).collect(),
+                    (0..300).map(embedding).collect(),
+                    Some((0..300).map(|i| Some(format!("document r{i}"))).collect()),
+                    None,
+                    Some((0..300).map(|i| Some(metadata(i))).collect()),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let number = |id: &str| id[1..].parse::<usize>().unwrap();
+        let get = frontend
+            .get(
+                GetRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    None,
+                    None,
+                    None,
+                    0,
+                    chroma_types::IncludeList(vec![
+                        chroma_types::Include::Document,
+                        chroma_types::Include::Metadata,
+                        chroma_types::Include::Embedding,
+                    ]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            get.ids,
+            (0..300).map(|i| format!("r{i}")).collect::<Vec<_>>()
+        );
+        let documents = get.documents.unwrap();
+        let metadatas = get.metadatas.unwrap();
+        let embeddings = get.embeddings.unwrap();
+        for (at, id) in get.ids.iter().enumerate() {
+            let i = number(id);
+            assert_eq!(documents[at], Some(format!("document r{i}")), "{id}");
+            assert_eq!(metadatas[at], Some(metadata(i)), "{id}");
+            assert_eq!(embeddings[at], embedding(i), "{id}");
+        }
+        for include in [
+            vec![
+                chroma_types::Include::Document,
+                chroma_types::Include::Metadata,
+                chroma_types::Include::Embedding,
+                chroma_types::Include::Distance,
+            ],
+            vec![chroma_types::Include::Distance],
+        ] {
+            let query = frontend
+                .query(
+                    QueryRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection_id,
+                        None,
+                        None,
+                        vec![embedding(150)],
+                        20,
+                        chroma_types::IncludeList(include.clone()),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let ids = &query.ids[0];
+            assert_eq!(ids.len(), 20, "{include:?}");
+            assert_eq!(ids[0], "r150", "{include:?}");
+            let distances = query.distances.unwrap()[0]
+                .iter()
+                .map(|distance| distance.unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                distances.windows(2).all(|pair| pair[0] <= pair[1]),
+                "{include:?}: {distances:?}"
+            );
+            // Each record comes with its own distance, the squared distance of its embedding to the query in the space
+            // l2 of the collection: a record in the place of another has the distance of the other.
+            for (at, id) in ids.iter().enumerate() {
+                let (record, target) = (embedding(number(id)), embedding(150));
+                let expected = (record[0] - target[0]).powi(2) + (record[1] - target[1]).powi(2);
+                assert!(
+                    (distances[at] - expected).abs() <= 1e-3 * expected.max(1.0),
+                    "{include:?}: {id} at {at} has the distance {}, not {expected}",
+                    distances[at]
+                );
+            }
+            if let (Some(documents), Some(metadatas), Some(embeddings)) =
+                (query.documents, query.metadatas, query.embeddings)
+            {
+                for (at, id) in ids.iter().enumerate() {
+                    let i = number(id);
+                    assert_eq!(documents[0][at], Some(format!("document r{i}")), "{id}");
+                    assert_eq!(metadatas[0][at], Some(metadata(i)), "{id}");
+                    assert_eq!(embeddings[0][at], Some(embedding(i)), "{id}");
+                }
+            }
+        }
+    }
+
     // A write to a SPANN collection whose last flush cannot be read is rejected before it reaches the log, as a write to
     // an HNSW collection whose index cannot be read: once the files are back, nothing of it is there.
     #[tokio::test]
