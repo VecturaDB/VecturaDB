@@ -1145,8 +1145,13 @@ impl SqliteMetadataReader {
     }
 
     pub async fn get(&self, plan: Get) -> Result<GetResult, SqliteMetadataError> {
-        let mut conn = self.db.get_conn().acquire().await?;
-        self.get_with_connection(plan, &mut conn).await
+        // Every query of a get in one read transaction, as a search: the get reads one moment of the collection, and its
+        // queries, one more for each 500 records for their sparse vectors, take the lock of SQLite once instead of once
+        // each.
+        let mut tx = self.db.get_conn().begin().await?;
+        let result = self.get_with_connection(plan, &mut tx).await?;
+        tx.commit().await?;
+        Ok(result)
     }
 
     async fn get_with_connection(
@@ -1222,6 +1227,8 @@ impl SqliteMetadataReader {
         let (sql, values) = projection_query.build_sqlx(SqliteQueryBuilder);
 
         let rows = sqlx::query_with(&sql, values).fetch_all(&mut *conn).await?;
+        #[cfg(test)]
+        stop_get(&collection_and_segments.metadata_segment.id).await;
 
         let mut records = BTreeMap::new();
 
@@ -1915,6 +1922,32 @@ impl SqliteMetadataReader {
             });
         }
         Ok(SearchPayloadResult { records: selected })
+    }
+}
+
+/// Test hook: the gets of the metadata segments that a test stops after their first query, until it lets them go on.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static STOP_GET: std::sync::Mutex<
+    Vec<(
+        chroma_types::SegmentUuid,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+async fn stop_get(segment: &chroma_types::SegmentUuid) {
+    let stop = {
+        let mut stops = STOP_GET.lock().unwrap();
+        stops
+            .iter()
+            .position(|(id, _, _)| id == segment)
+            .map(|at| stops.remove(at))
+    };
+    if let Some((_, stopped, go_on)) = stop {
+        let _ = stopped.send(());
+        let _ = go_on.await;
     }
 }
 
@@ -3147,6 +3180,52 @@ mod tests {
                 ))
             );
         }
+    }
+
+    // Every query of a get runs in one read transaction: stopped after its first query, the get still holds SQLite, so that
+    // a write from another connection cannot commit before the get ends (with no busy timeout it fails at once), and the
+    // get answers the records of the moment it started, its sparse vectors included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_get_runs_its_queries_in_one_read_transaction() {
+        let mut log = sparse_log(1, "r0", Operation::Add, Some(sparse_value(1.0)));
+        log.record
+            .metadata
+            .as_mut()
+            .unwrap()
+            .insert("i".into(), UpdateMetadataValue::Int(0));
+        let (reader, cas) = setup_with_logs(vec![log]).await;
+        let (stopped_tx, stopped) = tokio::sync::oneshot::channel();
+        let (go_on, waiting) = tokio::sync::oneshot::channel();
+        super::STOP_GET
+            .lock()
+            .unwrap()
+            .push((cas.metadata_segment.id, stopped_tx, waiting));
+        let get = tokio::spawn({
+            let reader = reader.clone();
+            let plan = make_get_plan(&cas, None);
+            async move { reader.get(plan).await }
+        });
+        stopped.await.unwrap();
+        let mut writer = reader.db.get_conn().acquire().await.unwrap();
+        sqlx::query("PRAGMA busy_timeout = 0")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let write = sqlx::query("UPDATE embedding_metadata SET int_value = 1 WHERE key = 'i'")
+            .execute(&mut *writer)
+            .await;
+        let _ = go_on.send(());
+        let records = get.await.unwrap().unwrap().result.records;
+        assert!(
+            write.is_err(),
+            "a write committed while the get was stopped: {write:?}"
+        );
+        let metadata = records[0].metadata.as_ref().unwrap();
+        assert_eq!(metadata.get("i"), Some(&MetadataValue::Int(0)));
+        assert!(matches!(
+            metadata.get("sparse"),
+            Some(MetadataValue::SparseVector(_))
+        ));
     }
 
     #[tokio::test]

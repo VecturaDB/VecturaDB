@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 FROM python:3.11-slim-bookworm AS builder
 ARG REBUILD_HNSWLIB
 ARG PROTOC_VERSION=31.1
@@ -48,6 +49,7 @@ WORKDIR /chroma
 
 # Copy only package build inputs so unrelated repository files do not
 # invalidate the wheel build layer.
+COPY ./.cargo ./.cargo
 COPY ./Cargo.toml ./Cargo.toml
 COPY ./Cargo.lock ./Cargo.lock
 COPY ./LICENSE ./LICENSE

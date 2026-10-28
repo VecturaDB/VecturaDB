@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use crate::config::{MigrationHash, MigrationMode, SqliteDBConfig};
 use crate::migrations::{GetSourceMigrationsError, Migration, MigrationDir, MIGRATION_DIRS};
 use chroma_error::{ChromaError, ErrorCodes};
@@ -384,6 +385,25 @@ mod tests {
             .expect("Expect it to be fetched");
         let name: String = row.get("name");
         assert_eq!(name, "migrations");
+    }
+
+    // Each connection keeps its own page cache: built with SQLITE_ENABLE_MEMORY_MANAGEMENT, as libsqlite3-sys builds it
+    // unless .cargo/config.toml says otherwise, SQLite shares one page cache among all the connections of the process,
+    // and a connection whose share another one has taken drops each page right after reading it.
+    #[tokio::test]
+    async fn each_connection_keeps_its_own_page_cache() {
+        let db = test_utils::get_new_sqlite_db().await;
+        let options: Vec<String> =
+            sqlx::query_scalar("SELECT compile_options FROM pragma_compile_options")
+                .fetch_all(&db.conn)
+                .await
+                .unwrap();
+        assert!(
+            !options
+                .iter()
+                .any(|option| option == "ENABLE_MEMORY_MANAGEMENT"),
+            "{options:?}"
+        );
     }
 
     #[tokio::test]
