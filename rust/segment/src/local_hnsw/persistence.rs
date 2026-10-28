@@ -3,7 +3,7 @@
 use std::{
     collections::HashSet,
     fs::File,
-    io::{self, BufReader, Read, Seek, SeekFrom},
+    io::{self, BufReader, Cursor, Read, Seek, SeekFrom},
     mem::size_of,
     path::Path,
 };
@@ -170,6 +170,23 @@ fn u32_from(reader: &mut impl Read) -> io::Result<u32> {
     Ok(u32::from_ne_bytes(bytes))
 }
 
+// data_level0.bin is read in pieces of this size, not in the 8 KB of a BufReader: on a folder shared from another
+// system, such as a bind mount of Docker Desktop or a network file system, each read is a round trip. Pieces rather
+// than the whole file, as the purge also checks the checkpoint of an index that is loaded in memory.
+const DATA_LEVEL0_PIECE: usize = 8 << 20;
+
+/// The first `len` bytes of a file, read at once.
+fn read_whole(mut file: File, len: u64) -> io::Result<Vec<u8>> {
+    let len = usize::try_from(len).map_err(|_| invalid())?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    bytes.resize(len, 0);
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Inspect the complete header, payload lengths, native labels and pickle maps.
 /// Inspection never repairs files. A missing pickle is reported as requiring recovery.
 pub fn inspect_persisted_hnsw_index(path: &Path) -> io::Result<PersistedHnswIndex> {
@@ -297,16 +314,16 @@ fn validate_files_with_construction(
         return Err(invalid());
     }
     let dimensionality = vector_bytes / size_of::<f32>();
-    let mut data = BufReader::new(File::open(path.join("data_level0.bin"))?);
+    let data = File::open(path.join("data_level0.bin"))?;
     let lengths = File::open(path.join("length.bin"))?;
-    let mut links = BufReader::new(File::open(path.join("link_lists.bin"))?);
+    let links = File::open(path.join("link_lists.bin"))?;
     let data_bytes = elements.checked_mul(stride).ok_or_else(invalid)?;
     let length_bytes = elements.checked_mul(size_of::<f32>()).ok_or_else(invalid)?;
-    if data.get_ref().metadata()?.len() < data_bytes as u64
-        || lengths.metadata()?.len() < length_bytes as u64
+    if data.metadata()?.len() < data_bytes as u64 || lengths.metadata()?.len() < length_bytes as u64
     {
         return Err(invalid());
     }
+    let mut data = BufReader::with_capacity(data_bytes.min(DATA_LEVEL0_PIECE), data);
     if let Some(map) = metadata {
         if map.dimensionality.is_some_and(|dim| dim != dimensionality)
             || map.id_to_label.len() != map.label_to_id.len()
@@ -323,7 +340,14 @@ fn validate_files_with_construction(
         .checked_mul(4)
         .and_then(|n| n.checked_add(4))
         .ok_or_else(invalid)?;
-    let links_length = links.get_ref().metadata()?.len();
+    let links_length = links.metadata()?.len();
+    // In memory up to what the check below can read, a few bytes for each element: through a BufReader, each seek of
+    // the check of the upper levels would read it again.
+    let links_read = (max_level.max(0) as usize)
+        .saturating_mul(upper_level_bytes)
+        .saturating_add(4)
+        .saturating_mul(elements);
+    let mut links = Cursor::new(read_whole(links, links_length.min(links_read as u64))?);
     let mut labels = HashSet::new();
     let mut recovery_required = metadata.is_none() && elements != 0;
     let mut max_label = 0;
