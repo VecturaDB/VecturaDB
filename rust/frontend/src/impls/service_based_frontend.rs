@@ -5903,11 +5903,25 @@ mod tests {
                 wrong
             }
         };
-        let ((), mut wrong, searched, got) = tokio::join!(writer, queries, searches, gets);
+        // A read that waits for a write that waits for it stops both until the busy timeout of SQLite, 1000 s: the test
+        // fails long before.
+        let Ok(((), mut wrong, searched, got)) =
+            tokio::time::timeout(READS_DURING_WRITES_WAIT, async {
+                tokio::join!(writer, queries, searches, gets)
+            })
+            .await
+        else {
+            return vec![format!(
+                "the reads and the writes did not end within {READS_DURING_WRITES_WAIT:?}"
+            )];
+        };
         wrong.extend(searched);
         wrong.extend(got);
         wrong
     }
+
+    // How long the reads during writes may take: many times what they take, far below the busy timeout of SQLite.
+    const READS_DURING_WRITES_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
 
     // Reads of a SPANN collection see one moment of it, while another request writes it: the records of SQLite and the
     // SPANN files of the same flush. A write commits SQLite first and then flushes SPANN, hundreds of ms later.

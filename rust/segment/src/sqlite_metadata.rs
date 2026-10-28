@@ -158,7 +158,11 @@ impl DenseVectorReader for LocalHnswSegmentReader {
     }
 }
 
-/// A read of the metadata at one moment: see SqliteMetadataReader::snapshot.
+/// A read of the metadata at one moment: see SqliteMetadataReader::snapshot. The single node keeps the rollback journal
+/// of SQLite, which sqlx does not change, so the read transaction holds its shared lock until it ends, and the commit of
+/// a writer waits for it. A writer that waits keeps new readers out: a second connection that reads while a snapshot is
+/// open waits for the writer that waits for the snapshot, up to the busy timeout of 1000 s (rust/sqlite/src/config.rs).
+/// Every read inside a snapshot goes through it.
 pub struct MetadataSnapshot {
     tx: Transaction<'static, Sqlite>,
 }
