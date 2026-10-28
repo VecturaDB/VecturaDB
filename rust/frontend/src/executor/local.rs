@@ -1,6 +1,7 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
 use super::config::{LocalExecutorConfig, RetryConfig};
 use async_trait::async_trait;
+use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder};
 use chroma_config::{registry::Registry, Configurable};
 use chroma_distance::{normalize, DistanceFunction};
 use chroma_error::{ChromaError, ErrorCodes};
@@ -183,19 +184,15 @@ impl LocalExecutor {
         Fut: Future<Output = Result<Count, Box<dyn ChromaError>>>,
     {
         if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
-            // A read that finds the files of its flush removed reads again, as a get does.
+            // A read that fails with an error that distributed Chroma retries reads again, as a get does.
+            let mut delays = spann_backoff();
             let mut plan = plan;
-            for _ in 0..RetryConfig::default().max_attempts {
+            loop {
                 match Box::pin(self.spann_count(plan.clone())).await {
-                    Err(err) if err.code() == ErrorCodes::NotFound => {
-                        plan = replan(tonic::Code::NotFound)
-                            .await
-                            .map_err(ExecutorError::Internal)?;
-                    }
+                    Err(err) => plan = spann_replan(err, &mut delays, &replan).await?,
                     result => return result,
                 }
             }
-            return Box::pin(self.spann_count(plan)).await;
         }
         self.try_backfill_collection(&plan.scan.collection_and_segments)
             .await?;
@@ -298,21 +295,17 @@ impl LocalExecutor {
         Fut: Future<Output = Result<Get, Box<dyn ChromaError>>>,
     {
         if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
-            // As the executor of distributed Chroma (distributed.rs): a read that finds the files of its flush removed,
-            // NotFound, reads again at once from the plan that the frontend gives back, as many times as the retry
-            // config of that executor allows by default.
+            // As the executor of distributed Chroma (distributed.rs): a read that fails with an error it retries, as the
+            // NotFound of the files of its flush that later flushes removed, reads again from the plan that the frontend
+            // gives back.
+            let mut delays = spann_backoff();
             let mut plan = plan;
-            for _ in 0..RetryConfig::default().max_attempts {
+            loop {
                 match Box::pin(self.spann_get(plan.clone())).await {
-                    Err(err) if err.code() == ErrorCodes::NotFound => {
-                        plan = replan(tonic::Code::NotFound)
-                            .await
-                            .map_err(ExecutorError::Internal)?;
-                    }
+                    Err(err) => plan = spann_replan(err, &mut delays, &replan).await?,
                     result => return result,
                 }
             }
-            return Box::pin(self.spann_get(plan)).await;
         }
         let collection_and_segments = plan.scan.collection_and_segments.clone();
         let hnsw_reader = self
@@ -469,19 +462,15 @@ impl LocalExecutor {
         Fut: Future<Output = Result<Knn, Box<dyn ChromaError>>>,
     {
         if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
-            // A read that finds the files of its flush removed reads again, as a get does.
+            // A read that fails with an error that distributed Chroma retries reads again, as a get does.
+            let mut delays = spann_backoff();
             let mut plan = plan;
-            for _ in 0..RetryConfig::default().max_attempts {
+            loop {
                 match Box::pin(self.spann_knn(plan.clone())).await {
-                    Err(err) if err.code() == ErrorCodes::NotFound => {
-                        plan = replan(tonic::Code::NotFound)
-                            .await
-                            .map_err(ExecutorError::Internal)?;
-                    }
+                    Err(err) => plan = spann_replan(err, &mut delays, &replan).await?,
                     result => return result,
                 }
             }
-            return Box::pin(self.spann_knn(plan)).await;
         }
         let collection_and_segments = plan.scan.collection_and_segments.clone();
         let hnsw_reader = self
@@ -745,6 +734,8 @@ impl LocalExecutor {
     ) -> Result<Option<RecordSegmentReaderShard<'_>>, ExecutorError> {
         #[cfg(test)]
         stop_before_files(collection_and_segments.collection.collection_id).await;
+        #[cfg(test)]
+        fail_before_files(collection_and_segments.collection.collection_id)?;
         let Some(provider) = self.hnsw_manager.spann_provider() else {
             return Ok(None);
         };
@@ -896,19 +887,15 @@ impl LocalExecutor {
         Fut: Future<Output = Result<Search, Box<dyn ChromaError>>>,
     {
         if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
-            // A read that finds the files of its flush removed reads again, as a get does.
+            // A read that fails with an error that distributed Chroma retries reads again, as a get does.
+            let mut delays = spann_backoff();
             let mut plan = plan;
-            for _ in 0..RetryConfig::default().max_attempts {
+            loop {
                 match Box::pin(self.spann_search(plan.clone())).await {
-                    Err(err) if err.code() == ErrorCodes::NotFound => {
-                        plan = replan(tonic::Code::NotFound)
-                            .await
-                            .map_err(ExecutorError::Internal)?;
-                    }
+                    Err(err) => plan = spann_replan(err, &mut delays, &replan).await?,
                     result => return result,
                 }
             }
-            return Box::pin(self.spann_search(plan)).await;
         }
         // Every read level reads the same records: the local writes reach the indexes before they are acknowledged,
         // and the replay below applies any write a previous process left in the log.
@@ -962,6 +949,44 @@ impl LocalExecutor {
         self.hnsw_manager.reset().await.map_err(|err| err.boxed())?;
         Ok(())
     }
+}
+
+// The backoff of the reads of SPANN collections: that of the executor of distributed Chroma, from its retry config by
+// default.
+fn spann_backoff() -> ExponentialBackoff {
+    ExponentialBuilder::from(&RetryConfig::default()).build()
+}
+
+// After a failed read of a SPANN collection, the plan to read again, as the executor of distributed Chroma decides it
+// (is_retryable_error and its retries in distributed.rs): on the errors it retries, after the next delay of the backoff,
+// or at once after a NotFound, the plan that the frontend gives back for that error; on any other error, or once the
+// backoff is over, the error.
+async fn spann_replan<P, F, Fut>(
+    err: ExecutorError,
+    delays: &mut ExponentialBackoff,
+    replan: &F,
+) -> Result<P, ExecutorError>
+where
+    F: Fn(tonic::Code) -> Fut,
+    Fut: Future<Output = Result<P, Box<dyn ChromaError>>>,
+{
+    let code = err.code();
+    let retried = matches!(
+        code,
+        ErrorCodes::Unavailable
+            | ErrorCodes::DeadlineExceeded
+            | ErrorCodes::Aborted
+            | ErrorCodes::ResourceExhausted
+            | ErrorCodes::NotFound
+            | ErrorCodes::Unknown
+    );
+    let Some(delay) = delays.next().filter(|_| retried) else {
+        return Err(err);
+    };
+    if code != ErrorCodes::NotFound {
+        tokio::time::sleep(delay).await;
+    }
+    replan(code.into()).await.map_err(ExecutorError::Internal)
 }
 
 // The SPANN index of a collection with its record segment, for the KNN of distributed Chroma
@@ -1150,6 +1175,42 @@ async fn stop_before_files(collection_id: chroma_types::CollectionUuid) {
     if let Some(stop) = stop {
         let _ = stop.stopped.send(());
         let _ = stop.go_on.await;
+    }
+}
+
+/// Test hook: the failures of reads of SPANN collections at their opening of the files, so that a test sees which
+/// errors a read takes again. Each opening of the files of a collection takes its first failure, in order.
+#[cfg(test)]
+pub(crate) static FAIL_BEFORE_FILES: std::sync::Mutex<
+    Vec<(chroma_types::CollectionUuid, ErrorCodes)>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// The error of a failure of FAIL_BEFORE_FILES.
+#[cfg(test)]
+#[derive(Debug, thiserror::Error)]
+#[error("failure of a test: {0:?}")]
+pub(crate) struct TestFailure(pub(crate) ErrorCodes);
+
+#[cfg(test)]
+impl ChromaError for TestFailure {
+    fn code(&self) -> ErrorCodes {
+        self.0
+    }
+}
+
+// The failure of FAIL_BEFORE_FILES for the collection, when a test set one.
+#[cfg(test)]
+fn fail_before_files(collection_id: chroma_types::CollectionUuid) -> Result<(), ExecutorError> {
+    let failure = {
+        let mut failures = FAIL_BEFORE_FILES.lock().unwrap();
+        failures
+            .iter()
+            .position(|(id, _)| *id == collection_id)
+            .map(|at| failures.remove(at))
+    };
+    match failure {
+        Some((_, code)) => Err(ExecutorError::Internal(Box::new(TestFailure(code)))),
+        None => Ok(()),
     }
 }
 

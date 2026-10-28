@@ -6521,6 +6521,218 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    // A read of a SPANN collection that reads again ends with the error of its new plan when that plan fails, and asks for
+    // it once: distributed Chroma retries a new plan that fails, so that a read of a collection deleted meanwhile, whose
+    // new plan answers NotFound, reads again there without end.
+    #[tokio::test]
+    async fn a_spann_read_ends_with_the_error_of_a_new_plan_that_fails() {
+        use crate::executor::local::FAIL_BEFORE_FILES;
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        let scan = Scan {
+            collection_and_segments: frontend
+                .sysdb_client
+                .get_collection_with_segments(None, collection_id)
+                .await
+                .unwrap(),
+            shard_index: 0,
+            num_shards: 1,
+            log_upper_bound_offset: 0,
+        };
+        let projection = Projection {
+            document: true,
+            embedding: false,
+            metadata: false,
+        };
+        let ranked = SearchPayload {
+            rank: chroma_types::operator::Rank {
+                expr: Some(chroma_types::operator::RankExpr::Knn {
+                    query: chroma_types::operator::QueryVector::Dense(vec![0.0, 0.0]),
+                    key: chroma_types::operator::Key::Embedding,
+                    limit: 10,
+                    default: None,
+                    return_rank: false,
+                }),
+            },
+            limit: Limit {
+                offset: 0,
+                limit: Some(10),
+            },
+            ..Default::default()
+        };
+        let plans = AtomicUsize::new(0);
+        let mut wrong = Vec::new();
+        for read in [
+            SpannRead::Get,
+            SpannRead::Query,
+            SpannRead::Search,
+            SpannRead::Count,
+        ] {
+            for code in [ErrorCodes::NotFound, ErrorCodes::Unavailable] {
+                FAIL_BEFORE_FILES
+                    .lock()
+                    .unwrap()
+                    .push((collection_id, code));
+                plans.store(0, Ordering::Relaxed);
+                let executor = &mut frontend.executor;
+                let answer = tokio::time::timeout(Duration::from_secs(60), async {
+                    match read {
+                        SpannRead::Get => executor
+                            .get(
+                                Get {
+                                    scan: scan.clone(),
+                                    filter: Filter::default(),
+                                    limit: Limit {
+                                        offset: 0,
+                                        limit: None,
+                                    },
+                                    proj: projection.clone(),
+                                },
+                                plan_that_fails(&plans, collection_id),
+                            )
+                            .await
+                            .map(|_| ()),
+                        SpannRead::Query => executor
+                            .knn(
+                                Knn {
+                                    scan: scan.clone(),
+                                    filter: Filter::default(),
+                                    knn: KnnBatch {
+                                        embeddings: vec![vec![0.0, 0.0]],
+                                        fetch: 10,
+                                    },
+                                    proj: KnnProjection {
+                                        projection: projection.clone(),
+                                        distance: true,
+                                    },
+                                },
+                                plan_that_fails(&plans, collection_id),
+                            )
+                            .await
+                            .map(|_| ()),
+                        SpannRead::Search => executor
+                            .search(
+                                Search {
+                                    scan: scan.clone(),
+                                    payloads: vec![ranked.clone()],
+                                    read_level: Default::default(),
+                                },
+                                plan_that_fails(&plans, collection_id),
+                            )
+                            .await
+                            .map(|_| ()),
+                        SpannRead::Count => executor
+                            .count(
+                                Count {
+                                    scan: scan.clone(),
+                                    read_level: Default::default(),
+                                },
+                                plan_that_fails(&plans, collection_id),
+                            )
+                            .await
+                            .map(|_| ()),
+                    }
+                })
+                .await;
+                match answer {
+                    Ok(Err(err)) if err.code() == ErrorCodes::NotFound => {}
+                    other => wrong.push(format!(
+                        "{read:?}, {code:?}: {other:?}, not the NotFound of the new plan"
+                    )),
+                }
+                let asked = plans.load(Ordering::Relaxed);
+                if asked != 1 {
+                    wrong.push(format!(
+                        "{read:?}, {code:?}: the new plan asked for {asked} times"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // A new plan that fails as that of a collection deleted meanwhile, which counts the times it is asked for.
+    fn plan_that_fails<P>(
+        plans: &AtomicUsize,
+        collection_id: CollectionUuid,
+    ) -> impl Fn(tonic::Code) -> std::future::Ready<Result<P, Box<dyn ChromaError>>> + '_ {
+        move |_| {
+            plans.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Err(GetCollectionWithSegmentsError::NotFound(
+                collection_id.to_string(),
+            )
+            .boxed()))
+        }
+    }
+
+    // A get, a query, a search and a count of a SPANN collection that fail with an error that the executor of distributed
+    // Chroma retries read again, as many times as its retry config allows by default, 5; they answer any other error at
+    // once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_read_reads_again_on_the_errors_distributed_chroma_retries() {
+        use crate::executor::local::FAIL_BEFORE_FILES;
+        use chroma_error::ErrorCodes;
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        let fail = |codes: &[ErrorCodes]| {
+            FAIL_BEFORE_FILES
+                .lock()
+                .unwrap()
+                .extend(codes.iter().map(|code| (collection_id, *code)));
+        };
+        let mut wrong = Vec::new();
+        for read in [
+            SpannRead::Get,
+            SpannRead::Query,
+            SpannRead::Search,
+            SpannRead::Count,
+        ] {
+            for code in [
+                ErrorCodes::Unavailable,
+                ErrorCodes::DeadlineExceeded,
+                ErrorCodes::Aborted,
+                ErrorCodes::ResourceExhausted,
+                ErrorCodes::Unknown,
+                ErrorCodes::NotFound,
+            ] {
+                fail(&[code]);
+                match spann_read(&mut frontend, collection_id, read).await {
+                    Ok(answer) => wrong.extend(
+                        differences_from(&answer, 0)
+                            .into_iter()
+                            .map(|difference| format!("{read:?}, {code:?}: {difference}")),
+                    ),
+                    Err(err) => wrong.push(format!("{read:?}, {code:?}: {err}")),
+                }
+            }
+            fail(&[ErrorCodes::NotFound; 5]);
+            if let Err(err) = spann_read(&mut frontend, collection_id, read).await {
+                wrong.push(format!("{read:?}, five NotFound in a row: {err}"));
+            }
+            fail(&[ErrorCodes::NotFound; 6]);
+            if spann_read(&mut frontend, collection_id, read).await.is_ok() {
+                wrong.push(format!(
+                    "{read:?}, six NotFound in a row: the read answered"
+                ));
+            }
+            fail(&[ErrorCodes::Internal]);
+            if spann_read(&mut frontend, collection_id, read).await.is_ok() {
+                wrong.push(format!("{read:?}, Internal: the read read again"));
+            }
+        }
+        if FAIL_BEFORE_FILES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| *id == collection_id)
+        {
+            wrong.push("failures left that no read took".to_string());
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     // A write to a SPANN collection whose last flush cannot be read is rejected before it reaches the log, as a write to
     // an HNSW collection whose index cannot be read: once the files are back, nothing of it is there.
     #[tokio::test]
