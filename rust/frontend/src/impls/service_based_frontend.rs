@@ -5960,18 +5960,26 @@ mod tests {
         Get,
         Query,
         Search,
+        Count,
     }
 
     // A record as a read answers it: its id, its document and its embedding.
     type ReadRecord = (String, Option<String>, Option<Vec<f32>>);
 
-    // What a read of a SPANN collection answers, by list of records, each list by id: one list for a get or a query, two
-    // for a search, ranked by a KNN and listed without a rank.
+    // What a read of a SPANN collection answers: its lists of records, each list by id, one for a get or a query and
+    // two for a search, ranked by a KNN and listed without a rank; or the number of records, for a count.
+    #[derive(Debug)]
+    enum ReadAnswer {
+        Records(Vec<Vec<ReadRecord>>),
+        Count(u32),
+    }
+
+    // What a read of a SPANN collection answers.
     async fn spann_read(
         frontend: &mut ServiceBasedFrontend,
         collection_id: CollectionUuid,
         read: SpannRead,
-    ) -> Result<Vec<Vec<ReadRecord>>, String> {
+    ) -> Result<ReadAnswer, String> {
         let include = || {
             chroma_types::IncludeList(vec![
                 chroma_types::Include::Document,
@@ -6120,11 +6128,26 @@ mod tests {
                     })
                     .collect()
             }
+            SpannRead::Count => {
+                return frontend
+                    .count(
+                        CountRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            chroma_types::plan::ReadLevel::default(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .map(ReadAnswer::Count)
+                    .map_err(|err| format!("count: {err}"));
+            }
         };
         for answer in &mut answers {
             answer.sort_by(|a, b| a.0.cmp(&b.0));
         }
-        Ok(answers)
+        Ok(ReadAnswer::Records(answers))
     }
 
     // How long a stopped read and the writes around it may take: a few seconds, far below the busy timeout of SQLite.
@@ -6150,11 +6173,21 @@ mod tests {
     }
 
     // The records of each list of an answer that differ from the records after the writes given, and those missing: a
-    // record of one moment with the document or the embedding of another is of none.
-    fn differences_from(answer: &[Vec<ReadRecord>], writes: usize) -> Vec<String> {
+    // record of one moment with the document or the embedding of another is of none. A count answers their number.
+    fn differences_from(answer: &ReadAnswer, writes: usize) -> Vec<String> {
         let expected = records_after(writes);
+        let lists = match answer {
+            ReadAnswer::Records(lists) => lists,
+            ReadAnswer::Count(count) if *count as usize == expected.len() => return Vec::new(),
+            ReadAnswer::Count(count) => {
+                return vec![format!(
+                    "the count answered {count}, not {}",
+                    expected.len()
+                )]
+            }
+        };
         let mut wrong = Vec::new();
-        for (list, records) in answer.iter().enumerate() {
+        for (list, records) in lists.iter().enumerate() {
             wrong.extend(
                 records
                     .iter()
@@ -6172,7 +6205,7 @@ mod tests {
     }
 
     // The task of a read of a SPANN collection.
-    type ReadTask = tokio::task::JoinHandle<Result<Vec<Vec<ReadRecord>>, String>>;
+    type ReadTask = tokio::task::JoinHandle<Result<ReadAnswer, String>>;
 
     // A read of the collection, started and stopped by the executor between its snapshot of SQLite and its files: the
     // sender that lets it go on and the task of the read, or None when it did not stop.
@@ -6355,6 +6388,13 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    // The same for a count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_count_whose_files_two_flushes_removed_answers_for_the_last_flush() {
+        let wrong = read_across_flushes(SpannRead::Count, 2, std::time::Duration::ZERO, 2).await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     // A search of a SPANN collection keeps its snapshot of SQLite through its files, since it numbers the records by
     // their rows of SQLite, and answers for it. A change of SQLite at the stop between that snapshot and the files waits
     // for the search, and while it waits keeps out any new reader of SQLite until it commits: a search that read SQLite
@@ -6423,6 +6463,60 @@ mod tests {
             other => wrong.push(format!(
                 "the change of SQLite did not commit once the search ended: {other:?}"
             )),
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // A count of a SPANN collection counts the records of the record segment, as distributed Chroma does, at the flush of
+    // its snapshot of SQLite: an add and its flush between that snapshot and its files leave its answer as it was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_count_across_a_flush_answers_for_its_snapshot() {
+        use crate::executor::local::{StopBeforeFiles, STOP_BEFORE_FILES};
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        let (stopped, at_stop) = tokio::sync::oneshot::channel();
+        let (go_on, waiting) = tokio::sync::oneshot::channel();
+        STOP_BEFORE_FILES.lock().unwrap().push(StopBeforeFiles {
+            collection_id,
+            stopped,
+            go_on: waiting,
+        });
+        let counting = tokio::spawn({
+            let mut frontend = frontend.clone();
+            async move {
+                frontend
+                    .count(
+                        CountRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            chroma_types::plan::ReadLevel::default(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+            }
+        });
+        let mut wrong = Vec::new();
+        if tokio::time::timeout(STOP_WAIT, at_stop).await.is_err() {
+            wrong.push("the count did not stop before its files".to_string());
+        }
+        if tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+        )
+        .await
+        .is_err()
+        {
+            wrong.push(format!(
+                "the add did not end within {STOP_WAIT:?} while the count stopped"
+            ));
+        }
+        let _ = go_on.send(());
+        match tokio::time::timeout(STOP_WAIT, counting).await {
+            Ok(Ok(Ok(10))) => {}
+            other => wrong.push(format!("the count answered {other:?}, not 10")),
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
     }

@@ -173,22 +173,56 @@ impl LocalExecutor {
 }
 
 impl LocalExecutor {
-    pub async fn count<F, Fut>(&mut self, plan: Count, _: F) -> Result<CountResult, ExecutorError>
+    pub async fn count<F, Fut>(
+        &mut self,
+        plan: Count,
+        replan: F,
+    ) -> Result<CountResult, ExecutorError>
     where
         F: Fn(tonic::Code) -> Fut,
         Fut: Future<Output = Result<Count, Box<dyn ChromaError>>>,
     {
         if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
-            self.spann_replay(&plan.scan.collection_and_segments)
-                .await?;
-        } else {
-            self.try_backfill_collection(&plan.scan.collection_and_segments)
-                .await?;
+            // A read that finds the files of its flush removed reads again, as a get does.
+            let mut plan = plan;
+            for _ in 0..RetryConfig::default().max_attempts {
+                match Box::pin(self.spann_count(plan.clone())).await {
+                    Err(err) if err.code() == ErrorCodes::NotFound => {
+                        plan = replan(tonic::Code::NotFound)
+                            .await
+                            .map_err(ExecutorError::Internal)?;
+                    }
+                    result => return result,
+                }
+            }
+            return Box::pin(self.spann_count(plan)).await;
         }
+        self.try_backfill_collection(&plan.scan.collection_and_segments)
+            .await?;
         self.metadata_reader
             .count(plan)
             .await
             .map_err(|err| ExecutorError::Internal(Box::new(err)))
+    }
+
+    // A count of a SPANN collection as distributed Chroma counts it (rust/worker/src/execution/operators/count_records.rs):
+    // the records of the record segment, at the files of the last flush that a snapshot of SQLite gives before it closes.
+    async fn spann_count(&mut self, plan: Count) -> Result<CountResult, ExecutorError> {
+        let (snapshot, collection_and_segments) = self
+            .spann_snapshot(&plan.scan.collection_and_segments)
+            .await?;
+        snapshot
+            .close()
+            .await
+            .map_err(|err| ExecutorError::Internal(Box::new(err)))?;
+        let count = match Box::pin(self.spann_records(&collection_and_segments)).await? {
+            Some(records) => records.count().await.map_err(ExecutorError::Internal)?,
+            None => 0,
+        };
+        Ok(CountResult {
+            count: count as u32,
+            pulled_log_bytes: 0,
+        })
     }
 
     // Pin the index through replay and the read. A collection-level "backfilled"
@@ -307,9 +341,9 @@ impl LocalExecutor {
 
     // One read of a SPANN collection: its log applied first, then a snapshot of SQLite, which reads the files of the
     // last flush with the records at one moment, as a read of distributed Chroma reads one version of every segment.
-    // The files of a flush never change, and those of a replaced flush stay at least a grace: a get and a query close the
-    // snapshot before they read the files, so that writers commit meanwhile. A search keeps it through its files, since
-    // it numbers the records by their rows of SQLite.
+    // The files of a flush never change, and those of a replaced flush stay at least a grace: a get, a query and a count
+    // close the snapshot before they read the files, so that writers commit meanwhile. A search keeps it through its
+    // files, since it numbers the records by their rows of SQLite.
     async fn spann_snapshot(
         &mut self,
         collection_and_segments: &CollectionAndSegments,
