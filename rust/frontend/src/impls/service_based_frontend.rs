@@ -6339,6 +6339,22 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    // Without a grace, the second of two flushes between the snapshot of a get and its files removes the files of its
+    // moment. The get finds them gone and reads again from a new snapshot, as distributed Chroma does: it answers for the
+    // last flush, without an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_get_whose_files_two_flushes_removed_answers_for_the_last_flush() {
+        let wrong = read_across_flushes(SpannRead::Get, 2, std::time::Duration::ZERO, 2).await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // The same for a query, which reads again as a get does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_query_whose_files_two_flushes_removed_answers_for_the_last_flush() {
+        let wrong = read_across_flushes(SpannRead::Query, 2, std::time::Duration::ZERO, 2).await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     // A search of a SPANN collection keeps its snapshot of SQLite through its files, since it numbers the records by
     // their rows of SQLite, and answers for it. A change of SQLite at the stop between that snapshot and the files waits
     // for the search, and while it waits keeps out any new reader of SQLite until it commits: a search that read SQLite

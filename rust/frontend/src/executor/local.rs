@@ -1,9 +1,9 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
-use super::config::LocalExecutorConfig;
+use super::config::{LocalExecutorConfig, RetryConfig};
 use async_trait::async_trait;
 use chroma_config::{registry::Registry, Configurable};
 use chroma_distance::{normalize, DistanceFunction};
-use chroma_error::ChromaError;
+use chroma_error::{ChromaError, ErrorCodes};
 use chroma_log::{BackfillMessage, LocalCompactionManager, PurgeLogsMessage};
 use chroma_segment::blockfile_record::{
     RecordSegmentReaderOptions, RecordSegmentReaderShard, RecordSegmentReaderShardCreationError,
@@ -258,12 +258,26 @@ impl LocalExecutor {
         Ok(reader)
     }
 
-    pub async fn get<F, Fut>(&mut self, plan: Get, _: F) -> Result<GetResult, ExecutorError>
+    pub async fn get<F, Fut>(&mut self, plan: Get, replan: F) -> Result<GetResult, ExecutorError>
     where
         F: Fn(tonic::Code) -> Fut,
         Fut: Future<Output = Result<Get, Box<dyn ChromaError>>>,
     {
         if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
+            // As the executor of distributed Chroma (distributed.rs): a read that finds the files of its flush removed,
+            // NotFound, reads again at once from the plan that the frontend gives back, as many times as the retry
+            // config of that executor allows by default.
+            let mut plan = plan;
+            for _ in 0..RetryConfig::default().max_attempts {
+                match Box::pin(self.spann_get(plan.clone())).await {
+                    Err(err) if err.code() == ErrorCodes::NotFound => {
+                        plan = replan(tonic::Code::NotFound)
+                            .await
+                            .map_err(ExecutorError::Internal)?;
+                    }
+                    result => return result,
+                }
+            }
             return Box::pin(self.spann_get(plan)).await;
         }
         let collection_and_segments = plan.scan.collection_and_segments.clone();
@@ -411,12 +425,28 @@ impl LocalExecutor {
         Ok(result)
     }
 
-    pub async fn knn<F, Fut>(&mut self, plan: Knn, _: F) -> Result<KnnBatchResult, ExecutorError>
+    pub async fn knn<F, Fut>(
+        &mut self,
+        plan: Knn,
+        replan: F,
+    ) -> Result<KnnBatchResult, ExecutorError>
     where
         F: Fn(tonic::Code) -> Fut,
         Fut: Future<Output = Result<Knn, Box<dyn ChromaError>>>,
     {
         if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
+            // A read that finds the files of its flush removed reads again, as a get does.
+            let mut plan = plan;
+            for _ in 0..RetryConfig::default().max_attempts {
+                match Box::pin(self.spann_knn(plan.clone())).await {
+                    Err(err) if err.code() == ErrorCodes::NotFound => {
+                        plan = replan(tonic::Code::NotFound)
+                            .await
+                            .map_err(ExecutorError::Internal)?;
+                    }
+                    result => return result,
+                }
+            }
             return Box::pin(self.spann_knn(plan)).await;
         }
         let collection_and_segments = plan.scan.collection_and_segments.clone();
@@ -825,13 +855,25 @@ impl LocalExecutor {
     pub async fn search<F, Fut>(
         &mut self,
         plan: Search,
-        _: F,
+        replan: F,
     ) -> Result<SearchResult, ExecutorError>
     where
         F: Fn(tonic::Code) -> Fut,
         Fut: Future<Output = Result<Search, Box<dyn ChromaError>>>,
     {
         if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
+            // A read that finds the files of its flush removed reads again, as a get does.
+            let mut plan = plan;
+            for _ in 0..RetryConfig::default().max_attempts {
+                match Box::pin(self.spann_search(plan.clone())).await {
+                    Err(err) if err.code() == ErrorCodes::NotFound => {
+                        plan = replan(tonic::Code::NotFound)
+                            .await
+                            .map_err(ExecutorError::Internal)?;
+                    }
+                    result => return result,
+                }
+            }
             return Box::pin(self.spann_search(plan)).await;
         }
         // Every read level reads the same records: the local writes reach the indexes before they are acknowledged,
