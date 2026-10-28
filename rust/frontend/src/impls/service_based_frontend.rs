@@ -6733,6 +6733,56 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    // The adaptive number of probes of a SPANN query takes the records of the record segment, as distributed Chroma takes
+    // those of its last compaction, not the offsets that deleted records leave behind; without adaptive probes, the count
+    // is not read.
+    #[tokio::test]
+    async fn the_adaptive_probes_of_spann_take_the_records_of_the_record_segment() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        let mut frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    Some((5..10).map(|i| format!("r{i}")).collect()),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        let segments = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collection_id)
+            .await
+            .unwrap();
+        let manager = registry
+            .get::<chroma_segment::local_segment_manager::LocalSegmentManager>()
+            .unwrap();
+        let provider = manager.spann_provider().unwrap();
+        let shard = chroma_types::SegmentShard::try_from((&segments.record_segment, 0)).unwrap();
+        let records = chroma_segment::blockfile_record::RecordSegmentReaderShard::from_segment(
+            &shard,
+            &provider.blockfile_provider,
+            None,
+        )
+        .await
+        .unwrap();
+        let adaptive = crate::executor::local::spann_probe_records(true, &records)
+            .await
+            .unwrap();
+        let fixed = crate::executor::local::spann_probe_records(false, &records)
+            .await
+            .unwrap();
+        assert_eq!((adaptive, fixed), (5, 0));
+    }
+
     // A write to a SPANN collection whose last flush cannot be read is rejected before it reaches the log, as a write to
     // an HNSW collection whose index cannot be read: once the files are back, nothing of it is there.
     #[tokio::test]

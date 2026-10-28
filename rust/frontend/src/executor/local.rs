@@ -800,6 +800,7 @@ impl LocalExecutor {
             reader,
             records,
             distance_function: DistanceFunction::from(space),
+            adaptive: provider.adaptive_search_nprobe,
         }))
     }
 
@@ -996,6 +997,21 @@ struct SpannVectors<'me> {
     reader: SpannSegmentReaderShard<'me>,
     records: RecordSegmentReaderShard<'me>,
     distance_function: DistanceFunction,
+    adaptive: bool,
+}
+
+// The records of a SPANN collection for the adaptive number of probes of a query, which distributed Chroma takes from the
+// count of its last compaction (total_records_post_compaction): the count of the record segment, read only when the probes
+// adapt, since their number does not depend on it otherwise.
+pub(crate) async fn spann_probe_records(
+    adaptive: bool,
+    records: &RecordSegmentReaderShard<'_>,
+) -> Result<usize, Box<dyn ChromaError>> {
+    if adaptive {
+        records.count().await
+    } else {
+        Ok(0)
+    }
 }
 
 impl SpannVectors<'_> {
@@ -1030,8 +1046,7 @@ impl SpannVectors<'_> {
         } else {
             query
         };
-        // An upper bound of the records, for the adaptive number of probes; the SQLite catalog keeps no count.
-        let collection_size = self.records.get_max_offset_id() as usize;
+        let collection_size = spann_probe_records(self.adaptive, &self.records).await?;
         let (centers, _, _) = self
             .reader
             .rng_query(&query, collection_size, k as usize)
