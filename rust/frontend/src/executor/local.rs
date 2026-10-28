@@ -126,6 +126,10 @@ impl LocalExecutor {
             ) {
                 continue;
             }
+            if segment.r#type == SegmentType::Spann {
+                self.hnsw_manager
+                    .set_spann_applied(segment.collection, false);
+            }
             match self.hnsw_manager.delete_hnsw_index_files(segment.id).await {
                 Ok(true) => removed.push(segment.id),
                 Ok(false) => {}
@@ -161,8 +165,13 @@ impl LocalExecutor {
         F: Fn(tonic::Code) -> Fut,
         Fut: Future<Output = Result<Count, Box<dyn ChromaError>>>,
     {
-        self.try_backfill_collection(&plan.scan.collection_and_segments)
-            .await?;
+        if plan.scan.collection_and_segments.vector_segment.r#type == SegmentType::Spann {
+            self.spann_replay(&plan.scan.collection_and_segments)
+                .await?;
+        } else {
+            self.try_backfill_collection(&plan.scan.collection_and_segments)
+                .await?;
+        }
         self.metadata_reader
             .count(plan)
             .await
@@ -276,8 +285,7 @@ impl LocalExecutor {
         &mut self,
         collection_and_segments: &CollectionAndSegments,
     ) -> Result<(MetadataSnapshot, CollectionAndSegments), ExecutorError> {
-        self.try_backfill_collection(collection_and_segments)
-            .await?;
+        self.spann_replay(collection_and_segments).await?;
         let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
         let mut snapshot = self.metadata_reader.snapshot().await.map_err(internal)?;
         let mut files = snapshot
@@ -292,6 +300,22 @@ impl LocalExecutor {
             .remove(&collection_and_segments.vector_segment.id.to_string())
             .unwrap_or_default();
         Ok((snapshot, collection_and_segments))
+    }
+
+    // The log of a SPANN collection replayed, unless the compaction has applied all of it: a read of an HNSW index
+    // replays nothing once its replay is complete, the same.
+    async fn spann_replay(
+        &mut self,
+        collection_and_segments: &CollectionAndSegments,
+    ) -> Result<(), ExecutorError> {
+        if !self
+            .hnsw_manager
+            .spann_applied(collection_and_segments.collection.collection_id)
+        {
+            self.try_backfill_collection(collection_and_segments)
+                .await?;
+        }
+        Ok(())
     }
 
     // A get of a SPANN collection: the records of SQLite and their embeddings from the record segment, at one moment.

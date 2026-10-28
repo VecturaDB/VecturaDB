@@ -20,7 +20,9 @@ use chroma_index::{
 };
 use chroma_sqlite::db::SqliteDb;
 use chroma_storage::{local::LocalStorage, Storage};
-use chroma_types::{Collection, Segment, SegmentUuid, HNSW_PATH, USER_ID_BLOOM_FILTER};
+use chroma_types::{
+    Collection, CollectionUuid, Segment, SegmentUuid, HNSW_PATH, USER_ID_BLOOM_FILTER,
+};
 use sea_query_binder::SqlxBinder;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -66,6 +68,8 @@ pub struct LocalSegmentManager {
     sqlite: SqliteDb,
     persist_root: Option<String>,
     spann_provider: Option<SpannProvider>,
+    // The SPANN collections whose log is applied: see spann_applied.
+    spann_applied: Arc<std::sync::Mutex<HashSet<CollectionUuid>>>,
 }
 
 #[derive(Error, Debug)]
@@ -232,6 +236,7 @@ impl Configurable<LocalSegmentManagerConfig> for LocalSegmentManager {
             sqlite: sqldb,
             persist_root: config.persist_path.clone(),
             spann_provider,
+            spann_applied: Arc::default(),
         };
         if res.persist_root.is_some() {
             let cleaner = res.clone();
@@ -367,6 +372,29 @@ impl LocalSegmentManager {
     /// The providers of SPANN segments, on the data path; none without one.
     pub fn spann_provider(&self) -> Option<&SpannProvider> {
         self.spann_provider.as_ref()
+    }
+
+    /// Whether the log of a SPANN collection is applied, as replay_complete for a local HNSW index: the compaction
+    /// clears it when it starts on the log of the collection and sets it once the records are in SQLite and in the files
+    /// of a flush. A read of a collection whose log is applied has nothing to replay. None is applied after a start.
+    pub fn spann_applied(&self, collection_id: CollectionUuid) -> bool {
+        self.spann_applied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&collection_id)
+    }
+
+    /// Sets whether the log of a SPANN collection is applied; a deleted collection is forgotten so.
+    pub fn set_spann_applied(&self, collection_id: CollectionUuid, applied: bool) {
+        let mut collections = self
+            .spann_applied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if applied {
+            collections.insert(collection_id);
+        } else {
+            collections.remove(&collection_id);
+        }
     }
 
     pub async fn get_hnsw_writer(

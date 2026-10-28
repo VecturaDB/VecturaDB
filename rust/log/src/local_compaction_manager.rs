@@ -248,12 +248,23 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
                     .map_err(CompactionManagerError::SchemaReconcileError)?,
             );
         }
+        let spann = collection_and_segments.vector_segment.r#type == SegmentType::Spann;
+        if spann {
+            // Until the log is applied again, a read of the collection replays it.
+            self.hnsw_segment_manager
+                .set_spann_applied(message.collection_id, false);
+        }
         // If collection is uninitialized, that means nothing has been written yet.
         let dim = match collection_and_segments.collection.dimension {
             Some(dim) => dim,
-            None => return Ok(()),
+            None => {
+                if spann {
+                    self.hnsw_segment_manager
+                        .set_spann_applied(message.collection_id, true);
+                }
+                return Ok(());
+            }
         };
-        let spann = collection_and_segments.vector_segment.r#type == SegmentType::Spann;
         let hnsw_reader = if spann {
             Err(LocalSegmentManagerError::LocalHnswSegmentReaderError(
                 LocalHnswSegmentReaderError::UninitializedSegment,
@@ -418,6 +429,8 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
                     }
                 }
             }
+            self.hnsw_segment_manager
+                .set_spann_applied(message.collection_id, true);
             return Ok(());
         }
         // Next apply it to the hnsw writer.

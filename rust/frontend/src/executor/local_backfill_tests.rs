@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use super::*;
 use chroma_log::{
     local_compaction_manager::LocalCompactionManagerConfig, sqlite_log::SqliteLog, Log,
@@ -600,4 +601,97 @@ async fn repeated_reads_skip_replay_and_inspection_but_eviction_replays_tail() {
         "reload replays the unpersisted tail without reinspecting a checkpoint with no purge work"
     );
     f.stop().await;
+}
+
+// As for an HNSW collection, repeated reads of a SPANN collection with nothing new in its log do no replay. A replay goes
+// through the compactor, behind the writes of every collection, and reads the catalog and the log.
+#[tokio::test]
+async fn repeated_reads_of_a_spann_collection_skip_replay() {
+    use chroma_types::{
+        AddCollectionRecordsRequest, CountRequest, CreateCollectionRequest, DatabaseName,
+        GetRequest,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let registry = Registry::new();
+    let metrics = MetricCapture::new(&registry);
+    let mut config = crate::config::FrontendConfig::sqlite_in_memory();
+    config.sqlitedb.as_mut().unwrap().url =
+        Some(root.path().join("chroma.sqlite3").to_str().unwrap().into());
+    config.segment_manager.as_mut().unwrap().persist_path =
+        Some(root.path().to_str().unwrap().into());
+    config.executor =
+        super::super::config::ExecutorConfig::Local(super::super::config::LocalExecutorConfig {
+            spann: true,
+        });
+    let mut frontend = crate::impls::service_based_frontend::ServiceBasedFrontend::try_from_config(
+        &(config, System::new()),
+        &registry,
+    )
+    .await
+    .unwrap();
+    let collection_id = frontend
+        .create_collection(
+            CreateCollectionRequest::try_new(
+                "default_tenant".to_string(),
+                DatabaseName::new("default_database").unwrap(),
+                "spann-replays".to_string(),
+                None,
+                None,
+                Some(Schema::new_default(KnnIndex::Spann)),
+                false,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .collection_id;
+    frontend
+        .add(
+            AddCollectionRecordsRequest::try_new(
+                "default_tenant".to_string(),
+                "default_database".to_string(),
+                collection_id,
+                (0..10).map(|i| format!("r{i}")).collect(),
+                (0..10).map(|i| vec![i as f32, 1.0]).collect(),
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let get = || {
+        GetRequest::try_new(
+            "default_tenant".to_string(),
+            "default_database".to_string(),
+            collection_id,
+            None,
+            None,
+            None,
+            0,
+            chroma_types::IncludeList(vec![chroma_types::Include::Embedding]),
+        )
+        .unwrap()
+    };
+    let count = || {
+        CountRequest::try_new(
+            "default_tenant".to_string(),
+            "default_database".to_string(),
+            collection_id,
+            chroma_types::plan::ReadLevel::default(),
+        )
+        .unwrap()
+    };
+    assert_eq!(frontend.get(get()).await.unwrap().ids.len(), 10);
+    let before = metrics.counts().0;
+    for _ in 0..5 {
+        assert_eq!(frontend.get(get()).await.unwrap().ids.len(), 10);
+        assert_eq!(frontend.count(count()).await.unwrap(), 10);
+    }
+    assert_eq!(
+        metrics.counts().0,
+        before,
+        "reads with nothing new in the log must do no replay"
+    );
 }
