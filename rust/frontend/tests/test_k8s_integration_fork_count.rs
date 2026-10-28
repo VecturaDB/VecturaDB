@@ -1,4 +1,5 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
+#![recursion_limit = "256"]
 //! K8s integration tests for fork count functionality.
 //!
 //! These tests require a deployed Chroma cluster with gRPC sysdb.

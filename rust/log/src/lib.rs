@@ -1,3 +1,5 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
+#![recursion_limit = "256"]
 pub mod config;
 pub mod grpc_log;
 pub mod in_memory_log;

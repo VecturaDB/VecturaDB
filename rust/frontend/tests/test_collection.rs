@@ -1,3 +1,5 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
+#![recursion_limit = "256"]
 use proptest_helpers::{
     frontend_reference::{FrontendReferenceState, FrontendReferenceStateMachine},
     frontend_under_test::FrontendUnderTest,
