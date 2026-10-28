@@ -6747,6 +6747,411 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    // The local executor of a frontend of the single node.
+    fn local_executor(frontend: &ServiceBasedFrontend) -> &crate::executor::local::LocalExecutor {
+        match &frontend.executor {
+            crate::executor::Executor::Local(local) => local,
+            _ => unreachable!("a frontend of the single node"),
+        }
+    }
+
+    // The openings after a flush that ended for the collection: the files of each, and whether it opened them.
+    fn warm_ups(
+        collection_id: CollectionUuid,
+    ) -> Vec<(std::collections::HashMap<String, Vec<String>>, bool)> {
+        crate::executor::local::WARMED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _, _)| *id == collection_id)
+            .map(|(_, files, opened)| (files.clone(), *opened))
+            .collect()
+    }
+
+    // Whether an opening after a flush ran or runs for the collection.
+    fn warm_up_seen(frontend: &ServiceBasedFrontend, collection_id: CollectionUuid) -> bool {
+        local_executor(frontend).spann_warm_up_runs(collection_id)
+            || !warm_ups(collection_id).is_empty()
+    }
+
+    // The end of the openings after a flush of the collection.
+    fn warm_up_end(collection_id: CollectionUuid) -> tokio::sync::oneshot::Receiver<()> {
+        let (end, ended) = tokio::sync::oneshot::channel();
+        crate::executor::local::WARM_UP_ENDS
+            .lock()
+            .unwrap()
+            .push((collection_id, end));
+        ended
+    }
+
+    // A stop of the next opening after a flush of the collection, before its files: the signal of its stop, and the way
+    // to let it go on.
+    fn stop_warm_up(
+        collection_id: CollectionUuid,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (stopped_tx, stopped) = tokio::sync::oneshot::channel();
+        let (go_on, waiting) = tokio::sync::oneshot::channel();
+        crate::executor::local::STOP_WARM_UP.lock().unwrap().push(
+            crate::executor::local::StopBeforeFiles {
+                collection_id,
+                stopped: stopped_tx,
+                go_on: waiting,
+            },
+        );
+        (stopped, go_on)
+    }
+
+    // The files of the record segment of a collection at its last flush, and the files of the roots of its blockfiles
+    // under the data path.
+    async fn record_roots(
+        frontend: &mut ServiceBasedFrontend,
+        root: &std::path::Path,
+        collection_id: CollectionUuid,
+    ) -> (
+        std::collections::HashMap<String, Vec<String>>,
+        Vec<std::path::PathBuf>,
+    ) {
+        let files = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collection_id)
+            .await
+            .unwrap()
+            .record_segment
+            .file_path;
+        let roots = files
+            .values()
+            .flatten()
+            .map(|path| {
+                let (prefix, id) = chroma_types::Segment::extract_prefix_and_id(path).unwrap();
+                root.join(prefix).join("root").join(id.to_string())
+            })
+            .collect();
+        (files, roots)
+    }
+
+    // A read of a SPANN collection after a write finds the roots of the files of the write in memory: the flush opened
+    // them in the background, as the collection was read since its previous flush. With those files gone, the read
+    // still answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_read_after_a_write_finds_the_new_files_open() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        let ended = warm_up_end(collection_id);
+        add_with_documents(&mut frontend, collection_id, 10..11, "r").await;
+        tokio::time::timeout(STOP_WAIT, ended)
+            .await
+            .unwrap()
+            .unwrap();
+        let (files, roots) = record_roots(&mut frontend, root.path(), collection_id).await;
+        assert_eq!(warm_ups(collection_id), vec![(files, true)]);
+        for path in roots {
+            std::fs::remove_file(path).unwrap();
+        }
+        match spann_read(&mut frontend, collection_id, SpannRead::Get).await {
+            Ok(ReadAnswer::Records(records)) => assert_eq!(records[0].len(), 11),
+            other => panic!("the read after the write answered {other:?}"),
+        }
+    }
+
+    // An opening after a write whose files a deletion removed meanwhile fails, which only goes to the log, and leaves
+    // nothing behind: a new collection writes and reads as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_opening_after_a_write_whose_files_went_fails_and_leaves_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        let (stopped, go_on) = stop_warm_up(collection_id);
+        let ended = warm_up_end(collection_id);
+        tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(STOP_WAIT, stopped)
+            .await
+            .unwrap()
+            .unwrap();
+        frontend
+            .delete_collection(
+                DeleteCollectionRequest::try_new(TENANT.into(), DATABASE.into(), "stops".into())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = go_on.send(());
+        tokio::time::timeout(STOP_WAIT, ended)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(warm_ups(collection_id).as_slice(), [(_, false)]),
+            "{:?}",
+            warm_ups(collection_id)
+        );
+        assert!(!local_executor(&frontend).spann_warm_up_runs(collection_id));
+        let other = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, other, SpannRead::Get)
+            .await
+            .unwrap();
+        add_with_documents(&mut frontend, other, 10..11, "r").await;
+        match spann_read(&mut frontend, other, SpannRead::Get).await {
+            Ok(ReadAnswer::Records(records)) => assert_eq!(records[0].len(), 11),
+            answer => panic!("the new collection answered {answer:?}"),
+        }
+    }
+
+    // Writes in a row open one version at a time: while an opening waits, each flush replaces the version to open after
+    // it, so that the next opening is of the last write, whose roots the next read finds in memory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn spann_writes_in_a_row_open_the_last_version_only() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        let (stopped, go_on) = stop_warm_up(collection_id);
+        let ended = warm_up_end(collection_id);
+        tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(STOP_WAIT, stopped)
+            .await
+            .unwrap()
+            .unwrap();
+        let (first, _) = record_roots(&mut frontend, root.path(), collection_id).await;
+        for i in 11..31 {
+            tokio::time::timeout(
+                STOP_WAIT,
+                spann_read(&mut frontend, collection_id, SpannRead::Get),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            tokio::time::timeout(
+                STOP_WAIT,
+                add_with_documents(&mut frontend, collection_id, i..i + 1, "r"),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(local_executor(&frontend).spann_warm_up_runs(collection_id));
+        let (last, roots) = record_roots(&mut frontend, root.path(), collection_id).await;
+        let _ = go_on.send(());
+        tokio::time::timeout(STOP_WAIT, ended)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(warm_ups(collection_id), vec![(first, true), (last, true)]);
+        for path in roots {
+            std::fs::remove_file(path).unwrap();
+        }
+        match spann_read(&mut frontend, collection_id, SpannRead::Get).await {
+            Ok(ReadAnswer::Records(records)) => assert_eq!(records[0].len(), 31),
+            other => panic!("the read after the writes answered {other:?}"),
+        }
+    }
+
+    // A read does not wait for the opening after a write: with the opening stopped, the read answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_read_does_not_wait_for_the_opening_after_a_write() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        let (stopped, go_on) = stop_warm_up(collection_id);
+        let ended = warm_up_end(collection_id);
+        tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(STOP_WAIT, stopped)
+            .await
+            .unwrap()
+            .unwrap();
+        match tokio::time::timeout(
+            STOP_WAIT,
+            spann_read(&mut frontend, collection_id, SpannRead::Get),
+        )
+        .await
+        {
+            Ok(Ok(ReadAnswer::Records(records))) => assert_eq!(records[0].len(), 11),
+            other => panic!("the read during the opening answered {other:?}"),
+        }
+        let _ = go_on.send(());
+        tokio::time::timeout(STOP_WAIT, ended)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    // A write does not wait for the opening after a previous write: with the opening stopped, the write answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_write_does_not_wait_for_the_opening_after_a_write() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        let (stopped, go_on) = stop_warm_up(collection_id);
+        let ended = warm_up_end(collection_id);
+        tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(STOP_WAIT, stopped)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 11..12, "r"),
+        )
+        .await
+        .unwrap();
+        let _ = go_on.send(());
+        tokio::time::timeout(STOP_WAIT, ended)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    // Only a SPANN collection read since its previous flush opens the files of its next one: a collection that is only
+    // written opens nothing, so that it never pushes out of the cache the roots of the collections that are read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn only_a_spann_collection_read_since_its_last_write_opens_the_next() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        add_with_documents(&mut frontend, collection_id, 10..11, "r").await;
+        assert!(!warm_up_seen(&frontend, collection_id));
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        let ended = warm_up_end(collection_id);
+        add_with_documents(&mut frontend, collection_id, 11..12, "r").await;
+        tokio::time::timeout(STOP_WAIT, ended)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(warm_ups(collection_id).len(), 1);
+        add_with_documents(&mut frontend, collection_id, 12..13, "r").await;
+        assert!(!local_executor(&frontend).spann_warm_up_runs(collection_id));
+        assert_eq!(warm_ups(collection_id).len(), 1);
+    }
+
+    // A write to an HNSW collection opens nothing after it, with the option of SPANN on or off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_to_an_hnsw_collection_opens_nothing_after_it() {
+        for spann in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let mut frontend = frontend_with_spann(root.path(), spann).await;
+            let collection_id = frontend
+                .create_collection(
+                    CreateCollectionRequest::try_new(
+                        TENANT.to_string(),
+                        DatabaseName::new(DATABASE).unwrap(),
+                        "hnsw".to_string(),
+                        None,
+                        None,
+                        Some(Schema::new_default(KnnIndex::Hnsw)),
+                        false,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .collection_id;
+            add_with_documents(&mut frontend, collection_id, 0..10, "r").await;
+            spann_read(&mut frontend, collection_id, SpannRead::Get)
+                .await
+                .unwrap();
+            add_with_documents(&mut frontend, collection_id, 10..11, "r").await;
+            assert!(!warm_up_seen(&frontend, collection_id), "spann {spann}");
+        }
+    }
+
+    // An opening after a write on a damaged root fails, which only goes to the log, and the read answers an error, as it
+    // did without the opening.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_opening_after_a_write_on_a_damaged_root_fails_and_the_read_errs() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        let (stopped, go_on) = stop_warm_up(collection_id);
+        let ended = warm_up_end(collection_id);
+        tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(STOP_WAIT, stopped)
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, roots) = record_roots(&mut frontend, root.path(), collection_id).await;
+        std::fs::write(&roots[0], b"not a root").unwrap();
+        let _ = go_on.send(());
+        tokio::time::timeout(STOP_WAIT, ended)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(warm_ups(collection_id).as_slice(), [(_, false)]),
+            "{:?}",
+            warm_ups(collection_id)
+        );
+        assert!(spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .is_err());
+    }
+
+    // The deletion of a SPANN collection forgets that it was read since its last flush, as it forgets that its log is
+    // applied: the mark of a collection deleted after a read does not stay until a restart.
+    #[tokio::test]
+    async fn the_deletion_of_a_spann_collection_forgets_its_read() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        assert!(local_executor(&frontend).spann_marked_read(collection_id));
+        frontend
+            .delete_collection(
+                DeleteCollectionRequest::try_new(TENANT.into(), DATABASE.into(), "stops".into())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!local_executor(&frontend).spann_marked_read(collection_id));
+    }
+
     // The adaptive number of probes of a SPANN query takes the records of the record segment, as distributed Chroma takes
     // those of its last compaction, not the offsets that deleted records leave behind; without adaptive probes, the count
     // is not read.

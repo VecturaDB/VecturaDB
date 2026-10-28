@@ -70,6 +70,21 @@ pub struct LocalSegmentManager {
     spann_provider: Option<SpannProvider>,
     // The SPANN collections whose log is applied: see spann_applied.
     spann_applied: Arc<std::sync::Mutex<HashSet<CollectionUuid>>>,
+    // What runs after each flush of a SPANN collection: see on_spann_flushed.
+    spann_flushed: SpannFlushListener,
+}
+
+/// What runs after each flush of a SPANN collection, once SQLite records its files, with the collection and its record
+/// segment at those files.
+type SpannFlushed = Arc<dyn Fn(CollectionUuid, Segment) + Send + Sync>;
+
+#[derive(Clone, Default)]
+struct SpannFlushListener(Arc<std::sync::Mutex<Option<SpannFlushed>>>);
+
+impl std::fmt::Debug for SpannFlushListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpannFlushListener")
+    }
 }
 
 #[derive(Error, Debug)]
@@ -237,6 +252,7 @@ impl Configurable<LocalSegmentManagerConfig> for LocalSegmentManager {
             persist_root: config.persist_path.clone(),
             spann_provider,
             spann_applied: Arc::default(),
+            spann_flushed: SpannFlushListener::default(),
         };
         if res.persist_root.is_some() {
             let cleaner = res.clone();
@@ -394,6 +410,34 @@ impl LocalSegmentManager {
             collections.insert(collection_id);
         } else {
             collections.remove(&collection_id);
+        }
+    }
+
+    /// Sets what runs after each flush of a SPANN collection, once SQLite records its files, in place of what ran
+    /// before: the local executor opens there the record segment of the new version, so that the next read finds it
+    /// open.
+    pub fn on_spann_flushed(
+        &self,
+        listener: impl Fn(CollectionUuid, Segment) + Send + Sync + 'static,
+    ) {
+        *self
+            .spann_flushed
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(listener));
+    }
+
+    /// Runs what on_spann_flushed set, if anything, after a flush of a SPANN collection that SQLite recorded with its
+    /// files, given the record segment at those files.
+    pub fn spann_flushed(&self, collection_id: CollectionUuid, record_segment: Segment) {
+        let listener = self
+            .spann_flushed
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(listener) = listener {
+            listener(collection_id, record_segment);
         }
     }
 

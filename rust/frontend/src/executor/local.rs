@@ -10,6 +10,7 @@ use chroma_segment::blockfile_record::{
     RecordSegmentReaderOptions, RecordSegmentReaderShard, RecordSegmentReaderShardCreationError,
 };
 use chroma_segment::distributed_spann::{SpannSegmentReaderShard, SpannSegmentReaderShardError};
+use chroma_segment::spann_provider::SpannProvider;
 use chroma_segment::{
     local_hnsw::LocalHnswSegmentReader,
     local_segment_manager::LocalSegmentManager,
@@ -41,6 +42,7 @@ pub struct LocalExecutor {
     compactor_handle: ComponentHandle<LocalCompactionManager>,
     spann: bool,
     retry: RetryConfig,
+    spann_warm_up: SpannWarmUp,
 }
 
 impl LocalExecutor {
@@ -55,12 +57,26 @@ impl LocalExecutor {
             compactor_handle,
             spann: false,
             retry: RetryConfig::default(),
+            spann_warm_up: SpannWarmUp::default(),
         }
     }
 
-    /// SPANN collections, when the option asks for them and the data path can hold their files.
+    /// SPANN collections, when the option asks for them and the data path can hold their files. Each flush of a SPANN
+    /// collection read since its previous one then opens the new version of its record segment: see SpannWarmUp.
     pub fn with_spann(mut self, spann: bool) -> Self {
         self.spann = spann && self.hnsw_manager.spann_provider().is_some();
+        if let Some(provider) = self
+            .hnsw_manager
+            .spann_provider()
+            .filter(|_| self.spann)
+            .cloned()
+        {
+            let warm_up = self.spann_warm_up.clone();
+            self.hnsw_manager
+                .on_spann_flushed(move |collection_id, record_segment| {
+                    warm_up.flushed(collection_id, record_segment, provider.clone())
+                });
+        }
         self
     }
 
@@ -139,6 +155,7 @@ impl LocalExecutor {
             if segment.r#type == SegmentType::Spann {
                 self.hnsw_manager
                     .set_spann_applied(segment.collection, false);
+                self.spann_warm_up.forget(segment.collection);
             }
             match self.hnsw_manager.delete_hnsw_index_files(segment.id).await {
                 Ok(true) => removed.push(segment.id),
@@ -350,6 +367,8 @@ impl LocalExecutor {
         &mut self,
         collection_and_segments: &CollectionAndSegments,
     ) -> Result<(MetadataSnapshot, CollectionAndSegments), ExecutorError> {
+        self.spann_warm_up
+            .read(collection_and_segments.collection.collection_id);
         self.spann_replay(collection_and_segments).await?;
         self.snapshot_files(collection_and_segments).await
     }
@@ -985,6 +1004,118 @@ async fn spann_projection(
     }
 }
 
+// The opening of the record segment of a SPANN collection after each of its flushes, in the background, so that the next
+// read finds the roots of its blockfiles in memory: a flush puts in the cache the blocks it writes but not the roots, and
+// the first read after it loads them from the files (37 ms on a folder of Windows mounted in Docker). Only for a collection
+// read since its previous flush, so that a collection that is only written never pushes out of the cache the roots of the
+// collections that are read. One opening at a time for each collection, of its last version: a flush during an opening
+// replaces the version that waits for it. An opening that fails, as on files that a later flush or a deletion removed,
+// is only logged. A read never waits for an opening, and opens what it does not find in memory, as before.
+// Distributed Chroma prefetches the record and the metadata segments at the start of each get instead
+// (rust/worker/src/execution/orchestration/get.rs), into a cache on disk: its compactor runs in another process.
+#[derive(Clone, Debug, Default)]
+#[allow(clippy::type_complexity)]
+struct SpannWarmUp {
+    // The collections read since their last flush.
+    read: std::sync::Arc<std::sync::Mutex<HashSet<chroma_types::CollectionUuid>>>,
+    // The collections with an opening running, each with the version to open after it, if any.
+    running:
+        std::sync::Arc<std::sync::Mutex<HashMap<chroma_types::CollectionUuid, Option<Segment>>>>,
+}
+
+impl SpannWarmUp {
+    fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // A read of the collection: its next flush opens the new version.
+    fn read(&self, collection_id: chroma_types::CollectionUuid) {
+        Self::lock(&self.read).insert(collection_id);
+    }
+
+    // A deleted collection: its mark of a read goes with it.
+    fn forget(&self, collection_id: chroma_types::CollectionUuid) {
+        Self::lock(&self.read).remove(&collection_id);
+    }
+
+    // A flush of the collection, with its record segment at the files of the flush.
+    fn flushed(
+        &self,
+        collection_id: chroma_types::CollectionUuid,
+        record_segment: Segment,
+        provider: SpannProvider,
+    ) {
+        if !Self::lock(&self.read).remove(&collection_id) {
+            return;
+        }
+        {
+            let mut running = Self::lock(&self.running);
+            if let Some(next) = running.get_mut(&collection_id) {
+                *next = Some(record_segment);
+                return;
+            }
+            running.insert(collection_id, None);
+        }
+        let running = self.running.clone();
+        tokio::spawn(async move {
+            let mut record_segment = record_segment;
+            loop {
+                #[cfg(test)]
+                stop_warm_up(collection_id).await;
+                let opened = open_record_segment(&record_segment, &provider).await;
+                match &opened {
+                    Err(err) if err.code() == ErrorCodes::NotFound => tracing::debug!(
+                        collection_id = %collection_id,
+                        error = %err,
+                        "a later flush or a deletion removed the files of a SPANN flush before their opening"
+                    ),
+                    Err(err) => tracing::warn!(
+                        collection_id = %collection_id,
+                        error = %err,
+                        "the opening of the files of a SPANN flush failed; the next read opens them"
+                    ),
+                    Ok(()) => {}
+                }
+                #[cfg(test)]
+                WARMED.lock().unwrap().push((
+                    collection_id,
+                    record_segment.file_path.clone(),
+                    opened.is_ok(),
+                ));
+                let next = {
+                    let mut running = Self::lock(&running);
+                    let next = running.get_mut(&collection_id).and_then(Option::take);
+                    if next.is_none() {
+                        running.remove(&collection_id);
+                    }
+                    next
+                };
+                match next {
+                    Some(next) => record_segment = next,
+                    None => break,
+                }
+            }
+            #[cfg(test)]
+            warm_up_ended(collection_id);
+        });
+    }
+}
+
+// The record segment of a SPANN collection opened at the files given, which loads the roots of its blockfiles in the
+// cache, then closed.
+async fn open_record_segment(
+    record_segment: &Segment,
+    provider: &SpannProvider,
+) -> Result<(), Box<dyn ChromaError>> {
+    let shard = SegmentShard::try_from((record_segment, 0)).map_err(|err| err.boxed())?;
+    RecordSegmentReaderShard::from_segment(&shard, &provider.blockfile_provider, None)
+        .await
+        .map(|_| ())
+        .map_err(|err| err.boxed())
+}
+
 // The backoff of the reads of SPANN collections, from a retry config as the executor of distributed Chroma builds it.
 fn spann_backoff(retry: &RetryConfig) -> ExponentialBackoff {
     ExponentialBuilder::from(retry).build()
@@ -1260,6 +1391,76 @@ fn fail_before_files(collection_id: chroma_types::CollectionUuid) -> Result<(), 
     match failure {
         Some((_, code)) => Err(ExecutorError::Internal(Box::new(TestFailure(code)))),
         None => Ok(()),
+    }
+}
+
+/// Test hook: the stops of the openings after a flush of a SPANN collection, before they open the files, until the test
+/// lets them go on.
+#[cfg(test)]
+pub(crate) static STOP_WARM_UP: std::sync::Mutex<Vec<StopBeforeFiles>> =
+    std::sync::Mutex::new(Vec::new());
+
+// The stop of STOP_WARM_UP for the collection, when a test set one.
+#[cfg(test)]
+async fn stop_warm_up(collection_id: chroma_types::CollectionUuid) {
+    let stop = {
+        let mut stops = STOP_WARM_UP.lock().unwrap();
+        stops
+            .iter()
+            .position(|stop| stop.collection_id == collection_id)
+            .map(|at| stops.swap_remove(at))
+    };
+    if let Some(stop) = stop {
+        let _ = stop.stopped.send(());
+        let _ = stop.go_on.await;
+    }
+}
+
+/// Test hook: the openings after a flush, each with its collection, the files it opened and whether it opened them.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) static WARMED: std::sync::Mutex<
+    Vec<(
+        chroma_types::CollectionUuid,
+        HashMap<String, Vec<String>>,
+        bool,
+    )>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// Test hook: the tests that wait for the end of the openings of a collection.
+#[cfg(test)]
+pub(crate) static WARM_UP_ENDS: std::sync::Mutex<
+    Vec<(
+        chroma_types::CollectionUuid,
+        tokio::sync::oneshot::Sender<()>,
+    )>,
+> = std::sync::Mutex::new(Vec::new());
+
+// The end of the openings of a collection, to the tests that wait for it.
+#[cfg(test)]
+fn warm_up_ended(collection_id: chroma_types::CollectionUuid) {
+    let mut ends = WARM_UP_ENDS.lock().unwrap();
+    let mut at = 0;
+    while at < ends.len() {
+        if ends[at].0 == collection_id {
+            let (_, end) = ends.swap_remove(at);
+            let _ = end.send(());
+        } else {
+            at += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+impl LocalExecutor {
+    /// Whether an opening after a flush runs for the collection.
+    pub(crate) fn spann_warm_up_runs(&self, collection_id: chroma_types::CollectionUuid) -> bool {
+        SpannWarmUp::lock(&self.spann_warm_up.running).contains_key(&collection_id)
+    }
+
+    /// Whether the collection is marked as read since its last flush.
+    pub(crate) fn spann_marked_read(&self, collection_id: chroma_types::CollectionUuid) -> bool {
+        SpannWarmUp::lock(&self.spann_warm_up.read).contains(&collection_id)
     }
 }
 

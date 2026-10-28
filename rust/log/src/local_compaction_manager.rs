@@ -413,6 +413,8 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
             .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
         if spann {
             if let Some(flush) = spann_flush {
+                let mut record_segment = collection_and_segments.record_segment.clone();
+                record_segment.file_path = flush.record_files.clone();
                 for (segment, files) in [
                     (&collection_and_segments.record_segment, flush.record_files),
                     (&collection_and_segments.vector_segment, flush.vector_files),
@@ -428,6 +430,8 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
                         tracing::warn!(error = %err, "SPANN flush done; the files of older versions stay for the next flush");
                     }
                 }
+                self.hnsw_segment_manager
+                    .spann_flushed(message.collection_id, record_segment);
             }
             self.hnsw_segment_manager
                 .set_spann_applied(message.collection_id, true);
