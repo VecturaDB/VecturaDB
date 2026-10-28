@@ -2105,6 +2105,11 @@ impl ServiceBasedFrontend {
                         ),
                     )));
                 }
+                // Reject SPANN files that cannot be read before committing more logs, as for HNSW below.
+                self.executor
+                    .validate_spann_index(&collection)
+                    .await
+                    .map_err(|err| PushLogsError::Other(err.boxed()))?;
             } else {
                 schema
                     .get_internal_hnsw_config_with_legacy_fallback(&collection.vector_segment)
@@ -5932,6 +5937,78 @@ mod tests {
             "HNSW: {} answers mixed two moments, for example {:?}",
             wrong.len(),
             &wrong[..wrong.len().min(8)]
+        );
+    }
+
+    // A write to a SPANN collection whose last flush cannot be read is rejected before it reaches the log, as a write to
+    // an HNSW collection whose index cannot be read: once the files are back, nothing of it is there.
+    #[tokio::test]
+    async fn a_spann_write_on_unreadable_files_leaves_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let saved = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = spann_collection_with_records(&mut frontend, "spann-unreadable").await;
+        let record_segment = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collection_id)
+            .await
+            .unwrap()
+            .record_segment
+            .id
+            .to_string();
+        drop(frontend);
+        // The roots of the blockfiles of the record segment, moved away while no server runs, so that no cache holds
+        // them.
+        let roots = files_under(&root.path().join("tenant"))
+            .into_iter()
+            .filter_map(|file| file.parent().map(|folder| folder.to_path_buf()))
+            .find(|folder| {
+                folder.ends_with("root")
+                    && folder
+                        .parent()
+                        .is_some_and(|segment| segment.ends_with(&record_segment))
+            })
+            .unwrap();
+        copy_folder(&roots, &saved.path().join("root"));
+        std::fs::remove_dir_all(&roots).unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let written = frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    vec!["x".to_string()],
+                    vec![vec![0.5, 0.5]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(written.is_err());
+        copy_folder(&saved.path().join("root"), &roots);
+        let got = frontend
+            .get(
+                GetRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    Some(vec!["x".to_string()]),
+                    None,
+                    None,
+                    0,
+                    chroma_types::IncludeList(vec![]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            got.ids.is_empty(),
+            "the write that failed is in the collection: {:?}",
+            got.ids
         );
     }
 

@@ -286,6 +286,14 @@ impl LocalExecutor {
         collection_and_segments: &CollectionAndSegments,
     ) -> Result<(MetadataSnapshot, CollectionAndSegments), ExecutorError> {
         self.spann_replay(collection_and_segments).await?;
+        self.snapshot_files(collection_and_segments).await
+    }
+
+    // A snapshot of SQLite, with the segments of a SPANN collection at the files of the last flush it reads.
+    async fn snapshot_files(
+        &self,
+        collection_and_segments: &CollectionAndSegments,
+    ) -> Result<(MetadataSnapshot, CollectionAndSegments), ExecutorError> {
         let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
         let mut snapshot = self.metadata_reader.snapshot().await.map_err(internal)?;
         let mut files = snapshot
@@ -300,6 +308,23 @@ impl LocalExecutor {
             .remove(&collection_and_segments.vector_segment.id.to_string())
             .unwrap_or_default();
         Ok((snapshot, collection_and_segments))
+    }
+
+    /// Rejects a write to a SPANN collection whose files of the last flush cannot be read before it reaches the log, as
+    /// validate_index does for a local HNSW index: the compaction would fail on those files with the write in the log
+    /// and its records in SQLite. A collection never written has no files, and passes.
+    pub async fn validate_spann_index(
+        &self,
+        collection_and_segments: &CollectionAndSegments,
+    ) -> Result<(), Box<dyn ChromaError>> {
+        let (_, collection_and_segments) = self
+            .snapshot_files(collection_and_segments)
+            .await
+            .map_err(|err| err.boxed())?;
+        self.spann_vectors(&collection_and_segments)
+            .await
+            .map_err(|err| err.boxed())?;
+        Ok(())
     }
 
     // The log of a SPANN collection replayed, unless the compaction has applied all of it: a read of an HNSW index
