@@ -137,6 +137,19 @@ impl LocalExecutor {
                     failure.get_or_insert(err.boxed());
                 }
             }
+            // Only a segment of a SPANN collection has blockfiles to look for.
+            if matches!(
+                segment.r#type,
+                SegmentType::Spann | SegmentType::BlockfileRecord
+            ) {
+                if let Err(err) = self
+                    .hnsw_manager
+                    .delete_blockfile_segment_files(segment.id)
+                    .await
+                {
+                    failure.get_or_insert(err.boxed());
+                }
+            }
         }
         (removed, failure)
     }

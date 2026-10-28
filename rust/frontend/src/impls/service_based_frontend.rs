@@ -6012,6 +6012,42 @@ mod tests {
         );
     }
 
+    // The deletion of an HNSW collection does not look into the folders of SPANN segments: what one of them holds does
+    // not keep the deletion of the HNSW index pending. Here a SPANN segment folder holds a file with the name of the
+    // HNSW segment, which a walk of every SPANN folder for that name trips on.
+    #[tokio::test]
+    async fn an_hnsw_deletion_does_not_walk_the_spann_folders() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let spann = spann_collection_with_records(&mut frontend, "spann-near").await;
+        let hnsw = create_collection_for(&mut frontend, TENANT, DATABASE, "hnsw-deleted").await;
+        add_record(&mut frontend, &hnsw, "a").await;
+        let hnsw_segment = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, hnsw.collection_id)
+            .await
+            .unwrap()
+            .vector_segment
+            .id
+            .to_string();
+        let spann_segments = files_under(&root.path().join("tenant"))
+            .into_iter()
+            .find(|file| file.to_string_lossy().contains(&spann.to_string()))
+            .and_then(|file| {
+                file.ancestors()
+                    .find(|folder| folder.ends_with("segment"))
+                    .map(|folder| folder.to_path_buf())
+            })
+            .unwrap();
+        std::fs::write(spann_segments.join(&hnsw_segment), b"").unwrap();
+        frontend
+            .delete_collection(delete_collection_request("hnsw-deleted"))
+            .await
+            .unwrap();
+        frontend.executor.cleanup_deleted_indexes().await.unwrap();
+        assert_eq!(pending_cleanups(root.path()), 0);
+    }
+
     #[tokio::test]
     async fn a_collection_created_again_before_the_sweep_is_new_and_works() {
         let root = tempfile::tempdir().unwrap();

@@ -462,7 +462,8 @@ impl LocalSegmentManager {
     }
 
     /// The files of a deleted index, removed: true when they were queued in index_cleanup, whose row stays until
-    /// forget_deleted_hnsw_indexes. For a segment of a SPANN collection, its blockfiles.
+    /// forget_deleted_hnsw_indexes. The blockfiles of a segment of a SPANN collection go with
+    /// delete_blockfile_segment_files.
     pub async fn delete_hnsw_index_files(
         &self,
         segment_id: SegmentUuid,
@@ -496,9 +497,25 @@ impl LocalSegmentManager {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err.into()),
             }
-            remove_blockfile_segment(Path::new(root), segment_id).await?;
         }
         Ok(true)
+    }
+
+    /// The blockfiles of a deleted segment of a SPANN collection, removed with the folders of its collection that it
+    /// leaves empty; nothing for a segment that the catalog still has. Those that a stop leaves behind go with the sweep
+    /// of the folders of segments that the catalog no longer has.
+    pub async fn delete_blockfile_segment_files(
+        &self,
+        segment_id: SegmentUuid,
+    ) -> Result<(), LocalSegmentManagerError> {
+        let Some(root) = &self.persist_root else {
+            return Ok(());
+        };
+        if self.segment_exists(segment_id).await? {
+            return Ok(());
+        }
+        remove_blockfile_segment(Path::new(root), segment_id).await?;
+        Ok(())
     }
 
     /// Takes deleted indexes whose files are gone out of index_cleanup, with one statement per 500.
