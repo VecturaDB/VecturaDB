@@ -35,40 +35,72 @@ jobs:
     with:
       version: ${{ needs.version.outputs.version }}
 
+  # The image is built from the source as Chroma builds its official one (.github/workflows/_build_release_container.yml
+  # of Chroma), with vecturadb/docker/Dockerfile: each architecture on a runner of its own, without emulation, pushed with
+  # a tag of its architecture; then one tag for both.
   image:
+    name: Image (${{ matrix.arch }})
     needs: [version, ci]
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: cli-linux-*
-          merge-multiple: true
-      - name: Context
-        run: |
-          mkdir ctx
-          cp vecturadb/docker/Dockerfile vecturadb/docker/config.yaml ctx/
-          cp vecturadb-linux-x86_64 ctx/vecturadb-amd64 && cp vecturadb-linux-aarch64 ctx/vecturadb-arm64 && chmod +x ctx/vecturadb-*
-      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      # As the jobs of the CLI: the binary of the image tells the version of the release (vecturadb --version, and the
+      # block server of /api/v2/pre-flight-checks).
+      - name: CLI version from the release tag
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: perl -0pi -e 's/^version = ".*"/version = "$ENV{VERSION}"/m' rust/cli/Cargo.toml && grep -m1 '^version' rust/cli/Cargo.toml
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Build and push amd64 and arm64
+      - name: Build and push ${{ matrix.arch }}
+        env:
+          IMAGE: ghcr.io/vecturadb/vecturadb
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          docker pull --platform "linux/${{ matrix.arch }}" rust:1.92.0
+          docker pull --platform "linux/${{ matrix.arch }}" debian:stable-slim
+          docker buildx build --platform "linux/${{ matrix.arch }}" -f vecturadb/docker/Dockerfile \
+            --build-arg REVISION=${{ github.sha }} -t "$IMAGE:$VERSION-${{ matrix.arch }}" --push .
+
+  image-manifest:
+    needs: [version, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: One tag for amd64 and arm64
         env:
           IMAGE: ghcr.io/vecturadb/vecturadb
           VERSION: ${{ needs.version.outputs.version }}
           CHANNEL: ${{ needs.version.outputs.prerelease == 'true' && 'preview' || 'latest' }}
           DESCRIPTION: "Vector database compatible with the Chroma API. Independent project. Not affiliated with, endorsed by or sponsored by Chroma Inc. CHROMA is a registered trademark of Chroma Inc., used here only to describe compatibility."
-        run: >-
-          docker buildx build --platform linux/amd64,linux/arm64 --build-arg REVISION=${{ github.sha }}
-          --annotation "index:org.opencontainers.image.description=$DESCRIPTION"
-          -t "$IMAGE:$VERSION" -t "$IMAGE:$CHANNEL" --push ctx
+        run: |
+          docker buildx imagetools create --annotation "index:org.opencontainers.image.description=$DESCRIPTION" \
+            -t "$IMAGE:$VERSION" -t "$IMAGE:$CHANNEL" "$IMAGE:$VERSION-amd64" "$IMAGE:$VERSION-arm64"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
 
   github-release:
     needs: [version, ci]
