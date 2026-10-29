@@ -1,6 +1,13 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
-use chroma_blockstore::{config::BlockfileProviderConfig, provider::BlockfileProvider};
-use chroma_cache::{AysncPartitionedMutex, Cache, CacheConfig, CacheError, FoyerCacheConfig};
+use chroma_blockstore::{
+    arrow::provider::{BlockManager, RootManagerError},
+    config::BlockfileProviderConfig,
+    provider::BlockfileProvider,
+    RootManager,
+};
+use chroma_cache::{
+    nop::NopCache, AysncPartitionedMutex, Cache, CacheConfig, CacheError, FoyerCacheConfig,
+};
 use chroma_config::{
     registry::{Injectable, Registry},
     Configurable,
@@ -8,16 +15,19 @@ use chroma_config::{
 use chroma_error::{ChromaError, ErrorCodes};
 use chroma_index::{
     config::{HnswProviderConfig, SpannProviderConfig},
-    hnsw_provider::HnswIndexProvider,
+    hnsw_provider::{HnswIndexProvider, FILES},
     IndexUuid,
 };
 use chroma_sqlite::db::SqliteDb;
-use chroma_storage::{local::LocalStorage, Storage};
-use chroma_types::{Collection, Segment, SegmentUuid};
+use chroma_storage::{local::LocalStorage, Storage, StorageError};
+use chroma_types::{
+    Collection, CollectionUuid, Segment, SegmentUuid, HNSW_PATH, USER_ID_BLOOM_FILTER,
+};
+use futures::StreamExt;
 use sea_query_binder::SqlxBinder;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     path::Path,
     sync::{Arc, Weak},
@@ -59,6 +69,23 @@ pub struct LocalSegmentManager {
     sqlite: SqliteDb,
     persist_root: Option<String>,
     spann_provider: Option<SpannProvider>,
+    // The SPANN collections whose log is applied: see spann_applied.
+    spann_applied: Arc<std::sync::Mutex<HashSet<CollectionUuid>>>,
+    // What runs after each flush of a SPANN collection: see on_spann_flushed.
+    spann_flushed: SpannFlushListener,
+}
+
+/// What runs after each flush of a SPANN collection, once SQLite records its files, with the collection and its record
+/// segment at those files.
+type SpannFlushed = Arc<dyn Fn(CollectionUuid, Segment) + Send + Sync>;
+
+#[derive(Clone, Default)]
+struct SpannFlushListener(Arc<std::sync::Mutex<Option<SpannFlushed>>>);
+
+impl std::fmt::Debug for SpannFlushListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpannFlushListener")
+    }
 }
 
 #[derive(Error, Debug)]
@@ -71,19 +98,49 @@ impl ChromaError for SpannDefaultsError {
     }
 }
 
-// The providers of the SPANN index, as the worker of distributed Chroma builds them with the defaults of its
-// configuration, on local storage at the data path: the blockfiles, and the HNSW index of the centers.
+// The settings of the SPANN index in the configuration of the worker of distributed Chroma
+// (rust/worker/chroma_config.yaml): reads as its query service, without the adaptive number of probes, so a query probes
+// the search_nprobe of the collection; writes as its compaction service, with the garbage collection of the posting
+// lists and of the HNSW index of the centers.
+fn local_spann_config() -> Result<SpannProviderConfig, serde_json::Error> {
+    serde_json::from_value(serde_json::json!({
+        "adaptive_search_nprobe": false,
+        "pl_block_size": 5242880,
+        "pl_garbage_collection": {"enabled": true, "policy": {"random_sample": {"sample_size": 0.1}}},
+        "hnsw_garbage_collection": {"enabled": true, "policy": "full_rebuild"},
+    }))
+}
+
+// The blockfiles of the SPANN index, with the settings of the compaction service of the worker
+// (rust/worker/chroma_config.yaml): blocks of 8 MiB, and a cache of 1000 of them and of 1000 roots in memory.
+fn local_blockfile_config() -> Result<BlockfileProviderConfig, serde_json::Error> {
+    serde_json::from_value(serde_json::json!({
+        "arrow": {
+            "block_manager_config": {
+                "max_block_size_bytes": 8388608,
+                "block_cache_config": {"lru": {"name": "block_cache", "capacity": 1000}},
+                "num_concurrent_block_flushes": 40,
+            },
+            "sparse_index_manager_config": {
+                "sparse_index_cache_config": {"lru": {"name": "sparse_index_cache", "capacity": 1000}},
+            },
+        },
+    }))
+}
+
+// The providers of the SPANN index, as the worker of distributed Chroma builds them, on local storage at the data path:
+// the blockfiles, and the HNSW index of the centers.
 async fn local_spann_provider(
     persist_path: &str,
     registry: &Registry,
 ) -> Result<SpannProvider, Box<dyn ChromaError>> {
     let storage = Storage::Local(LocalStorage::new(persist_path));
+    let defaults = |e| -> Box<dyn ChromaError> { Box::new(SpannDefaultsError(e)) };
     let blockfile_provider = BlockfileProvider::try_from_config(
-        &(BlockfileProviderConfig::default(), storage.clone()),
+        &(local_blockfile_config().map_err(defaults)?, storage.clone()),
         registry,
     )
     .await?;
-    let defaults = |e| -> Box<dyn ChromaError> { Box::new(SpannDefaultsError(e)) };
     let mut hnsw_config: HnswProviderConfig = serde_json::from_str("{}").map_err(defaults)?;
     hnsw_config.hnsw_cache_config = CacheConfig::Memory(FoyerCacheConfig {
         capacity: 64,
@@ -91,7 +148,7 @@ async fn local_spann_provider(
     });
     let hnsw_provider =
         HnswIndexProvider::try_from_config(&(hnsw_config, storage.clone()), registry).await?;
-    let spann_config: SpannProviderConfig = serde_json::from_str("{}").map_err(defaults)?;
+    let spann_config = local_spann_config().map_err(defaults)?;
     #[cfg(not(feature = "usearch"))]
     let config = (hnsw_provider, blockfile_provider, spann_config);
     #[cfg(feature = "usearch")]
@@ -108,6 +165,117 @@ async fn local_spann_provider(
         )
     };
     SpannProvider::try_from_config(&config, registry).await
+}
+
+// The folder of a segment of a SPANN collection, under the prefix of distributed Chroma
+// (tenant/{tenant}/database/{database}/collection/{collection}/segment/{segment}), removed with the folders of its
+// collection that it leaves empty. The catalog no longer names the tenant or the database of a deleted segment: its
+// folder is looked for in the folder of its collection under each of them, never in the folders of other collections.
+async fn remove_blockfile_segment(
+    root: &Path,
+    collection_id: CollectionUuid,
+    segment_id: SegmentUuid,
+) -> io::Result<()> {
+    let folders = |path: std::path::PathBuf| async move { entries(&path, true).await };
+    let segment = segment_id.to_string();
+    for tenant in folders(root.join("tenant")).await? {
+        for database in folders(tenant.join("database")).await? {
+            let collection = database.join("collection").join(collection_id.to_string());
+            let segments = collection.join("segment");
+            match tokio::fs::remove_dir_all(segments.join(&segment)).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            }
+            // A folder that still holds something stays.
+            for empty in [segments, collection] {
+                if tokio::fs::remove_dir(&empty).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// The folders, or else the files, in a folder; none in a folder that is not there.
+async fn entries(path: &Path, folders: bool) -> io::Result<Vec<std::path::PathBuf>> {
+    let mut entries = match tokio::fs::read_dir(path).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut found = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_dir() == folders {
+            found.push(entry.path());
+        }
+    }
+    Ok(found)
+}
+
+/// Test hooks of the cleanup of the SPANN files under a prefix, where it touches the files: the reads of roots
+/// (ROOT_READS), the removals of files (FILE_REMOVALS) and the listings of the folders of the HNSW indexes
+/// (FOLDER_LISTINGS) are counted, and with a meeting the first two of them wait up to 5 s for each other, which they
+/// meet only when they run together.
+#[cfg(feature = "test-hooks")]
+pub static ROOT_READS: std::sync::Mutex<Vec<FileHook>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "test-hooks")]
+pub static FILE_REMOVALS: std::sync::Mutex<Vec<FileHook>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "test-hooks")]
+pub static FOLDER_LISTINGS: std::sync::Mutex<Vec<FileHook>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Debug)]
+pub struct FileHook {
+    pub prefix: String,
+    pub count: Arc<std::sync::atomic::AtomicUsize>,
+    pub meeting: Option<Arc<Meeting>>,
+}
+
+/// The first two operations of a hook: they met when the second came while the first still waited for it.
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Default)]
+pub struct Meeting {
+    // How many came, and whether the first gave up waiting.
+    state: std::sync::Mutex<(usize, bool)>,
+    second: std::sync::Condvar,
+    pub met: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "test-hooks")]
+fn file_hook(hooks: &std::sync::Mutex<Vec<FileHook>>, prefix: &str) {
+    let hook = hooks
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|hook| hook.prefix == prefix)
+        .cloned();
+    let Some(hook) = hook else {
+        return;
+    };
+    hook.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let Some(meeting) = hook.meeting else {
+        return;
+    };
+    let mut state = meeting.state.lock().unwrap();
+    state.0 += 1;
+    if state.0 == 1 {
+        let (mut state, wait) = meeting
+            .second
+            .wait_timeout_while(state, std::time::Duration::from_secs(5), |state| {
+                state.0 < 2
+            })
+            .unwrap();
+        if wait.timed_out() {
+            state.1 = true;
+        }
+    } else if state.0 == 2 && !state.1 {
+        meeting.met.store(true, std::sync::atomic::Ordering::SeqCst);
+        meeting.second.notify_all();
+    }
 }
 
 #[derive(Debug)]
@@ -151,6 +319,8 @@ impl Configurable<LocalSegmentManagerConfig> for LocalSegmentManager {
             sqlite: sqldb,
             persist_root: config.persist_path.clone(),
             spann_provider,
+            spann_applied: Arc::default(),
+            spann_flushed: SpannFlushListener::default(),
         };
         if res.persist_root.is_some() {
             let cleaner = res.clone();
@@ -183,6 +353,8 @@ pub enum LocalSegmentManagerError {
     PoolCacheError(#[from] CacheError),
     #[error("Error creating hnsw segment writer: {0}")]
     LocalHnswSegmentWriterError(#[from] LocalHnswSegmentWriterError),
+    #[error("Error reading the root of a blockfile: {0}")]
+    Root(#[from] RootManagerError),
 }
 
 impl ChromaError for LocalSegmentManagerError {
@@ -193,6 +365,7 @@ impl ChromaError for LocalSegmentManagerError {
             LocalSegmentManagerError::LocalHnswSegmentReaderError(e) => e.code(),
             LocalSegmentManagerError::PoolCacheError(e) => e.code(),
             LocalSegmentManagerError::LocalHnswSegmentWriterError(e) => e.code(),
+            LocalSegmentManagerError::Root(e) => e.code(),
         }
     }
 }
@@ -285,6 +458,57 @@ impl LocalSegmentManager {
         self.spann_provider.as_ref()
     }
 
+    /// Whether the log of a SPANN collection is applied, as replay_complete for a local HNSW index: the compaction
+    /// clears it when it starts on the log of the collection and sets it once the records are in SQLite and in the files
+    /// of a flush. A read of a collection whose log is applied has nothing to replay. None is applied after a start.
+    pub fn spann_applied(&self, collection_id: CollectionUuid) -> bool {
+        self.spann_applied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&collection_id)
+    }
+
+    /// Sets whether the log of a SPANN collection is applied; a deleted collection is forgotten so.
+    pub fn set_spann_applied(&self, collection_id: CollectionUuid, applied: bool) {
+        let mut collections = self
+            .spann_applied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if applied {
+            collections.insert(collection_id);
+        } else {
+            collections.remove(&collection_id);
+        }
+    }
+
+    /// Sets what runs after each flush of a SPANN collection, once SQLite records its files, in place of what ran
+    /// before: the local executor opens there the record segment of the new version, so that the next read finds it
+    /// open.
+    pub fn on_spann_flushed(
+        &self,
+        listener: impl Fn(CollectionUuid, Segment) + Send + Sync + 'static,
+    ) {
+        *self
+            .spann_flushed
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(listener));
+    }
+
+    /// Runs what on_spann_flushed set, if anything, after a flush of a SPANN collection that SQLite recorded with its
+    /// files, given the record segment at those files.
+    pub fn spann_flushed(&self, collection_id: CollectionUuid, record_segment: Segment) {
+        let listener = self
+            .spann_flushed
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(listener) = listener {
+            listener(collection_id, record_segment);
+        }
+    }
+
     pub async fn get_hnsw_writer(
         &self,
         collection: &Collection,
@@ -350,7 +574,8 @@ impl LocalSegmentManager {
     }
 
     /// The files of a deleted index, removed: true when they were queued in index_cleanup, whose row stays until
-    /// forget_deleted_hnsw_indexes.
+    /// forget_deleted_hnsw_indexes. The blockfiles of a segment of a SPANN collection go with
+    /// delete_blockfile_segment_files.
     pub async fn delete_hnsw_index_files(
         &self,
         segment_id: SegmentUuid,
@@ -388,6 +613,24 @@ impl LocalSegmentManager {
         Ok(true)
     }
 
+    /// The blockfiles of a deleted segment of a SPANN collection, removed with the folders of its collection that it
+    /// leaves empty; nothing for a segment that the catalog still has. Those that a stop leaves behind go with the sweep
+    /// of the folders of segments that the catalog no longer has.
+    pub async fn delete_blockfile_segment_files(
+        &self,
+        collection_id: CollectionUuid,
+        segment_id: SegmentUuid,
+    ) -> Result<(), LocalSegmentManagerError> {
+        let Some(root) = &self.persist_root else {
+            return Ok(());
+        };
+        if self.segment_exists(segment_id).await? {
+            return Ok(());
+        }
+        remove_blockfile_segment(Path::new(root), collection_id, segment_id).await?;
+        Ok(())
+    }
+
     /// Takes deleted indexes whose files are gone out of index_cleanup, with one statement per 500.
     pub async fn forget_deleted_hnsw_indexes(
         &self,
@@ -406,6 +649,184 @@ impl LocalSegmentManager {
                 .await?;
         }
         Ok(())
+    }
+
+    /// The files under the prefix of a segment of a SPANN collection that none of the versions given references,
+    /// removed: blocks, roots and the files of the HNSW indexes of the centers, listed as the garbage collector of
+    /// distributed Chroma lists the files of a version (rust/garbage_collector/src/operators/list_files_at_version.rs).
+    /// Other files stay. Returns how many went.
+    pub async fn remove_unused_spann_files(
+        &self,
+        prefix: &str,
+        versions: &[&HashMap<String, Vec<String>>],
+    ) -> Result<usize, LocalSegmentManagerError> {
+        let (Some(root), Some(storage)) = (
+            &self.persist_root,
+            self.spann_provider
+                .as_ref()
+                .and_then(|provider| provider.blockfile_provider.storage()),
+        ) else {
+            return Ok(0);
+        };
+        // No cache of roots, as the garbage collector of distributed Chroma by default (root_cache_config): two
+        // cleanups of a segment see versions about a grace apart, so a cache of its own would hold almost no root that
+        // a later one reads, and the cache of the reads would lose to them the roots of the collections that are read.
+        let roots = RootManager::new((*storage).clone(), Box::new(NopCache));
+        let mut live = HashSet::new();
+        // The roots of the blockfiles of the versions, each once, read a hundred at a time, as distributed Chroma lists
+        // the files of a version (list_files_at_version.rs). The local storage reads a file in one go, with nothing to
+        // wait for: each read goes to the blocking threads of tokio, as tokio::fs does, so that the reads run together,
+        // as those of the storage of distributed Chroma do.
+        let mut sparse_indexes = HashMap::new();
+        for files in versions {
+            for (file_type, paths) in files.iter() {
+                for path in paths {
+                    let (path_prefix, id) = Segment::extract_prefix_and_id(path)
+                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+                    if file_type == HNSW_PATH || file_type == "hnsw_index" {
+                        live.extend(FILES.iter().map(|file| {
+                            HnswIndexProvider::format_key(path_prefix, &IndexUuid(id), file)
+                        }));
+                    } else if file_type == USER_ID_BLOOM_FILTER {
+                        live.insert(path.clone());
+                    } else {
+                        live.insert(RootManager::get_storage_key(path_prefix, &id));
+                        sparse_indexes.insert(id, path_prefix.to_string());
+                    }
+                }
+            }
+        }
+        let handle = tokio::runtime::Handle::current();
+        let mut block_ids = futures::stream::iter(sparse_indexes)
+            .map(|(id, path_prefix)| {
+                let (roots, handle) = (roots.clone(), handle.clone());
+                #[cfg(feature = "test-hooks")]
+                let hook_prefix = prefix.to_string();
+                async move {
+                    let (blocks, path_prefix) = tokio::task::spawn_blocking(move || {
+                        #[cfg(feature = "test-hooks")]
+                        file_hook(&ROOT_READS, &hook_prefix);
+                        let blocks = handle.block_on(roots.get_all_block_ids(&id, &path_prefix));
+                        (blocks, path_prefix)
+                    })
+                    .await
+                    .map_err(io::Error::other)?;
+                    match blocks {
+                        Ok(blocks) => Ok((blocks, path_prefix)),
+                        // As distributed Chroma: a root that is not there went with its version.
+                        Err(RootManagerError::StorageGetError(StorageError::NotFound { .. })) => {
+                            tracing::debug!(
+                                "Sparse index {id} not found in storage. Assuming it was previously deleted."
+                            );
+                            Ok((Vec::new(), path_prefix))
+                        }
+                        Err(err) => Err(LocalSegmentManagerError::from(err)),
+                    }
+                }
+            })
+            .buffer_unordered(100);
+        while let Some(result) = block_ids.next().await {
+            let (blocks, path_prefix) = result?;
+            live.extend(
+                blocks
+                    .iter()
+                    .map(|block| BlockManager::format_key(&path_prefix, block)),
+            );
+        }
+        let root = Path::new(root);
+        let mut files = Vec::new();
+        for kind in ["block", "root"] {
+            for file in entries(&root.join(format!("{prefix}/{kind}")), false).await? {
+                if let Some(name) = file.file_name().and_then(|name| name.to_str()) {
+                    files.push(format!("{prefix}/{kind}/{name}"));
+                }
+            }
+        }
+        let indexes = entries(&root.join(format!("{prefix}/hnsw")), true).await?;
+        // The folders of the HNSW indexes of the centers, one for each index that a flush wrote, listed a hundred at a
+        // time as well, each listing on the blocking threads of tokio. The stream owns its paths: one that borrowed
+        // them made the future of the compaction, which must be Send, too general for the compiler to prove it.
+        let mut listings = futures::stream::iter(indexes.clone())
+            .map(|index| {
+                let folder = index.clone();
+                #[cfg(feature = "test-hooks")]
+                let hook_prefix = prefix.to_string();
+                async move {
+                    let listed = tokio::task::spawn_blocking(move || {
+                        #[cfg(feature = "test-hooks")]
+                        file_hook(&FOLDER_LISTINGS, &hook_prefix);
+                        // As entries(index, false), in one go on a blocking thread: the files of the folder, none if
+                        // it is not there.
+                        let mut found = Vec::new();
+                        let folder = match std::fs::read_dir(&folder) {
+                            Ok(folder) => folder,
+                            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(found),
+                            Err(err) => return Err(err),
+                        };
+                        for entry in folder {
+                            let entry = entry?;
+                            if !entry.file_type()?.is_dir() {
+                                found.push(entry.path());
+                            }
+                        }
+                        Ok(found)
+                    })
+                    .await
+                    .map_err(io::Error::other)?;
+                    Ok::<_, io::Error>((index, listed?))
+                }
+            })
+            .buffer_unordered(100);
+        while let Some(listed) = listings.next().await {
+            let (index, listed) = listed?;
+            let Some(index_name) = index.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            for file in listed {
+                if let Some(name) = file.file_name().and_then(|name| name.to_str()) {
+                    files.push(format!("{prefix}/hnsw/{index_name}/{name}"));
+                }
+            }
+        }
+        drop(listings);
+        // The files that no version names, a hundred at a time, as distributed Chroma renames them a hundred at a time
+        // or deletes them a thousand in a request (delete_unused_files.rs): each removal goes to the blocking threads
+        // of tokio, as tokio::fs::remove_file does, so that the removals run together.
+        let unused = files.into_iter().filter(|key| !live.contains(key));
+        let mut removals = futures::stream::iter(unused)
+            .map(|key| {
+                let path = root.join(key);
+                #[cfg(feature = "test-hooks")]
+                let hook_prefix = prefix.to_string();
+                async move {
+                    let removal = tokio::task::spawn_blocking(move || {
+                        #[cfg(feature = "test-hooks")]
+                        file_hook(&FILE_REMOVALS, &hook_prefix);
+                        std::fs::remove_file(path)
+                    })
+                    .await
+                    .map_err(io::Error::other)?;
+                    match removal {
+                        Ok(()) => Ok(true),
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+                        Err(err) => Err(err),
+                    }
+                }
+            })
+            .buffer_unordered(100);
+        let mut removed = 0;
+        while let Some(result) = removals.next().await {
+            removed += result? as usize;
+        }
+        // A folder that still holds files stays. The folders go a hundred at a time too.
+        futures::stream::iter(indexes)
+            .map(|index| async move {
+                let _ = tokio::fs::remove_dir(&index).await;
+            })
+            .buffer_unordered(100)
+            .collect::<Vec<_>>()
+            .await;
+        Ok(removed)
     }
 
     /// Whether the indexes are files, which the sweep at startup and every hour removes once deleted.
@@ -440,10 +861,70 @@ impl LocalSegmentManager {
         }
         // The rows that collection deletions leave wait for this sweep: one statement per 500 of them.
         let forgotten = self.forget_deleted_hnsw_indexes(&removed).await;
+        if let Err(err) = self.remove_orphan_blockfile_segments().await {
+            tracing::warn!(error = %err, "cleanup of SPANN files failed; will retry");
+            first_error.get_or_insert(err);
+        }
         match first_error {
             Some(err) => Err(err),
             None => forgotten,
         }
+    }
+
+    // The folders of the segments of SPANN collections that the catalog no longer has, removed: a server that knows
+    // nothing of them, Chroma 1.5.9 or a VecturaDB release before SPANN, deletes a SPANN collection and leaves its files.
+    // A segment has its row before its first file, so a folder without a row is what a deletion left. The empty folders
+    // of a collection go only when the catalog no longer has the collection, which no flush writes to.
+    async fn remove_orphan_blockfile_segments(&self) -> Result<(), LocalSegmentManagerError> {
+        let Some(root) = &self.persist_root else {
+            return Ok(());
+        };
+        let root = Path::new(root);
+        for tenant in entries(&root.join("tenant"), true).await? {
+            for database in entries(&tenant.join("database"), true).await? {
+                for collection in entries(&database.join("collection"), true).await? {
+                    let segments = collection.join("segment");
+                    for segment in entries(&segments, true).await? {
+                        let Some(id) = segment
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .and_then(|name| uuid::Uuid::parse_str(name).ok())
+                        else {
+                            continue;
+                        };
+                        if self.segment_exists(SegmentUuid(id)).await? {
+                            continue;
+                        }
+                        match tokio::fs::remove_dir_all(&segment).await {
+                            Ok(()) => {}
+                            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+                    let Some(collection_id) = collection
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| uuid::Uuid::parse_str(name).ok())
+                    else {
+                        continue;
+                    };
+                    let collection_exists: bool =
+                        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?)")
+                            .bind(collection_id.to_string())
+                            .fetch_one(self.sqlite.get_conn())
+                            .await?;
+                    if !collection_exists {
+                        // A folder that still holds something stays.
+                        for empty in [segments, collection] {
+                            if tokio::fs::remove_dir(&empty).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn reset(&self) -> Result<(), LocalSegmentManagerError> {
@@ -461,6 +942,57 @@ mod tests {
         Chunk, KnnIndex, LogRecord, Operation, OperationRecord, Schema, SegmentScope, SegmentType,
         SegmentUuid,
     };
+
+    // The SPANN provider of a single node reads as the query service of the worker of distributed Chroma and writes as
+    // its compaction service, with the settings of rust/worker/chroma_config.yaml.
+    #[test]
+    fn the_spann_provider_has_the_settings_of_the_worker() {
+        use figment::providers::Format;
+        #[derive(Deserialize)]
+        struct Service {
+            spann_provider: serde_json::Value,
+            blockfile_provider: serde_json::Value,
+        }
+        #[derive(Deserialize)]
+        struct Worker {
+            query_service: Service,
+            compaction_service: Service,
+        }
+        let worker: Worker = figment::Figment::from(figment::providers::Yaml::string(
+            include_str!("../../worker/chroma_config.yaml"),
+        ))
+        .extract()
+        .unwrap();
+        let normalized = |section: serde_json::Value| {
+            serde_json::to_value(serde_json::from_value::<SpannProviderConfig>(section).unwrap())
+                .unwrap()
+        };
+        let query = normalized(worker.query_service.spann_provider);
+        let compaction = normalized(worker.compaction_service.spann_provider);
+        let local = serde_json::to_value(local_spann_config().unwrap()).unwrap();
+        assert_eq!(
+            local["adaptive_search_nprobe"],
+            query["adaptive_search_nprobe"]
+        );
+        for setting in [
+            "pl_block_size",
+            "pl_garbage_collection",
+            "hnsw_garbage_collection",
+        ] {
+            assert_eq!(local[setting], compaction[setting], "{setting}");
+        }
+        let blockfiles = serde_json::to_value(
+            serde_json::from_value::<BlockfileProviderConfig>(
+                worker.compaction_service.blockfile_provider,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(local_blockfile_config().unwrap()).unwrap(),
+            blockfiles
+        );
+    }
 
     // The SPANN index of distributed Chroma on the data path of the single node: written and flushed with the
     // providers of one manager, read back from the files by those of the next one.

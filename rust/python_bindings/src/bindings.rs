@@ -486,7 +486,7 @@ impl Bindings {
             cache_ttl_secs: 60,
         };
 
-        let executor_config = ExecutorConfig::Local(LocalExecutorConfig {});
+        let executor_config = ExecutorConfig::Local(LocalExecutorConfig::default());
 
         let knn_index = KnnIndex::Hnsw;
         let enable_schema = true;

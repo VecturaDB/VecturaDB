@@ -1171,6 +1171,22 @@ impl ServiceBasedFrontend {
         self.default_knn_index
     }
 
+    /// The index of a new collection: SPANN on a single node when the request asks for it and the executor supports
+    /// SPANN collections, the default otherwise.
+    pub fn knn_index_for(&self, spann_requested: bool) -> KnnIndex {
+        match &self.executor {
+            Executor::Local(_)
+                if spann_requested
+                    && self
+                        .get_supported_segment_types()
+                        .contains(&SegmentType::Spann) =>
+            {
+                KnnIndex::Spann
+            }
+            _ => self.default_knn_index,
+        }
+    }
+
     pub async fn heartbeat(&self) -> Result<HeartbeatResponse, HeartbeatError> {
         Ok(HeartbeatResponse {
             nanosecond_heartbeat: SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
@@ -1611,13 +1627,16 @@ impl ServiceBasedFrontend {
             ..
         }: CreateCollectionRequest,
     ) -> Result<CreateCollectionResponse, CreateCollectionError> {
+        let spann_requested =
+            frontend_core::collection_ops::asks_for_spann(configuration.as_ref(), schema.as_ref());
+        let knn_index = self.knn_index_for(spann_requested);
         let plan = frontend_core::collection_ops::plan_create_collection(
             configuration,
             schema,
             executor_kind(&self.executor),
             &self.get_supported_segment_types(),
             self.enable_schema,
-            self.default_knn_index,
+            knn_index,
             frontend_core::collection_ops::TenantFeatureFlags {
                 enable_quantization: self.should_enable_quantization_for_tenant(&tenant_id),
                 enable_maxscore: self.should_enable_maxscore_for_tenant(&tenant_id),
@@ -1832,9 +1851,10 @@ impl ServiceBasedFrontend {
     }
 
     /// The fork on a single node. Distributed Chroma forks the log and shares the segment files of the source (the
-    /// other branch of retryable_fork); a single node has no segment files to share and its log holds only the writes
-    /// not yet applied. So the sysdb copies the collection and its segments, then the records of the source are written
-    /// again into the copy through the local write path, in storage order. If the copy fails, the new collection is
+    /// other branch of retryable_fork); a single node shares no segment files, not even the blockfiles of a SPANN
+    /// collection, and its log holds only the writes not yet applied. So the sysdb copies the collection and its
+    /// segments without their files, then the records of the source are written again into the copy through the local
+    /// write path, in storage order. If the copy fails, the new collection is
     /// removed and the fork fails as a whole.
     async fn fork_local(
         &mut self,
@@ -1875,6 +1895,7 @@ impl ServiceBasedFrontend {
         {
             let segments = [
                 target.metadata_segment.clone(),
+                target.record_segment.clone(),
                 target.vector_segment.clone(),
             ];
             if let Err(cleanup) = self
@@ -2066,15 +2087,34 @@ impl ServiceBasedFrontend {
                     &owned_schema
                 }
             };
-            schema
-                .get_internal_hnsw_config_with_legacy_fallback(&collection.vector_segment)
-                .map_err(|err| PushLogsError::Other(err.boxed()))?
-                .ok_or_else(|| PushLogsError::Other(chroma_segment::local_hnsw::LocalHnswSegmentWriterError::MissingHnswConfiguration.boxed()))?;
-            // Reject an unreadable persisted index before committing more logs.
-            self.executor
-                .validate_index(&collection)
-                .await
-                .map_err(|err| PushLogsError::Other(err.boxed()))?;
+            if collection.vector_segment.r#type == SegmentType::Spann {
+                // A SPANN collection writes through its record and SPANN segments, which need the option.
+                if !self
+                    .get_supported_segment_types()
+                    .contains(&SegmentType::Spann)
+                {
+                    return Err(PushLogsError::Other(Box::new(
+                        ValidationError::InvalidArgument(
+                            "SPANN collections need the executor option spann".to_string(),
+                        ),
+                    )));
+                }
+                // Reject SPANN files that cannot be read before committing more logs, as for HNSW below.
+                self.executor
+                    .validate_spann_index(&collection)
+                    .await
+                    .map_err(|err| PushLogsError::Other(err.boxed()))?;
+            } else {
+                schema
+                    .get_internal_hnsw_config_with_legacy_fallback(&collection.vector_segment)
+                    .map_err(|err| PushLogsError::Other(err.boxed()))?
+                    .ok_or_else(|| PushLogsError::Other(chroma_segment::local_hnsw::LocalHnswSegmentWriterError::MissingHnswConfiguration.boxed()))?;
+                // Reject an unreadable persisted index before committing more logs.
+                self.executor
+                    .validate_index(&collection)
+                    .await
+                    .map_err(|err| PushLogsError::Other(err.boxed()))?;
+            }
         }
         self.log_client
             .push_logs(tenant_id, database_name, collection_id, records, cmek, None)
@@ -3930,8 +3970,8 @@ mod tests {
     use chroma_config::registry::Registry;
     use chroma_sysdb::GrpcSysDbConfig;
     use chroma_types::{
-        Collection, MetadataComparison, MetadataExpression, MetadataValue, PrimitiveOperator,
-        SegmentScope,
+        Collection, InternalCollectionConfiguration, MetadataComparison, MetadataExpression,
+        MetadataValue, PrimitiveOperator, SegmentScope,
     };
     use uuid::Uuid;
 
@@ -4388,6 +4428,414 @@ mod tests {
             .unwrap()
     }
 
+    // A single node on a data path, with SPANN collections when spann is on.
+    async fn frontend_with_spann(root: &std::path::Path, spann: bool) -> ServiceBasedFrontend {
+        frontend_with_spann_registry(root, spann, &Registry::new()).await
+    }
+
+    // A SPANN frontend that keeps the files of a replaced version for the grace given.
+    async fn frontend_with_spann_grace(
+        root: &std::path::Path,
+        grace: std::time::Duration,
+    ) -> ServiceBasedFrontend {
+        let registry = Registry::new();
+        registry.register(chroma_log::SpannVersionGrace(grace));
+        frontend_with_spann_registry(root, true, &registry).await
+    }
+
+    async fn frontend_with_spann_registry(
+        root: &std::path::Path,
+        spann: bool,
+        registry: &Registry,
+    ) -> ServiceBasedFrontend {
+        let executor = crate::executor::config::LocalExecutorConfig {
+            spann,
+            ..Default::default()
+        };
+        frontend_with_local_executor(root, executor, registry).await
+    }
+
+    // A single node on a data path, with the config of its executor given.
+    async fn frontend_with_local_executor(
+        root: &std::path::Path,
+        executor: crate::executor::config::LocalExecutorConfig,
+        registry: &Registry,
+    ) -> ServiceBasedFrontend {
+        let system = System::new();
+        let mut config = FrontendConfig::sqlite_in_memory();
+        config.sqlitedb.as_mut().unwrap().url =
+            Some(root.join("chroma.sqlite3").to_str().unwrap().into());
+        config.segment_manager.as_mut().unwrap().persist_path = Some(root.to_str().unwrap().into());
+        config.executor = crate::executor::config::ExecutorConfig::Local(executor);
+        ServiceBasedFrontend::try_from_config(&(config, system), registry)
+            .await
+            .unwrap()
+    }
+
+    // With the option off, a request for SPANN, in the configuration or in the schema, gets HNSW as before; with it on,
+    // the segments of distributed Chroma. A request without SPANN gets HNSW either way.
+    #[tokio::test]
+    async fn a_spann_request_gets_hnsw_unless_the_option_asks_for_spann() {
+        for spann in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut frontend = frontend_with_spann(root.path(), spann).await;
+            let request = |name: &str, configuration, schema| {
+                CreateCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    name.to_string(),
+                    None,
+                    configuration,
+                    schema,
+                    false,
+                )
+                .unwrap()
+            };
+            // As the HTTP server: a configuration with SPANN, converted with the index the frontend gives a SPANN
+            // request.
+            let spann_configuration = InternalCollectionConfiguration::try_from_config(
+                chroma_types::CollectionConfiguration {
+                    hnsw: None,
+                    spann: Some(chroma_types::SpannConfiguration::default()),
+                    embedding_function: None,
+                },
+                frontend.knn_index_for(true),
+                None,
+            )
+            .unwrap();
+            let created = [
+                (
+                    frontend
+                        .create_collection(request(
+                            "by-configuration",
+                            Some(spann_configuration),
+                            None,
+                        ))
+                        .await
+                        .unwrap(),
+                    spann,
+                ),
+                (
+                    frontend
+                        .create_collection(request(
+                            "by-schema",
+                            None,
+                            Some(Schema::new_default(KnnIndex::Spann)),
+                        ))
+                        .await
+                        .unwrap(),
+                    spann,
+                ),
+                (
+                    frontend
+                        .create_collection(request("plain", None, None))
+                        .await
+                        .unwrap(),
+                    false,
+                ),
+            ];
+            for (collection, gets_spann) in created {
+                let segments = frontend
+                    .sysdb_client
+                    .get_collection_with_segments(None, collection.collection_id)
+                    .await
+                    .unwrap();
+                let (vector, record) = if gets_spann {
+                    (SegmentType::Spann, SegmentType::BlockfileRecord)
+                } else {
+                    (SegmentType::HnswLocalPersisted, SegmentType::Sqlite)
+                };
+                assert_eq!(
+                    segments.vector_segment.r#type, vector,
+                    "{} spann={spann}",
+                    collection.name
+                );
+                assert_eq!(
+                    segments.record_segment.r#type, record,
+                    "{} spann={spann}",
+                    collection.name
+                );
+                assert_eq!(segments.metadata_segment.r#type, SegmentType::Sqlite);
+                let schema = segments.collection.schema.unwrap();
+                assert_eq!(schema.get_internal_spann_config().is_some(), gets_spann);
+                assert_eq!(schema.get_internal_hnsw_config().is_some(), !gets_spann);
+            }
+        }
+    }
+
+    // The ids of the k nearest of a query among the records, by squared L2 distance.
+    fn exact_nearest(records: &[(String, Vec<f32>)], query: &[f32], k: usize) -> Vec<String> {
+        let mut by_distance = records
+            .iter()
+            .map(|(id, vector)| {
+                let distance: f32 = vector
+                    .iter()
+                    .zip(query)
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
+                (distance, id.clone())
+            })
+            .collect::<Vec<_>>();
+        by_distance.sort_by(|a, b| a.0.total_cmp(&b.0));
+        by_distance.into_iter().take(k).map(|(_, id)| id).collect()
+    }
+
+    async fn query_ids(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        query: Vec<f32>,
+        k: u32,
+    ) -> Vec<String> {
+        frontend
+            .query(
+                QueryRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    None,
+                    None,
+                    vec![query],
+                    k,
+                    chroma_types::IncludeList::default_query(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .ids
+            .remove(0)
+    }
+
+    // A SPANN collection on a single node reads back what is written to it, by id and by KNN, after deletes and after
+    // a restart.
+    #[tokio::test]
+    async fn a_spann_collection_reads_back_its_records() {
+        let root = tempfile::tempdir().unwrap();
+        let mut records = (0..300)
+            .map(|i| {
+                let x = i as f32;
+                (
+                    format!("r{i}"),
+                    vec![
+                        (x * 0.37).sin(),
+                        (x * 0.11).cos(),
+                        (x * 0.05).sin(),
+                        x / 300.0,
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        let queries = [0usize, 77, 150, 299]
+            .iter()
+            .map(|&i| records[i].1.iter().map(|v| v + 0.01).collect::<Vec<f32>>())
+            .collect::<Vec<_>>();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection = frontend
+            .create_collection(
+                CreateCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    "spann-records".to_string(),
+                    None,
+                    None,
+                    Some(Schema::new_default(KnnIndex::Spann)),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let collection_id = collection.collection_id;
+        for chunk in records.chunks(100) {
+            frontend
+                .add(
+                    AddCollectionRecordsRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection_id,
+                        chunk.iter().map(|(id, _)| id.clone()).collect(),
+                        chunk.iter().map(|(_, vector)| vector.clone()).collect(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let segments = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collection_id)
+            .await
+            .unwrap();
+        assert_eq!(segments.vector_segment.r#type, SegmentType::Spann);
+        assert!(!segments.vector_segment.file_path.is_empty());
+        assert!(!segments.record_segment.file_path.is_empty());
+        for query in &queries {
+            assert_eq!(
+                query_ids(&mut frontend, collection_id, query.clone(), 5).await,
+                exact_nearest(&records, query, 5)
+            );
+        }
+        let got = frontend
+            .get(
+                GetRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    Some(vec!["r7".to_string(), "r250".to_string()]),
+                    None,
+                    None,
+                    0,
+                    chroma_types::IncludeList(vec![chroma_types::Include::Embedding]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut got = got
+            .ids
+            .into_iter()
+            .zip(got.embeddings.unwrap())
+            .collect::<Vec<_>>();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("r250".to_string(), records[250].1.clone()),
+                ("r7".to_string(), records[7].1.clone()),
+            ]
+        );
+
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    Some((0..10).map(|i| format!("r{i}")).collect()),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        records.drain(0..10);
+        let count = |frontend: &mut ServiceBasedFrontend| {
+            let mut frontend = frontend.clone();
+            async move {
+                frontend
+                    .count(
+                        CountRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            chroma_types::plan::ReadLevel::default(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(count(&mut frontend).await, 290);
+        for query in &queries {
+            assert_eq!(
+                query_ids(&mut frontend, collection_id, query.clone(), 5).await,
+                exact_nearest(&records, query, 5)
+            );
+        }
+        drop(frontend);
+
+        let mut reopened = frontend_with_spann(root.path(), true).await;
+        assert_eq!(count(&mut reopened).await, 290);
+        for query in &queries {
+            assert_eq!(
+                query_ids(&mut reopened, collection_id, query.clone(), 5).await,
+                exact_nearest(&records, query, 5)
+            );
+        }
+    }
+
+    // A cache of collections in memory keeps the segments of a collection for a while, with the files of an older
+    // flush; a query right after a write still reads the files of the last flush.
+    #[tokio::test]
+    async fn a_spann_query_reads_the_last_flush_through_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        let system = System::new();
+        let mut config = FrontendConfig::sqlite_in_memory();
+        config.sqlitedb.as_mut().unwrap().url =
+            Some(root.path().join("chroma.sqlite3").to_str().unwrap().into());
+        config.segment_manager.as_mut().unwrap().persist_path =
+            Some(root.path().to_str().unwrap().into());
+        config.executor = crate::executor::config::ExecutorConfig::Local(
+            crate::executor::config::LocalExecutorConfig {
+                spann: true,
+                ..Default::default()
+            },
+        );
+        config.collections_with_segments_provider.cache =
+            chroma_cache::CacheConfig::Memory(chroma_cache::FoyerCacheConfig {
+                capacity: 100,
+                ..Default::default()
+            });
+        let records = (0..200)
+            .map(|i| {
+                let x = i as f32;
+                (format!("r{i}"), vec![x, (x * 0.3).sin(), (x * 0.7).cos()])
+            })
+            .collect::<Vec<_>>();
+        let mut frontend = ServiceBasedFrontend::try_from_config(&(config, system), &registry)
+            .await
+            .unwrap();
+        let collection_id = frontend
+            .create_collection(
+                CreateCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    "spann-cache".to_string(),
+                    None,
+                    None,
+                    Some(Schema::new_default(KnnIndex::Spann)),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collection_id;
+        for (round, chunk) in records.chunks(100).enumerate() {
+            frontend
+                .add(
+                    AddCollectionRecordsRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection_id,
+                        chunk.iter().map(|(id, _)| id.clone()).collect(),
+                        chunk.iter().map(|(_, vector)| vector.clone()).collect(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            // Each query reads the records of every add so far.
+            let written = &records[..100 * (round + 1)];
+            let query = written.last().unwrap().1.clone();
+            assert_eq!(
+                query_ids(&mut frontend, collection_id, query.clone(), 3).await,
+                exact_nearest(written, &query, 3),
+                "after add {round}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn database_deletion_leaves_unrelated_cleanup_to_background() {
         let registry = Registry::new();
@@ -4628,6 +5076,2657 @@ mod tests {
         })
         .await
         .expect("the sweep at startup must take the row out");
+    }
+
+    // The files under a folder and its subfolders.
+    fn files_under(folder: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut folders = vec![folder.to_path_buf()];
+        while let Some(folder) = folders.pop() {
+            let Ok(entries) = std::fs::read_dir(&folder) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    folders.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
+    }
+
+    fn copy_folder(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let path = entry.unwrap().path();
+            let target = to.join(path.file_name().unwrap());
+            if path.is_dir() {
+                copy_folder(&path, &target);
+            } else {
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+
+    async fn spann_collection_with_records(
+        frontend: &mut ServiceBasedFrontend,
+        name: &str,
+    ) -> CollectionUuid {
+        let collection_id = frontend
+            .create_collection(
+                CreateCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    name.to_string(),
+                    None,
+                    None,
+                    Some(Schema::new_default(KnnIndex::Spann)),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collection_id;
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    (0..100).map(|i| format!("r{i}")).collect(),
+                    (0..100).map(|i| vec![i as f32, (i as f32).sin()]).collect(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        collection_id
+    }
+
+    // The files of a SPANN collection, its record segment and its SPANN index, go with the collection; their rows
+    // wait for the sweep, as those of an HNSW index. Another collection keeps its files.
+    #[tokio::test]
+    async fn a_spann_collection_deletion_removes_its_files() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let kept = spann_collection_with_records(&mut frontend, "spann-kept").await;
+        let kept_files = files_under(root.path().join("tenant").as_path()).len();
+        assert!(kept_files > 0);
+        spann_collection_with_records(&mut frontend, "spann-deleted").await;
+        assert!(files_under(root.path().join("tenant").as_path()).len() > kept_files);
+        frontend
+            .delete_collection(delete_collection_request("spann-deleted"))
+            .await
+            .unwrap();
+        let left = files_under(root.path().join("tenant").as_path());
+        assert_eq!(left.len(), kept_files);
+        assert!(left
+            .iter()
+            .all(|file| file.to_string_lossy().contains(&kept.to_string())));
+        assert_eq!(pending_cleanups(root.path()), 2);
+        frontend.executor.cleanup_deleted_indexes().await.unwrap();
+        assert_eq!(pending_cleanups(root.path()), 0);
+        assert_eq!(
+            query_ids(&mut frontend, kept, vec![3.0, 3f32.sin()], 1).await,
+            vec!["r3".to_string()]
+        );
+    }
+
+    // Files left by a deletion that stopped before removing them go with the sweep.
+    #[tokio::test]
+    async fn the_sweep_removes_the_files_of_a_deleted_spann_collection() {
+        let root = tempfile::tempdir().unwrap();
+        let saved = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        spann_collection_with_records(&mut frontend, "spann-swept").await;
+        copy_folder(&root.path().join("tenant"), &saved.path().join("tenant"));
+        frontend
+            .delete_collection(delete_collection_request("spann-swept"))
+            .await
+            .unwrap();
+        // As after a stop between the deletion in the catalog and the removal of the files.
+        copy_folder(&saved.path().join("tenant"), &root.path().join("tenant"));
+        assert!(!files_under(root.path().join("tenant").as_path()).is_empty());
+        frontend.executor.cleanup_deleted_indexes().await.unwrap();
+        assert!(files_under(root.path().join("tenant").as_path()).is_empty());
+        assert_eq!(pending_cleanups(root.path()), 0);
+    }
+
+    // The prefix of the files of a segment, from one of its paths.
+    fn segment_prefix(files: &std::collections::HashMap<String, Vec<String>>) -> String {
+        let path = files.values().flatten().next().unwrap();
+        chroma_types::Segment::extract_prefix_and_id(path)
+            .unwrap()
+            .0
+            .to_string()
+    }
+
+    type FileHooks = std::sync::Mutex<Vec<chroma_segment::local_segment_manager::FileHook>>;
+
+    // A hook of the cleanup of the SPANN files under a prefix, on its reads of roots or its removals of files, taken
+    // out when dropped, with the count of those operations and, when asked, the meeting of the first two.
+    struct CleanupHook(&'static FileHooks, String);
+
+    impl Drop for CleanupHook {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().retain(|hook| hook.prefix != self.1);
+        }
+    }
+
+    fn cleanup_hook(
+        hooks: &'static FileHooks,
+        prefix: &str,
+        meeting: bool,
+    ) -> (
+        CleanupHook,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Option<Arc<chroma_segment::local_segment_manager::Meeting>>,
+    ) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let meeting =
+            meeting.then(|| Arc::new(chroma_segment::local_segment_manager::Meeting::default()));
+        hooks
+            .lock()
+            .unwrap()
+            .push(chroma_segment::local_segment_manager::FileHook {
+                prefix: prefix.to_string(),
+                count: count.clone(),
+                meeting: meeting.clone(),
+            });
+        (CleanupHook(hooks, prefix.to_string()), count, meeting)
+    }
+
+    // The cleanup of the files of the replaced versions of a SPANN collection reads the roots of their blockfiles
+    // together, as distributed Chroma lists the files of a version: one after the other, on a folder mounted from
+    // another system, the reads of the roots of the versions of a minute held the compactor for 2.2 to 3.4 s. Here the
+    // first two reads of roots of the record segment meet where they read the files, which reads one after the other
+    // never do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_cleanup_reads_its_roots_together() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann_grace(root.path(), std::time::Duration::ZERO).await;
+        let collection_id = spann_collection_with_records(&mut frontend, "spann-cleanup").await;
+        let (files, _) = record_roots(&mut frontend, root.path(), collection_id).await;
+        let (_hook, count, meeting) = cleanup_hook(
+            &chroma_segment::local_segment_manager::ROOT_READS,
+            &segment_prefix(&files),
+            true,
+        );
+        tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+        )
+        .await
+        .unwrap();
+        assert!(count.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        assert!(meeting
+            .unwrap()
+            .met
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // The cleanup removes the files that no version names together, as distributed Chroma deletes them: one after the
+    // other, on a folder mounted from another system, the removals after the versions of a minute held the compactor
+    // for up to 5.6 s. Here two block files that no version names meet where they are removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_cleanup_removes_its_files_together() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = spann_collection_with_records(&mut frontend, "spann-removals").await;
+        let (files, _) = record_roots(&mut frontend, root.path(), collection_id).await;
+        let prefix = segment_prefix(&files);
+        let unused: Vec<_> = (0..2)
+            .map(|_| {
+                root.path()
+                    .join(&prefix)
+                    .join("block")
+                    .join(Uuid::new_v4().to_string())
+            })
+            .collect();
+        for file in &unused {
+            std::fs::write(file, b"").unwrap();
+        }
+        let (_hook, count, meeting) = cleanup_hook(
+            &chroma_segment::local_segment_manager::FILE_REMOVALS,
+            &prefix,
+            true,
+        );
+        local_executor(&frontend)
+            .segment_manager()
+            .remove_unused_spann_files(&prefix, &[&files])
+            .await
+            .unwrap();
+        assert!(unused.iter().all(|file| !file.exists()));
+        assert!(count.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        assert!(meeting
+            .unwrap()
+            .met
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // A root that is there but cannot be read stops the cleanup, and the files stay: only a root that is not there went
+    // with its version, and taking any error for that would remove the blocks of a version that is kept.
+    #[tokio::test]
+    async fn a_spann_cleanup_stops_on_a_root_it_cannot_read() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = spann_collection_with_records(&mut frontend, "spann-bad-root").await;
+        let (files, roots) = record_roots(&mut frontend, root.path(), collection_id).await;
+        let prefix = segment_prefix(&files);
+        std::fs::write(&roots[0], b"not a root").unwrap();
+        let unused = root
+            .path()
+            .join(&prefix)
+            .join("block")
+            .join(Uuid::new_v4().to_string());
+        std::fs::write(&unused, b"").unwrap();
+        assert!(local_executor(&frontend)
+            .segment_manager()
+            .remove_unused_spann_files(&prefix, &[&files])
+            .await
+            .is_err());
+        assert!(unused.exists());
+    }
+
+    // The cleanup lists the folders of the HNSW indexes of the centers together, as it reads the roots and removes the
+    // files: one for each index that a flush wrote, each listing a round trip on a folder mounted from another system.
+    // Here two folders of indexes that no version names meet where they are listed, and go with their files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_cleanup_lists_its_index_folders_together() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = spann_collection_with_records(&mut frontend, "spann-folders").await;
+        let files = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collection_id)
+            .await
+            .unwrap()
+            .vector_segment
+            .file_path;
+        let prefix = segment_prefix(&files);
+        let unused: Vec<_> = (0..2)
+            .map(|_| {
+                root.path()
+                    .join(&prefix)
+                    .join("hnsw")
+                    .join(Uuid::new_v4().to_string())
+            })
+            .collect();
+        for folder in &unused {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("header.bin"), b"").unwrap();
+        }
+        let (_hook, count, meeting) = cleanup_hook(
+            &chroma_segment::local_segment_manager::FOLDER_LISTINGS,
+            &prefix,
+            true,
+        );
+        local_executor(&frontend)
+            .segment_manager()
+            .remove_unused_spann_files(&prefix, &[&files])
+            .await
+            .unwrap();
+        assert!(unused.iter().all(|folder| !folder.exists()));
+        assert!(count.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        assert!(meeting
+            .unwrap()
+            .met
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // The cleanup reads each root once, even when two versions name it, as distributed Chroma.
+    #[tokio::test]
+    async fn a_spann_cleanup_reads_each_root_once() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = spann_collection_with_records(&mut frontend, "spann-once").await;
+        let (files, _) = record_roots(&mut frontend, root.path(), collection_id).await;
+        let prefix = segment_prefix(&files);
+        let (_hook, count, _) = cleanup_hook(
+            &chroma_segment::local_segment_manager::ROOT_READS,
+            &prefix,
+            false,
+        );
+        local_executor(&frontend)
+            .segment_manager()
+            .remove_unused_spann_files(&prefix, &[&files, &files])
+            .await
+            .unwrap();
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            files.values().map(Vec::len).sum::<usize>()
+        );
+    }
+
+    // A version whose root is not there, as one whose files went with it, does not stop the cleanup, as distributed
+    // Chroma: a file that no version names still goes.
+    #[tokio::test]
+    async fn a_spann_cleanup_goes_on_without_a_root() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = spann_collection_with_records(&mut frontend, "spann-no-root").await;
+        let (files, _) = record_roots(&mut frontend, root.path(), collection_id).await;
+        let prefix = segment_prefix(&files);
+        let gone = std::collections::HashMap::from([(
+            "offset_id_to_data".to_string(),
+            vec![format!("{prefix}/{}", Uuid::new_v4())],
+        )]);
+        let unused = root
+            .path()
+            .join(&prefix)
+            .join("block")
+            .join(Uuid::new_v4().to_string());
+        std::fs::write(&unused, b"").unwrap();
+        local_executor(&frontend)
+            .segment_manager()
+            .remove_unused_spann_files(&prefix, &[&files, &gone])
+            .await
+            .unwrap();
+        assert!(!unused.exists());
+    }
+
+    // On a single node a fork copies the records of a SPANN collection into files of its own, as it copies those of an
+    // HNSW collection: the fork answers after the source and its files are gone.
+    #[tokio::test]
+    async fn a_spann_fork_keeps_files_of_its_own() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let source = spann_collection_with_records(&mut frontend, "spann-source").await;
+        let fork = frontend
+            .fork_collection(
+                ForkCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    source,
+                    "spann-fork".to_string(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collection_id;
+        let files = |segments: &CollectionAndSegments| {
+            segments
+                .record_segment
+                .file_path
+                .values()
+                .chain(segments.vector_segment.file_path.values())
+                .flatten()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let source_files = files(
+            &frontend
+                .sysdb_client
+                .get_collection_with_segments(None, source)
+                .await
+                .unwrap(),
+        );
+        let forked = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, fork)
+            .await
+            .unwrap();
+        assert_eq!(forked.vector_segment.r#type, SegmentType::Spann);
+        let fork_files = files(&forked);
+        assert!(!fork_files.is_empty());
+        assert!(fork_files.is_disjoint(&source_files));
+
+        frontend
+            .delete_collection(delete_collection_request("spann-source"))
+            .await
+            .unwrap();
+        frontend.executor.cleanup_deleted_indexes().await.unwrap();
+        let records = (0..100)
+            .map(|i| (format!("r{i}"), vec![i as f32, (i as f32).sin()]))
+            .collect::<Vec<_>>();
+        for query in [vec![3.2, 0.0], vec![70.0, 1.0]] {
+            assert_eq!(
+                query_ids(&mut frontend, fork, query.clone(), 4).await,
+                exact_nearest(&records, &query, 4)
+            );
+        }
+    }
+
+    // The versions of a SPANN collection on disk, from the files of its segments: a flush writes a root for each
+    // blockfile of a segment and a folder for the HNSW index of the centers.
+    fn spann_versions_on_disk(
+        root: &std::path::Path,
+        segments: &CollectionAndSegments,
+    ) -> (usize, usize, usize) {
+        let files = files_under(root.join("tenant").as_path());
+        let in_folder = |segment: chroma_types::SegmentUuid, folder: &str| {
+            files
+                .iter()
+                .filter(|file| {
+                    file.to_string_lossy().contains(&segment.to_string())
+                        && file.parent().and_then(|parent| parent.file_name())
+                            == Some(std::ffi::OsStr::new(folder))
+                })
+                .count()
+        };
+        let hnsw_indexes = files
+            .iter()
+            .filter(|file| {
+                file.to_string_lossy()
+                    .contains(&segments.vector_segment.id.to_string())
+            })
+            .filter_map(|file| {
+                let index = file.parent()?;
+                (index.parent()?.file_name()? == "hnsw").then(|| index.to_path_buf())
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        (
+            in_folder(segments.record_segment.id, "root"),
+            in_folder(segments.vector_segment.id, "root"),
+            hnsw_indexes,
+        )
+    }
+
+    // A flush removes the files of the versions of a SPANN collection that it replaced longer than the grace ago, and
+    // keeps the version before the current one, as the garbage collector of distributed Chroma with its
+    // min_versions_to_keep of 2. The records still read back, after a restart too.
+    #[tokio::test]
+    async fn a_spann_flush_removes_the_versions_it_replaced() {
+        let records = (0..2000)
+            .map(|i| {
+                let x = i as f32;
+                (
+                    format!("r{i}"),
+                    vec![(x * 0.37).sin(), (x * 0.11).cos(), x / 2000.0],
+                )
+            })
+            .collect::<Vec<_>>();
+        let write =
+            |frontend: &mut ServiceBasedFrontend, collection_id, chunk: &[(String, Vec<f32>)]| {
+                let mut frontend = frontend.clone();
+                let request = AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    chunk.iter().map(|(id, _)| id.clone()).collect(),
+                    chunk.iter().map(|(_, vector)| vector.clone()).collect(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+                async move { frontend.add(request).await.unwrap() }
+            };
+        let create = |frontend: &mut ServiceBasedFrontend| {
+            let mut frontend = frontend.clone();
+            async move {
+                frontend
+                    .create_collection(
+                        CreateCollectionRequest::try_new(
+                            TENANT.to_string(),
+                            DatabaseName::new(DATABASE).unwrap(),
+                            "spann-versions".to_string(),
+                            None,
+                            None,
+                            Some(Schema::new_default(KnnIndex::Spann)),
+                            false,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .collection_id
+            }
+        };
+
+        // Within the grace every version stays, for the reads that opened it.
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = create(&mut frontend).await;
+        for chunk in records[..300].chunks(100) {
+            write(&mut frontend, collection_id, chunk).await;
+        }
+        let segments = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collection_id)
+            .await
+            .unwrap();
+        assert_eq!(spann_versions_on_disk(root.path(), &segments), (12, 9, 3));
+        drop(frontend);
+
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann_grace(root.path(), std::time::Duration::ZERO).await;
+        let collection_id = create(&mut frontend).await;
+        for chunk in records.chunks(100) {
+            write(&mut frontend, collection_id, chunk).await;
+        }
+        let segments = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collection_id)
+            .await
+            .unwrap();
+        // The current version and the one before it.
+        assert_eq!(spann_versions_on_disk(root.path(), &segments), (8, 6, 2));
+        let queries = [0usize, 777, 1999]
+            .iter()
+            .map(|&i| records[i].1.iter().map(|v| v + 0.01).collect::<Vec<f32>>())
+            .collect::<Vec<_>>();
+        for query in &queries {
+            assert_eq!(
+                query_ids(&mut frontend, collection_id, query.clone(), 5).await,
+                exact_nearest(&records, query, 5)
+            );
+        }
+        drop(frontend);
+        let mut reopened = frontend_with_spann(root.path(), true).await;
+        for query in &queries {
+            assert_eq!(
+                query_ids(&mut reopened, collection_id, query.clone(), 5).await,
+                exact_nearest(&records, query, 5)
+            );
+        }
+    }
+
+    // The Search API on a SPANN collection: a dense KNN rank answers as on the same records in an HNSW collection, and
+    // as the exact nearest, with their distance and embedding, with and without a filter.
+    #[tokio::test]
+    async fn a_spann_collection_answers_search_as_an_hnsw_collection() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let records = (0..300)
+            .map(|i| {
+                let x = i as f32;
+                (
+                    format!("r{i}"),
+                    vec![(x * 0.37).sin(), (x * 0.11).cos(), x / 300.0],
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut collections = Vec::new();
+        for (name, index) in [
+            ("search-spann", KnnIndex::Spann),
+            ("search-hnsw", KnnIndex::Hnsw),
+        ] {
+            let collection_id = frontend
+                .create_collection(
+                    CreateCollectionRequest::try_new(
+                        TENANT.to_string(),
+                        DatabaseName::new(DATABASE).unwrap(),
+                        name.to_string(),
+                        None,
+                        None,
+                        Some(Schema::new_default(index)),
+                        false,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .collection_id;
+            frontend
+                .add(
+                    AddCollectionRecordsRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection_id,
+                        records.iter().map(|(id, _)| id.clone()).collect(),
+                        records.iter().map(|(_, vector)| vector.clone()).collect(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            collections.push(collection_id);
+        }
+        let segments = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collections[0])
+            .await
+            .unwrap();
+        assert_eq!(segments.vector_segment.r#type, SegmentType::Spann);
+
+        let even = records.iter().step_by(2).cloned().collect::<Vec<_>>();
+        let query = vec![0.3, -0.2, 0.5];
+        let payload = |query_ids: Option<Vec<String>>| SearchPayload {
+            filter: Filter {
+                query_ids,
+                where_clause: None,
+            },
+            rank: chroma_types::operator::Rank {
+                expr: Some(chroma_types::operator::RankExpr::Knn {
+                    query: chroma_types::operator::QueryVector::Dense(query.clone()),
+                    key: chroma_types::operator::Key::Embedding,
+                    limit: 5,
+                    default: None,
+                    return_rank: false,
+                }),
+            },
+            limit: Limit {
+                offset: 0,
+                limit: Some(5),
+            },
+            select: chroma_types::operator::Select {
+                keys: [
+                    chroma_types::operator::Key::Score,
+                    chroma_types::operator::Key::Embedding,
+                ]
+                .into_iter()
+                .collect(),
+            },
+            ..Default::default()
+        };
+        let mut answers = Vec::new();
+        for &collection_id in &collections {
+            let response = frontend
+                .search(
+                    SearchRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection_id,
+                        vec![
+                            payload(None),
+                            payload(Some(even.iter().map(|(id, _)| id.clone()).collect())),
+                        ],
+                        chroma_types::plan::ReadLevel::default(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            answers.push(response);
+        }
+        let distance = |vector: &[f32]| -> f32 {
+            vector
+                .iter()
+                .zip(&query)
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum()
+        };
+        for (payload, candidates) in [(0, &records), (1, &even)] {
+            let expected = exact_nearest(candidates, &query, 5);
+            for answer in &answers {
+                assert_eq!(answer.ids[payload], expected);
+                let scores = answer.scores[payload].as_ref().unwrap();
+                let embeddings = answer.embeddings[payload].as_ref().unwrap();
+                for (position, id) in expected.iter().enumerate() {
+                    let vector = &records.iter().find(|(record, _)| record == id).unwrap().1;
+                    assert_eq!(embeddings[position].as_ref(), Some(vector));
+                    assert!((scores[position].unwrap() - distance(vector)).abs() < 1e-4);
+                }
+            }
+        }
+    }
+
+    // Chroma 1.5.9 and the VecturaDB releases before SPANN delete a SPANN collection from the catalog and leave its
+    // files, with no row in index_cleanup: the sweep removes the folders of the segments that the catalog no longer
+    // has, and leaves those of the others.
+    #[tokio::test]
+    async fn the_sweep_removes_the_files_of_spann_segments_the_catalog_no_longer_has() {
+        let root = tempfile::tempdir().unwrap();
+        let saved = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let kept = spann_collection_with_records(&mut frontend, "spann-kept").await;
+        let kept_files = files_under(root.path().join("tenant").as_path()).len();
+        spann_collection_with_records(&mut frontend, "spann-deleted-elsewhere").await;
+        copy_folder(&root.path().join("tenant"), &saved.path().join("tenant"));
+        frontend
+            .delete_collection(delete_collection_request("spann-deleted-elsewhere"))
+            .await
+            .unwrap();
+        // As after a deletion by a server that knows nothing of these files.
+        copy_folder(&saved.path().join("tenant"), &root.path().join("tenant"));
+        let path = root.path().join("chroma.sqlite3");
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    use sqlx::Connection;
+                    let options = sqlx::sqlite::SqliteConnectOptions::new()
+                        .filename(path)
+                        .busy_timeout(std::time::Duration::from_secs(5));
+                    let mut connection = sqlx::SqliteConnection::connect_with(&options)
+                        .await
+                        .unwrap();
+                    sqlx::query("DELETE FROM index_cleanup")
+                        .execute(&mut connection)
+                        .await
+                        .unwrap();
+                })
+        })
+        .join()
+        .unwrap();
+        assert!(files_under(root.path().join("tenant").as_path()).len() > kept_files);
+        frontend.executor.cleanup_deleted_indexes().await.unwrap();
+        let left = files_under(root.path().join("tenant").as_path());
+        assert_eq!(left.len(), kept_files);
+        assert!(left
+            .iter()
+            .all(|file| file.to_string_lossy().contains(&kept.to_string())));
+        assert_eq!(
+            query_ids(&mut frontend, kept, vec![3.0, 3f32.sin()], 1).await,
+            vec!["r3".to_string()]
+        );
+    }
+
+    // As Chroma Cloud (go/pkg/sysdb/coordinator/model/collection_configuration.go): an HNSW update of a SPANN collection
+    // fails, with its message, as a bad request where Chroma Cloud answers 500; a SPANN update applies, and an HNSW
+    // collection takes an HNSW update as before.
+    #[tokio::test]
+    async fn an_hnsw_update_of_a_spann_collection_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let spann = spann_collection_with_records(&mut frontend, "spann-update").await;
+        let hnsw = create_collection_for(&mut frontend, TENANT, DATABASE, "hnsw-update").await;
+        let update = |collection_id, vector_index| {
+            UpdateCollectionRequest::try_new(
+                Some(DatabaseName::new(DATABASE).unwrap()),
+                collection_id,
+                None,
+                None,
+                Some(chroma_types::InternalUpdateCollectionConfiguration {
+                    vector_index: Some(vector_index),
+                    embedding_function: None,
+                }),
+            )
+            .unwrap()
+        };
+        let hnsw_update = || {
+            chroma_types::UpdateVectorIndexConfiguration::Hnsw(Some(
+                chroma_types::UpdateHnswConfiguration {
+                    ef_search: Some(50),
+                    ..Default::default()
+                },
+            ))
+        };
+        let err = frontend
+            .update_collection(update(spann, hnsw_update()))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), ErrorCodes::InvalidArgument);
+        assert!(err
+            .to_string()
+            .contains("trying to update hnsw config but schema has spann"));
+        frontend
+            .update_collection(update(
+                spann,
+                chroma_types::UpdateVectorIndexConfiguration::Spann(Some(
+                    chroma_types::UpdateSpannConfiguration {
+                        search_nprobe: Some(32),
+                        ef_search: None,
+                    },
+                )),
+            ))
+            .await
+            .unwrap();
+        let config = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, spann)
+            .await
+            .unwrap()
+            .collection
+            .schema
+            .unwrap()
+            .get_internal_spann_config()
+            .unwrap();
+        assert_eq!(config.search_nprobe, 32);
+        frontend
+            .update_collection(update(hnsw.collection_id, hnsw_update()))
+            .await
+            .unwrap();
+    }
+
+    // Records with a document each, under the prefix, with the vectors of their numbers.
+    async fn add_with_documents(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        numbers: std::ops::Range<usize>,
+        prefix: &str,
+    ) {
+        let numbers = numbers.collect::<Vec<_>>();
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    numbers.iter().map(|i| format!("{prefix}{i}")).collect(),
+                    numbers
+                        .iter()
+                        .map(|&i| vec![i as f32, (i as f32).sin()])
+                        .collect(),
+                    Some(
+                        numbers
+                            .iter()
+                            .map(|i| Some(format!("document {prefix}{i}")))
+                            .collect(),
+                    ),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // What reads see while one writer adds and deletes records of the same collection: every record that a query, a
+    // search or a get returns should come with its document and its embedding, and no read should fail. Returns what
+    // went otherwise.
+    async fn reads_during_writes(index: KnnIndex, rounds: usize) -> Vec<String> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = frontend
+            .create_collection(
+                CreateCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    "moments".to_string(),
+                    None,
+                    None,
+                    Some(Schema::new_default(index)),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collection_id;
+        add_with_documents(&mut frontend, collection_id, 0..200, "r").await;
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let writer = {
+            let mut frontend = frontend.clone();
+            let done = done.clone();
+            async move {
+                for round in 0..rounds {
+                    add_with_documents(&mut frontend, collection_id, round..round + 1, "w").await;
+                    frontend
+                        .delete(
+                            DeleteCollectionRecordsRequest::try_new(
+                                TENANT.to_string(),
+                                DATABASE.to_string(),
+                                collection_id,
+                                Some(vec![format!("w{round}")]),
+                                None,
+                                None,
+                            )
+                            .unwrap(),
+                            String::new(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                done.store(true, Ordering::SeqCst);
+            }
+        };
+        let queries = {
+            let mut frontend = frontend.clone();
+            let done = done.clone();
+            async move {
+                let mut wrong = Vec::new();
+                while !done.load(Ordering::SeqCst) {
+                    let response = frontend
+                        .query(
+                            QueryRequest::try_new(
+                                TENANT.to_string(),
+                                DATABASE.to_string(),
+                                collection_id,
+                                None,
+                                None,
+                                vec![vec![0.0, 0.0]],
+                                500,
+                                chroma_types::IncludeList(vec![
+                                    chroma_types::Include::Document,
+                                    chroma_types::Include::Embedding,
+                                ]),
+                            )
+                            .unwrap(),
+                        )
+                        .await;
+                    match response {
+                        Ok(response) => {
+                            let documents = response.documents.unwrap_or_default();
+                            let embeddings = response.embeddings.unwrap_or_default();
+                            fn at<T>(lists: &[Vec<Option<T>>], position: usize) -> bool {
+                                lists
+                                    .first()
+                                    .and_then(|list| list.get(position))
+                                    .is_some_and(Option::is_some)
+                            }
+                            for (position, id) in response.ids[0].iter().enumerate() {
+                                if !at(&documents, position) {
+                                    wrong.push(format!("query: {id} without its document"));
+                                }
+                                if !at(&embeddings, position) {
+                                    wrong.push(format!("query: {id} without its embedding"));
+                                }
+                            }
+                        }
+                        Err(err) => wrong.push(format!("query: {err}")),
+                    }
+                }
+                wrong
+            }
+        };
+        let searches = {
+            let mut frontend = frontend.clone();
+            let done = done.clone();
+            async move {
+                let payload = SearchPayload {
+                    filter: Filter {
+                        query_ids: None,
+                        where_clause: None,
+                    },
+                    rank: chroma_types::operator::Rank {
+                        expr: Some(chroma_types::operator::RankExpr::Knn {
+                            query: chroma_types::operator::QueryVector::Dense(vec![0.0, 0.0]),
+                            key: chroma_types::operator::Key::Embedding,
+                            limit: 500,
+                            default: None,
+                            return_rank: false,
+                        }),
+                    },
+                    limit: Limit {
+                        offset: 0,
+                        limit: Some(500),
+                    },
+                    select: chroma_types::operator::Select {
+                        keys: [
+                            chroma_types::operator::Key::Document,
+                            chroma_types::operator::Key::Embedding,
+                        ]
+                        .into_iter()
+                        .collect(),
+                    },
+                    ..Default::default()
+                };
+                // Without a rank the records come from SQLite, and their embeddings from the vectors.
+                let listed = SearchPayload {
+                    rank: chroma_types::operator::Rank { expr: None },
+                    ..payload.clone()
+                };
+                let mut wrong = Vec::new();
+                while !done.load(Ordering::SeqCst) {
+                    let response = frontend
+                        .search(
+                            SearchRequest::try_new(
+                                TENANT.to_string(),
+                                DATABASE.to_string(),
+                                collection_id,
+                                vec![payload.clone(), listed.clone()],
+                                chroma_types::plan::ReadLevel::default(),
+                            )
+                            .unwrap(),
+                        )
+                        .await;
+                    match response {
+                        Ok(response) => {
+                            for (search, ids) in response.ids.iter().enumerate() {
+                                let documents =
+                                    response.documents[search].clone().unwrap_or_default();
+                                let embeddings =
+                                    response.embeddings[search].clone().unwrap_or_default();
+                                for (position, id) in ids.iter().enumerate() {
+                                    if documents.get(position).cloned().flatten().is_none() {
+                                        wrong.push(format!(
+                                            "search {search}: {id} without its document"
+                                        ));
+                                    }
+                                    if embeddings.get(position).cloned().flatten().is_none() {
+                                        wrong.push(format!(
+                                            "search {search}: {id} without its embedding"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => wrong.push(format!("search: {err}")),
+                    }
+                }
+                wrong
+            }
+        };
+        let gets = {
+            let mut frontend = frontend.clone();
+            let done = done.clone();
+            async move {
+                let mut wrong = Vec::new();
+                while !done.load(Ordering::SeqCst) {
+                    let response = frontend
+                        .get(
+                            GetRequest::try_new(
+                                TENANT.to_string(),
+                                DATABASE.to_string(),
+                                collection_id,
+                                None,
+                                None,
+                                None,
+                                0,
+                                chroma_types::IncludeList(vec![
+                                    chroma_types::Include::Document,
+                                    chroma_types::Include::Embedding,
+                                ]),
+                            )
+                            .unwrap(),
+                        )
+                        .await;
+                    match response {
+                        Ok(response) => {
+                            let embeddings = response.embeddings.map_or(0, |e| e.len());
+                            if embeddings != response.ids.len() {
+                                wrong.push(format!(
+                                    "get: {} ids and {embeddings} embeddings",
+                                    response.ids.len()
+                                ));
+                            }
+                            if response
+                                .documents
+                                .unwrap_or_default()
+                                .iter()
+                                .any(Option::is_none)
+                            {
+                                wrong.push("get: a record without its document".to_string());
+                            }
+                        }
+                        Err(err) => wrong.push(format!("get: {err}")),
+                    }
+                }
+                wrong
+            }
+        };
+        // A read that waits for a write that waits for it stops both until the busy timeout of SQLite, 1000 s: the test
+        // fails long before.
+        let Ok(((), mut wrong, searched, got)) =
+            tokio::time::timeout(READS_DURING_WRITES_WAIT, async {
+                tokio::join!(writer, queries, searches, gets)
+            })
+            .await
+        else {
+            return vec![format!(
+                "the reads and the writes did not end within {READS_DURING_WRITES_WAIT:?}"
+            )];
+        };
+        wrong.extend(searched);
+        wrong.extend(got);
+        wrong
+    }
+
+    // How long the reads during writes may take: many times what they take, far below the busy timeout of SQLite.
+    const READS_DURING_WRITES_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+    // Reads of a SPANN collection see one moment of it, while another request writes it: the records of SQLite and the
+    // SPANN files of the same flush. A write commits SQLite first and then flushes SPANN, hundreds of ms later.
+    #[test]
+    fn spann_reads_during_writes_see_one_moment() {
+        let wrong = on_a_large_stack(|| reads_during_writes(KnnIndex::Spann, 30));
+        let kinds = ["query", "search", "get"].map(|kind| {
+            let of_kind = wrong
+                .iter()
+                .filter(|answer| answer.starts_with(kind))
+                .collect::<Vec<_>>();
+            format!("{kind} {}, as {:?}", of_kind.len(), of_kind.first())
+        });
+        assert!(
+            wrong.is_empty(),
+            "{} answers mixed two moments: {kinds:?}",
+            wrong.len()
+        );
+    }
+
+    // The same on an HNSW collection, for the attribution: run by hand, it prints what went otherwise.
+    #[test]
+    #[ignore = "a probe for the attribution, run by hand"]
+    fn hnsw_reads_during_writes_see_one_moment() {
+        let wrong = on_a_large_stack(|| reads_during_writes(KnnIndex::Hnsw, 30));
+        println!(
+            "HNSW: {} answers mixed two moments, for example {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(8)]
+        );
+    }
+
+    // The tests of reads during writes run as the tests of the compactor and of SPANN of Chroma do: on a thread of
+    // 8 MiB, with workers of 8 MiB. In debug, their futures overflow the 2 MiB of the thread of a test: with Rust
+    // 1.99.1 they need 2.5 to 2.75 MiB.
+    fn on_a_large_stack<F, Fut, T>(test: F) -> T
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T>,
+        T: Send + 'static,
+    {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .thread_stack_size(8 * 1024 * 1024)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(test())
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    // The reads of a SPANN collection that the executor stops between their snapshot of SQLite and their files.
+    #[derive(Clone, Copy, Debug)]
+    enum SpannRead {
+        Get,
+        Query,
+        Search,
+        Count,
+    }
+
+    // A record as a read answers it: its id, its document and its embedding.
+    type ReadRecord = (String, Option<String>, Option<Vec<f32>>);
+
+    // What a read of a SPANN collection answers: its lists of records, each list by id, one for a get or a query and
+    // two for a search, ranked by a KNN and listed without a rank; or the number of records, for a count.
+    #[derive(Debug)]
+    enum ReadAnswer {
+        Records(Vec<Vec<ReadRecord>>),
+        Count(u32),
+    }
+
+    // What a read of a SPANN collection answers.
+    async fn spann_read(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        read: SpannRead,
+    ) -> Result<ReadAnswer, String> {
+        let include = || {
+            chroma_types::IncludeList(vec![
+                chroma_types::Include::Document,
+                chroma_types::Include::Embedding,
+            ])
+        };
+        let mut answers: Vec<Vec<ReadRecord>> = match read {
+            SpannRead::Get => {
+                let response = frontend
+                    .get(
+                        GetRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            None,
+                            None,
+                            None,
+                            0,
+                            include(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .map_err(|err| format!("get: {err}"))?;
+                let documents = response.documents.unwrap_or_default();
+                let embeddings = response.embeddings.unwrap_or_default();
+                vec![response
+                    .ids
+                    .into_iter()
+                    .enumerate()
+                    .map(|(at, id)| {
+                        (
+                            id,
+                            documents.get(at).cloned().flatten(),
+                            embeddings.get(at).cloned(),
+                        )
+                    })
+                    .collect()]
+            }
+            SpannRead::Query => {
+                let response = frontend
+                    .query(
+                        QueryRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            None,
+                            None,
+                            vec![vec![0.0, 0.0]],
+                            500,
+                            include(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .map_err(|err| format!("query: {err}"))?;
+                let documents = response.documents.unwrap_or_default();
+                let embeddings = response.embeddings.unwrap_or_default();
+                vec![response
+                    .ids
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(at, id)| {
+                        (
+                            id,
+                            documents
+                                .first()
+                                .and_then(|list| list.get(at))
+                                .cloned()
+                                .flatten(),
+                            embeddings
+                                .first()
+                                .and_then(|list| list.get(at))
+                                .cloned()
+                                .flatten(),
+                        )
+                    })
+                    .collect()]
+            }
+            SpannRead::Search => {
+                let ranked = SearchPayload {
+                    filter: Filter {
+                        query_ids: None,
+                        where_clause: None,
+                    },
+                    rank: chroma_types::operator::Rank {
+                        expr: Some(chroma_types::operator::RankExpr::Knn {
+                            query: chroma_types::operator::QueryVector::Dense(vec![0.0, 0.0]),
+                            key: chroma_types::operator::Key::Embedding,
+                            limit: 500,
+                            default: None,
+                            return_rank: false,
+                        }),
+                    },
+                    limit: Limit {
+                        offset: 0,
+                        limit: Some(500),
+                    },
+                    select: chroma_types::operator::Select {
+                        keys: [
+                            chroma_types::operator::Key::Document,
+                            chroma_types::operator::Key::Embedding,
+                        ]
+                        .into_iter()
+                        .collect(),
+                    },
+                    ..Default::default()
+                };
+                let listed = SearchPayload {
+                    rank: chroma_types::operator::Rank { expr: None },
+                    ..ranked.clone()
+                };
+                let response = frontend
+                    .search(
+                        SearchRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            vec![ranked, listed],
+                            chroma_types::plan::ReadLevel::default(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .map_err(|err| format!("search: {err}"))?;
+                response
+                    .ids
+                    .iter()
+                    .enumerate()
+                    .map(|(search, ids)| {
+                        let documents = response.documents[search].clone().unwrap_or_default();
+                        let embeddings = response.embeddings[search].clone().unwrap_or_default();
+                        ids.iter()
+                            .enumerate()
+                            .map(|(at, id)| {
+                                (
+                                    id.clone(),
+                                    documents.get(at).cloned().flatten(),
+                                    embeddings.get(at).cloned().flatten(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect()
+            }
+            SpannRead::Count => {
+                return frontend
+                    .count(
+                        CountRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            chroma_types::plan::ReadLevel::default(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .map(ReadAnswer::Count)
+                    .map_err(|err| format!("count: {err}"));
+            }
+        };
+        for answer in &mut answers {
+            answer.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        Ok(ReadAnswer::Records(answers))
+    }
+
+    // How long a stopped read and the writes around it may take, far below the busy timeout of SQLite: a write waits for
+    // the syncs of its files, and on the disk of Docker, with other tests syncing theirs, one took more than 10 s.
+    const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    // The records of the collection of the stopped reads after the writes given: the ten of the add and one more for
+    // each write, with r0 changed by each write, its document and its embedding.
+    fn records_after(writes: usize) -> Vec<ReadRecord> {
+        (0..10 + writes)
+            .map(|i| match (i, writes) {
+                (0, 1..) => (
+                    "r0".to_string(),
+                    Some(format!("document r0 {writes}")),
+                    Some(vec![100.0 * writes as f32; 2]),
+                ),
+                _ => (
+                    format!("r{i}"),
+                    Some(format!("document r{i}")),
+                    Some(vec![i as f32, (i as f32).sin()]),
+                ),
+            })
+            .collect()
+    }
+
+    // The records of each list of an answer that differ from the records after the writes given, and those missing: a
+    // record of one moment with the document or the embedding of another is of none. A count answers their number.
+    fn differences_from(answer: &ReadAnswer, writes: usize) -> Vec<String> {
+        let expected = records_after(writes);
+        let lists = match answer {
+            ReadAnswer::Records(lists) => lists,
+            ReadAnswer::Count(count) if *count as usize == expected.len() => return Vec::new(),
+            ReadAnswer::Count(count) => {
+                return vec![format!(
+                    "the count answered {count}, not {}",
+                    expected.len()
+                )]
+            }
+        };
+        let mut wrong = Vec::new();
+        for (list, records) in lists.iter().enumerate() {
+            wrong.extend(
+                records
+                    .iter()
+                    .filter(|record| !expected.contains(record))
+                    .map(|record| format!("list {list}: {record:?}")),
+            );
+            wrong.extend(
+                expected
+                    .iter()
+                    .filter(|record| records.iter().all(|answered| answered.0 != record.0))
+                    .map(|record| format!("list {list}: {} missing", record.0)),
+            );
+        }
+        wrong
+    }
+
+    // The task of a read of a SPANN collection.
+    type ReadTask = tokio::task::JoinHandle<Result<ReadAnswer, String>>;
+
+    // A read of the collection, started and stopped by the executor between its snapshot of SQLite and its files: the
+    // sender that lets it go on and the task of the read, or None when it did not stop.
+    async fn stopped_read(
+        frontend: &ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        read: SpannRead,
+    ) -> Option<(tokio::sync::oneshot::Sender<()>, ReadTask)> {
+        use crate::executor::local::{StopBeforeFiles, STOP_BEFORE_FILES};
+        let (stopped, at_stop) = tokio::sync::oneshot::channel();
+        let (go_on, waiting) = tokio::sync::oneshot::channel();
+        STOP_BEFORE_FILES.lock().unwrap().push(StopBeforeFiles {
+            collection_id,
+            stopped,
+            go_on: waiting,
+        });
+        let reading = tokio::spawn({
+            let mut frontend = frontend.clone();
+            async move { spann_read(&mut frontend, collection_id, read).await }
+        });
+        tokio::time::timeout(STOP_WAIT, at_stop).await.ok()?.ok()?;
+        Some((go_on, reading))
+    }
+
+    // What went otherwise than an answer with the records after the writes given, for a stopped read that went on.
+    async fn answer_differences(reading: ReadTask, writes: usize) -> Vec<String> {
+        match tokio::time::timeout(STOP_WAIT, reading).await {
+            Err(_) => vec![format!(
+                "the read did not end within {STOP_WAIT:?} once it went on"
+            )],
+            Ok(Err(err)) => vec![format!("the read failed: {err}")],
+            Ok(Ok(Err(err))) => vec![err],
+            Ok(Ok(Ok(answer))) => differences_from(&answer, writes),
+        }
+    }
+
+    // A collection of ten records with a document each, for the stopped reads.
+    async fn collection_to_stop(frontend: &mut ServiceBasedFrontend) -> CollectionUuid {
+        let collection_id = frontend
+            .create_collection(
+                CreateCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    "stops".to_string(),
+                    None,
+                    None,
+                    Some(Schema::new_default(KnnIndex::Spann)),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collection_id;
+        add_with_documents(frontend, collection_id, 0..10, "r").await;
+        collection_id
+    }
+
+    // A read of a SPANN collection of ten records, stopped by the executor between its snapshot of SQLite and its files
+    // while writes run, each with its flush: each changes the document and the embedding of r0, and adds a record, so
+    // that a read that takes its records, or their documents or embeddings, at another moment than its files answers a
+    // record of none, or a record more or less. The files of a replaced version stay for the grace given. The caches of
+    // the blockfiles are emptied once the writes end, so that the read takes its files from disk. A read that holds
+    // SQLite through its stop makes the writes wait: it fails at once, not after the busy timeout of SQLite. Returns
+    // what went otherwise than an answer with the records after the writes given.
+    async fn read_across_flushes(
+        read: SpannRead,
+        writes: usize,
+        grace: std::time::Duration,
+        answer_after: usize,
+    ) -> Vec<String> {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        registry.register(chroma_log::SpannVersionGrace(grace));
+        let mut frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        let Some((go_on, reading)) = stopped_read(&frontend, collection_id, read).await else {
+            return vec!["the read did not stop before its files".to_string()];
+        };
+        let mut writing = tokio::spawn(async move {
+            for write in 1..=writes {
+                let added = 9 + write;
+                frontend
+                    .upsert(
+                        UpsertCollectionRecordsRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            vec!["r0".to_string(), format!("r{added}")],
+                            vec![
+                                vec![100.0 * write as f32; 2],
+                                vec![added as f32, (added as f32).sin()],
+                            ],
+                            Some(vec![
+                                Some(format!("document r0 {write}")),
+                                Some(format!("document r{added}")),
+                            ]),
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let written = tokio::time::timeout(STOP_WAIT, &mut writing).await;
+        if written.is_ok() {
+            registry
+                .get::<chroma_segment::local_segment_manager::LocalSegmentManager>()
+                .unwrap()
+                .spann_provider()
+                .unwrap()
+                .blockfile_provider
+                .clear()
+                .await
+                .unwrap();
+        }
+        let _ = go_on.send(());
+        let mut wrong = answer_differences(reading, answer_after).await;
+        match written {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => wrong.push(format!("the writes failed: {err}")),
+            Err(_) => {
+                let ended = tokio::time::timeout(STOP_WAIT, writing).await.is_ok();
+                wrong.push(format!(
+                    "the writes did not end within {STOP_WAIT:?} while the read stopped{}",
+                    if ended {
+                        ", and ended once it went on"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
+        wrong
+    }
+
+    // A get of a SPANN collection answers for the moment of its snapshot of SQLite while a write and its flush come
+    // between that snapshot and its files, as distributed Chroma reads one version of every segment: the files of a flush
+    // never change, and the version before the current one stays. The stop of the executor puts the write there without
+    // timing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_get_across_a_flush_answers_for_its_snapshot() {
+        let grace = chroma_log::SpannVersionGrace::default().0;
+        let wrong = read_across_flushes(SpannRead::Get, 1, grace, 0).await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // The same for a query, whose nearest records come with their documents.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_query_across_a_flush_answers_for_its_snapshot() {
+        let grace = chroma_log::SpannVersionGrace::default().0;
+        let wrong = read_across_flushes(SpannRead::Query, 1, grace, 0).await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // Two flushes between the snapshot of a get and its files: the version of its moment is then neither the current
+    // one nor the one before it, and stays for the grace.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_get_across_two_flushes_answers_for_its_snapshot() {
+        let grace = chroma_log::SpannVersionGrace::default().0;
+        let wrong = read_across_flushes(SpannRead::Get, 2, grace, 0).await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // Without a grace, the second of two flushes between the snapshot of a get and its files removes the files of its
+    // moment. The get finds them gone and reads again from a new snapshot, as distributed Chroma does: it answers for the
+    // last flush, without an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_get_whose_files_two_flushes_removed_answers_for_the_last_flush() {
+        let wrong = read_across_flushes(SpannRead::Get, 2, std::time::Duration::ZERO, 2).await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // The same for a query, which reads again as a get does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_query_whose_files_two_flushes_removed_answers_for_the_last_flush() {
+        let wrong = read_across_flushes(SpannRead::Query, 2, std::time::Duration::ZERO, 2).await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // The same for a count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_count_whose_files_two_flushes_removed_answers_for_the_last_flush() {
+        let wrong = read_across_flushes(SpannRead::Count, 2, std::time::Duration::ZERO, 2).await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // A search of a SPANN collection reads SQLite in its snapshot, closes it, then reads its files, as a get does: it
+    // answers for the moment of its snapshot while a write and its flush come between that snapshot and its files, and
+    // holds nothing of SQLite meanwhile, so the write does not wait for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_search_across_a_flush_answers_for_its_snapshot() {
+        let grace = chroma_log::SpannVersionGrace::default().0;
+        let wrong = read_across_flushes(SpannRead::Search, 1, grace, 0).await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // The same for a search whose files the second of two flushes removed, without a grace: it reads again from a new
+    // snapshot, as a get does, and answers for the last flush.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_search_whose_files_two_flushes_removed_answers_for_the_last_flush() {
+        let wrong = read_across_flushes(SpannRead::Search, 2, std::time::Duration::ZERO, 2).await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // The searches in two moments against the search in one snapshot, on the same collection.
+    mod spann_search_tests;
+
+    // A count of a SPANN collection counts the records of the record segment, as distributed Chroma does, at the flush of
+    // its snapshot of SQLite: an add and its flush between that snapshot and its files leave its answer as it was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_count_across_a_flush_answers_for_its_snapshot() {
+        use crate::executor::local::{StopBeforeFiles, STOP_BEFORE_FILES};
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        let (stopped, at_stop) = tokio::sync::oneshot::channel();
+        let (go_on, waiting) = tokio::sync::oneshot::channel();
+        STOP_BEFORE_FILES.lock().unwrap().push(StopBeforeFiles {
+            collection_id,
+            stopped,
+            go_on: waiting,
+        });
+        let counting = tokio::spawn({
+            let mut frontend = frontend.clone();
+            async move {
+                frontend
+                    .count(
+                        CountRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            chroma_types::plan::ReadLevel::default(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+            }
+        });
+        let mut wrong = Vec::new();
+        if tokio::time::timeout(STOP_WAIT, at_stop).await.is_err() {
+            wrong.push("the count did not stop before its files".to_string());
+        }
+        if tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+        )
+        .await
+        .is_err()
+        {
+            wrong.push(format!(
+                "the add did not end within {STOP_WAIT:?} while the count stopped"
+            ));
+        }
+        let _ = go_on.send(());
+        match tokio::time::timeout(STOP_WAIT, counting).await {
+            Ok(Ok(Ok(10))) => {}
+            other => wrong.push(format!("the count answered {other:?}, not 10")),
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // A read of a SPANN collection that reads again ends with the error of its new plan when that plan fails, and asks for
+    // it once: distributed Chroma retries a new plan that fails, so that a read of a collection deleted meanwhile, whose
+    // new plan answers NotFound, reads again there without end.
+    #[tokio::test]
+    async fn a_spann_read_ends_with_the_error_of_a_new_plan_that_fails() {
+        use crate::executor::local::FAIL_BEFORE_FILES;
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        let scan = Scan {
+            collection_and_segments: frontend
+                .sysdb_client
+                .get_collection_with_segments(None, collection_id)
+                .await
+                .unwrap(),
+            shard_index: 0,
+            num_shards: 1,
+            log_upper_bound_offset: 0,
+        };
+        let projection = Projection {
+            document: true,
+            embedding: false,
+            metadata: false,
+        };
+        let ranked = SearchPayload {
+            rank: chroma_types::operator::Rank {
+                expr: Some(chroma_types::operator::RankExpr::Knn {
+                    query: chroma_types::operator::QueryVector::Dense(vec![0.0, 0.0]),
+                    key: chroma_types::operator::Key::Embedding,
+                    limit: 10,
+                    default: None,
+                    return_rank: false,
+                }),
+            },
+            limit: Limit {
+                offset: 0,
+                limit: Some(10),
+            },
+            ..Default::default()
+        };
+        let plans = AtomicUsize::new(0);
+        let mut wrong = Vec::new();
+        for read in [
+            SpannRead::Get,
+            SpannRead::Query,
+            SpannRead::Search,
+            SpannRead::Count,
+        ] {
+            for code in [ErrorCodes::NotFound, ErrorCodes::Unavailable] {
+                FAIL_BEFORE_FILES
+                    .lock()
+                    .unwrap()
+                    .push((collection_id, code));
+                plans.store(0, Ordering::Relaxed);
+                let executor = &mut frontend.executor;
+                let answer = tokio::time::timeout(Duration::from_secs(60), async {
+                    match read {
+                        SpannRead::Get => executor
+                            .get(
+                                Get {
+                                    scan: scan.clone(),
+                                    filter: Filter::default(),
+                                    limit: Limit {
+                                        offset: 0,
+                                        limit: None,
+                                    },
+                                    proj: projection.clone(),
+                                },
+                                plan_that_fails(&plans, collection_id),
+                            )
+                            .await
+                            .map(|_| ()),
+                        SpannRead::Query => executor
+                            .knn(
+                                Knn {
+                                    scan: scan.clone(),
+                                    filter: Filter::default(),
+                                    knn: KnnBatch {
+                                        embeddings: vec![vec![0.0, 0.0]],
+                                        fetch: 10,
+                                    },
+                                    proj: KnnProjection {
+                                        projection: projection.clone(),
+                                        distance: true,
+                                    },
+                                },
+                                plan_that_fails(&plans, collection_id),
+                            )
+                            .await
+                            .map(|_| ()),
+                        SpannRead::Search => executor
+                            .search(
+                                Search {
+                                    scan: scan.clone(),
+                                    payloads: vec![ranked.clone()],
+                                    read_level: Default::default(),
+                                },
+                                plan_that_fails(&plans, collection_id),
+                            )
+                            .await
+                            .map(|_| ()),
+                        SpannRead::Count => executor
+                            .count(
+                                Count {
+                                    scan: scan.clone(),
+                                    read_level: Default::default(),
+                                },
+                                plan_that_fails(&plans, collection_id),
+                            )
+                            .await
+                            .map(|_| ()),
+                    }
+                })
+                .await;
+                match answer {
+                    Ok(Err(err)) if err.code() == ErrorCodes::NotFound => {}
+                    other => wrong.push(format!(
+                        "{read:?}, {code:?}: {other:?}, not the NotFound of the new plan"
+                    )),
+                }
+                let asked = plans.load(Ordering::Relaxed);
+                if asked != 1 {
+                    wrong.push(format!(
+                        "{read:?}, {code:?}: the new plan asked for {asked} times"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // A new plan that fails as that of a collection deleted meanwhile, which counts the times it is asked for.
+    fn plan_that_fails<P>(
+        plans: &AtomicUsize,
+        collection_id: CollectionUuid,
+    ) -> impl Fn(tonic::Code) -> std::future::Ready<Result<P, Box<dyn ChromaError>>> + '_ {
+        move |_| {
+            plans.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Err(GetCollectionWithSegmentsError::NotFound(
+                collection_id.to_string(),
+            )
+            .boxed()))
+        }
+    }
+
+    // A get, a query, a search and a count of a SPANN collection that fail with an error that the executor of distributed
+    // Chroma retries read again, as many times as its retry config allows by default, 5; they answer any other error at
+    // once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_read_reads_again_on_the_errors_distributed_chroma_retries() {
+        use crate::executor::local::FAIL_BEFORE_FILES;
+        use chroma_error::ErrorCodes;
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        let fail = |codes: &[ErrorCodes]| {
+            FAIL_BEFORE_FILES
+                .lock()
+                .unwrap()
+                .extend(codes.iter().map(|code| (collection_id, *code)));
+        };
+        let mut wrong = Vec::new();
+        for read in [
+            SpannRead::Get,
+            SpannRead::Query,
+            SpannRead::Search,
+            SpannRead::Count,
+        ] {
+            for code in [
+                ErrorCodes::Unavailable,
+                ErrorCodes::DeadlineExceeded,
+                ErrorCodes::Aborted,
+                ErrorCodes::ResourceExhausted,
+                ErrorCodes::Unknown,
+                ErrorCodes::NotFound,
+            ] {
+                fail(&[code]);
+                match spann_read(&mut frontend, collection_id, read).await {
+                    Ok(answer) => wrong.extend(
+                        differences_from(&answer, 0)
+                            .into_iter()
+                            .map(|difference| format!("{read:?}, {code:?}: {difference}")),
+                    ),
+                    Err(err) => wrong.push(format!("{read:?}, {code:?}: {err}")),
+                }
+            }
+            fail(&[ErrorCodes::NotFound; 5]);
+            if let Err(err) = spann_read(&mut frontend, collection_id, read).await {
+                wrong.push(format!("{read:?}, five NotFound in a row: {err}"));
+            }
+            fail(&[ErrorCodes::NotFound; 6]);
+            if spann_read(&mut frontend, collection_id, read).await.is_ok() {
+                wrong.push(format!(
+                    "{read:?}, six NotFound in a row: the read answered"
+                ));
+            }
+            fail(&[ErrorCodes::Internal]);
+            if spann_read(&mut frontend, collection_id, read).await.is_ok() {
+                wrong.push(format!("{read:?}, Internal: the read read again"));
+            }
+        }
+        if FAIL_BEFORE_FILES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| *id == collection_id)
+        {
+            wrong.push("failures left that no read took".to_string());
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // The local executor of a frontend of the single node.
+    fn local_executor(frontend: &ServiceBasedFrontend) -> &crate::executor::local::LocalExecutor {
+        match &frontend.executor {
+            crate::executor::Executor::Local(local) => local,
+            _ => unreachable!("a frontend of the single node"),
+        }
+    }
+
+    // The openings after a flush that ended for the collection: the files of each, and whether it opened them.
+    fn warm_ups(
+        collection_id: CollectionUuid,
+    ) -> Vec<(std::collections::HashMap<String, Vec<String>>, bool)> {
+        crate::executor::local::WARMED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _, _)| *id == collection_id)
+            .map(|(_, files, opened)| (files.clone(), *opened))
+            .collect()
+    }
+
+    // Whether an opening after a flush ran or runs for the collection.
+    fn warm_up_seen(frontend: &ServiceBasedFrontend, collection_id: CollectionUuid) -> bool {
+        local_executor(frontend).spann_warm_up_runs(collection_id)
+            || !warm_ups(collection_id).is_empty()
+    }
+
+    // The end of the openings after a flush of the collection.
+    fn warm_up_end(collection_id: CollectionUuid) -> tokio::sync::oneshot::Receiver<()> {
+        let (end, ended) = tokio::sync::oneshot::channel();
+        crate::executor::local::WARM_UP_ENDS
+            .lock()
+            .unwrap()
+            .push((collection_id, end));
+        ended
+    }
+
+    // A stop of the next opening after a flush of the collection, before its files: the signal of its stop, and the way
+    // to let it go on.
+    fn stop_warm_up(
+        collection_id: CollectionUuid,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (stopped_tx, stopped) = tokio::sync::oneshot::channel();
+        let (go_on, waiting) = tokio::sync::oneshot::channel();
+        crate::executor::local::STOP_WARM_UP.lock().unwrap().push(
+            crate::executor::local::StopBeforeFiles {
+                collection_id,
+                stopped: stopped_tx,
+                go_on: waiting,
+            },
+        );
+        (stopped, go_on)
+    }
+
+    // The files of the record segment of a collection at its last flush, and the files of the roots of its blockfiles
+    // under the data path.
+    async fn record_roots(
+        frontend: &mut ServiceBasedFrontend,
+        root: &std::path::Path,
+        collection_id: CollectionUuid,
+    ) -> (
+        std::collections::HashMap<String, Vec<String>>,
+        Vec<std::path::PathBuf>,
+    ) {
+        let files = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collection_id)
+            .await
+            .unwrap()
+            .record_segment
+            .file_path;
+        let roots = files
+            .values()
+            .flatten()
+            .map(|path| {
+                let (prefix, id) = chroma_types::Segment::extract_prefix_and_id(path).unwrap();
+                root.join(prefix).join("root").join(id.to_string())
+            })
+            .collect();
+        (files, roots)
+    }
+
+    // A read of a SPANN collection after a write finds the roots of the files of the write in memory: the flush opened
+    // them in the background, as the collection was read since its previous flush. With those files gone, the read
+    // still answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_read_after_a_write_finds_the_new_files_open() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        let ended = warm_up_end(collection_id);
+        add_with_documents(&mut frontend, collection_id, 10..11, "r").await;
+        tokio::time::timeout(STOP_WAIT, ended)
+            .await
+            .unwrap()
+            .unwrap();
+        let (files, roots) = record_roots(&mut frontend, root.path(), collection_id).await;
+        assert_eq!(warm_ups(collection_id), vec![(files, true)]);
+        for path in roots {
+            std::fs::remove_file(path).unwrap();
+        }
+        match spann_read(&mut frontend, collection_id, SpannRead::Get).await {
+            Ok(ReadAnswer::Records(records)) => assert_eq!(records[0].len(), 11),
+            other => panic!("the read after the write answered {other:?}"),
+        }
+    }
+
+    // An opening after a write whose files a deletion removed meanwhile fails, which only goes to the log, and leaves
+    // nothing behind: a new collection writes and reads as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_opening_after_a_write_whose_files_went_fails_and_leaves_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        let (stopped, go_on) = stop_warm_up(collection_id);
+        let ended = warm_up_end(collection_id);
+        tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(STOP_WAIT, stopped)
+            .await
+            .unwrap()
+            .unwrap();
+        frontend
+            .delete_collection(
+                DeleteCollectionRequest::try_new(TENANT.into(), DATABASE.into(), "stops".into())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = go_on.send(());
+        tokio::time::timeout(STOP_WAIT, ended)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(warm_ups(collection_id).as_slice(), [(_, false)]),
+            "{:?}",
+            warm_ups(collection_id)
+        );
+        assert!(!local_executor(&frontend).spann_warm_up_runs(collection_id));
+        let other = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, other, SpannRead::Get)
+            .await
+            .unwrap();
+        add_with_documents(&mut frontend, other, 10..11, "r").await;
+        match spann_read(&mut frontend, other, SpannRead::Get).await {
+            Ok(ReadAnswer::Records(records)) => assert_eq!(records[0].len(), 11),
+            answer => panic!("the new collection answered {answer:?}"),
+        }
+    }
+
+    // Writes in a row open one version at a time: while an opening waits, each flush replaces the version to open after
+    // it, so that the next opening is of the last write, whose roots the next read finds in memory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn spann_writes_in_a_row_open_the_last_version_only() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        let (stopped, go_on) = stop_warm_up(collection_id);
+        let ended = warm_up_end(collection_id);
+        tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(STOP_WAIT, stopped)
+            .await
+            .unwrap()
+            .unwrap();
+        let (first, _) = record_roots(&mut frontend, root.path(), collection_id).await;
+        for i in 11..31 {
+            tokio::time::timeout(
+                STOP_WAIT,
+                spann_read(&mut frontend, collection_id, SpannRead::Get),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            tokio::time::timeout(
+                STOP_WAIT,
+                add_with_documents(&mut frontend, collection_id, i..i + 1, "r"),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(local_executor(&frontend).spann_warm_up_runs(collection_id));
+        let (last, roots) = record_roots(&mut frontend, root.path(), collection_id).await;
+        let _ = go_on.send(());
+        tokio::time::timeout(STOP_WAIT, ended)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(warm_ups(collection_id), vec![(first, true), (last, true)]);
+        for path in roots {
+            std::fs::remove_file(path).unwrap();
+        }
+        match spann_read(&mut frontend, collection_id, SpannRead::Get).await {
+            Ok(ReadAnswer::Records(records)) => assert_eq!(records[0].len(), 31),
+            other => panic!("the read after the writes answered {other:?}"),
+        }
+    }
+
+    // A read does not wait for the opening after a write: with the opening stopped, the read answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_read_does_not_wait_for_the_opening_after_a_write() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        let (stopped, go_on) = stop_warm_up(collection_id);
+        let ended = warm_up_end(collection_id);
+        tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(STOP_WAIT, stopped)
+            .await
+            .unwrap()
+            .unwrap();
+        match tokio::time::timeout(
+            STOP_WAIT,
+            spann_read(&mut frontend, collection_id, SpannRead::Get),
+        )
+        .await
+        {
+            Ok(Ok(ReadAnswer::Records(records))) => assert_eq!(records[0].len(), 11),
+            other => panic!("the read during the opening answered {other:?}"),
+        }
+        let _ = go_on.send(());
+        tokio::time::timeout(STOP_WAIT, ended)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    // A write does not wait for the opening after a previous write: with the opening stopped, the write answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_write_does_not_wait_for_the_opening_after_a_write() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        let (stopped, go_on) = stop_warm_up(collection_id);
+        let ended = warm_up_end(collection_id);
+        tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(STOP_WAIT, stopped)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 11..12, "r"),
+        )
+        .await
+        .unwrap();
+        let _ = go_on.send(());
+        tokio::time::timeout(STOP_WAIT, ended)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    // Only a SPANN collection read since its previous flush opens the files of its next one: a collection that is only
+    // written opens nothing, so that it never pushes out of the cache the roots of the collections that are read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn only_a_spann_collection_read_since_its_last_write_opens_the_next() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        add_with_documents(&mut frontend, collection_id, 10..11, "r").await;
+        assert!(!warm_up_seen(&frontend, collection_id));
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        let ended = warm_up_end(collection_id);
+        add_with_documents(&mut frontend, collection_id, 11..12, "r").await;
+        tokio::time::timeout(STOP_WAIT, ended)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(warm_ups(collection_id).len(), 1);
+        add_with_documents(&mut frontend, collection_id, 12..13, "r").await;
+        assert!(!local_executor(&frontend).spann_warm_up_runs(collection_id));
+        assert_eq!(warm_ups(collection_id).len(), 1);
+    }
+
+    // A write to an HNSW collection opens nothing after it, with the option of SPANN on or off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_to_an_hnsw_collection_opens_nothing_after_it() {
+        for spann in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let mut frontend = frontend_with_spann(root.path(), spann).await;
+            let collection_id = frontend
+                .create_collection(
+                    CreateCollectionRequest::try_new(
+                        TENANT.to_string(),
+                        DatabaseName::new(DATABASE).unwrap(),
+                        "hnsw".to_string(),
+                        None,
+                        None,
+                        Some(Schema::new_default(KnnIndex::Hnsw)),
+                        false,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .collection_id;
+            add_with_documents(&mut frontend, collection_id, 0..10, "r").await;
+            spann_read(&mut frontend, collection_id, SpannRead::Get)
+                .await
+                .unwrap();
+            add_with_documents(&mut frontend, collection_id, 10..11, "r").await;
+            assert!(!warm_up_seen(&frontend, collection_id), "spann {spann}");
+        }
+    }
+
+    // An opening after a write on a damaged root fails, which only goes to the log, and the read answers an error, as it
+    // did without the opening.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_opening_after_a_write_on_a_damaged_root_fails_and_the_read_errs() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        let (stopped, go_on) = stop_warm_up(collection_id);
+        let ended = warm_up_end(collection_id);
+        tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(STOP_WAIT, stopped)
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, roots) = record_roots(&mut frontend, root.path(), collection_id).await;
+        std::fs::write(&roots[0], b"not a root").unwrap();
+        let _ = go_on.send(());
+        tokio::time::timeout(STOP_WAIT, ended)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(warm_ups(collection_id).as_slice(), [(_, false)]),
+            "{:?}",
+            warm_ups(collection_id)
+        );
+        assert!(spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .is_err());
+    }
+
+    // The deletion of a SPANN collection forgets that it was read since its last flush, as it forgets that its log is
+    // applied: the mark of a collection deleted after a read does not stay until a restart.
+    #[tokio::test]
+    async fn the_deletion_of_a_spann_collection_forgets_its_read() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        spann_read(&mut frontend, collection_id, SpannRead::Get)
+            .await
+            .unwrap();
+        assert!(local_executor(&frontend).spann_marked_read(collection_id));
+        frontend
+            .delete_collection(
+                DeleteCollectionRequest::try_new(TENANT.into(), DATABASE.into(), "stops".into())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!local_executor(&frontend).spann_marked_read(collection_id));
+    }
+
+    // The adaptive number of probes of a SPANN query takes the records of the record segment, as distributed Chroma takes
+    // those of its last compaction, not the offsets that deleted records leave behind; without adaptive probes, the count
+    // is not read.
+    #[tokio::test]
+    async fn the_adaptive_probes_of_spann_take_the_records_of_the_record_segment() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        let mut frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    Some((5..10).map(|i| format!("r{i}")).collect()),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        let segments = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collection_id)
+            .await
+            .unwrap();
+        let manager = registry
+            .get::<chroma_segment::local_segment_manager::LocalSegmentManager>()
+            .unwrap();
+        let provider = manager.spann_provider().unwrap();
+        let shard = chroma_types::SegmentShard::try_from((&segments.record_segment, 0)).unwrap();
+        let records = chroma_segment::blockfile_record::RecordSegmentReaderShard::from_segment(
+            &shard,
+            &provider.blockfile_provider,
+            None,
+        )
+        .await
+        .unwrap();
+        let adaptive = crate::executor::local::spann_probe_records(true, &records)
+            .await
+            .unwrap();
+        let fixed = crate::executor::local::spann_probe_records(false, &records)
+            .await
+            .unwrap();
+        assert_eq!((adaptive, fixed), (5, 0));
+    }
+
+    // A get and a query of a SPANN collection load the blocks of their records and read them at once, as the projection
+    // of distributed Chroma does: each record keeps its document, metadata and embedding, and the records keep the order
+    // of the get, by row, and of the query, by distance.
+    #[tokio::test]
+    async fn spann_reads_answer_each_record_with_its_data_in_order() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = frontend
+            .create_collection(
+                CreateCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    "projection".to_string(),
+                    None,
+                    None,
+                    Some(Schema::new_default(KnnIndex::Spann)),
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collection_id;
+        let embedding = |i: usize| vec![i as f32, (i as f32).sin()];
+        let metadata = |i: usize| {
+            chroma_types::Metadata::from([
+                ("i".to_string(), MetadataValue::Int(i as i64)),
+                ("s".to_string(), MetadataValue::Str(format!("v{i}"))),
+            ])
+        };
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    (0..300).map(|i| format!("r{i}")).collect(),
+                    (0..300).map(embedding).collect(),
+                    Some((0..300).map(|i| Some(format!("document r{i}"))).collect()),
+                    None,
+                    Some((0..300).map(|i| Some(metadata(i))).collect()),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let number = |id: &str| id[1..].parse::<usize>().unwrap();
+        let get = frontend
+            .get(
+                GetRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    None,
+                    None,
+                    None,
+                    0,
+                    chroma_types::IncludeList(vec![
+                        chroma_types::Include::Document,
+                        chroma_types::Include::Metadata,
+                        chroma_types::Include::Embedding,
+                    ]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            get.ids,
+            (0..300).map(|i| format!("r{i}")).collect::<Vec<_>>()
+        );
+        let documents = get.documents.unwrap();
+        let metadatas = get.metadatas.unwrap();
+        let embeddings = get.embeddings.unwrap();
+        for (at, id) in get.ids.iter().enumerate() {
+            let i = number(id);
+            assert_eq!(documents[at], Some(format!("document r{i}")), "{id}");
+            assert_eq!(metadatas[at], Some(metadata(i)), "{id}");
+            assert_eq!(embeddings[at], embedding(i), "{id}");
+        }
+        for include in [
+            vec![
+                chroma_types::Include::Document,
+                chroma_types::Include::Metadata,
+                chroma_types::Include::Embedding,
+                chroma_types::Include::Distance,
+            ],
+            vec![chroma_types::Include::Distance],
+        ] {
+            let query = frontend
+                .query(
+                    QueryRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection_id,
+                        None,
+                        None,
+                        vec![embedding(150)],
+                        20,
+                        chroma_types::IncludeList(include.clone()),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let ids = &query.ids[0];
+            assert_eq!(ids.len(), 20, "{include:?}");
+            assert_eq!(ids[0], "r150", "{include:?}");
+            let distances = query.distances.unwrap()[0]
+                .iter()
+                .map(|distance| distance.unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                distances.windows(2).all(|pair| pair[0] <= pair[1]),
+                "{include:?}: {distances:?}"
+            );
+            // Each record comes with its own distance, the squared distance of its embedding to the query in the space
+            // l2 of the collection: a record in the place of another has the distance of the other.
+            for (at, id) in ids.iter().enumerate() {
+                let (record, target) = (embedding(number(id)), embedding(150));
+                let expected = (record[0] - target[0]).powi(2) + (record[1] - target[1]).powi(2);
+                assert!(
+                    (distances[at] - expected).abs() <= 1e-3 * expected.max(1.0),
+                    "{include:?}: {id} at {at} has the distance {}, not {expected}",
+                    distances[at]
+                );
+            }
+            if let (Some(documents), Some(metadatas), Some(embeddings)) =
+                (query.documents, query.metadatas, query.embeddings)
+            {
+                for (at, id) in ids.iter().enumerate() {
+                    let i = number(id);
+                    assert_eq!(documents[0][at], Some(format!("document r{i}")), "{id}");
+                    assert_eq!(metadatas[0][at], Some(metadata(i)), "{id}");
+                    assert_eq!(embeddings[0][at], Some(embedding(i)), "{id}");
+                }
+            }
+        }
+    }
+
+    // A SPANN read reads again as the retry of the config of its executor says, as a read of distributed Chroma does:
+    // with one attempt more at most, a second NotFound in a row is the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_read_reads_again_as_the_config_of_its_executor_says() {
+        use crate::executor::local::FAIL_BEFORE_FILES;
+        use chroma_error::ErrorCodes;
+        let root = tempfile::tempdir().unwrap();
+        let executor = crate::executor::config::LocalExecutorConfig {
+            spann: true,
+            retry: crate::executor::config::RetryConfig {
+                factor: 1.0,
+                min_delay_ms: 1,
+                max_delay_ms: 1,
+                max_attempts: 1,
+                jitter: false,
+            },
+        };
+        let mut frontend =
+            frontend_with_local_executor(root.path(), executor, &Registry::new()).await;
+        let collection_id = collection_to_stop(&mut frontend).await;
+        let fail = |count: usize| {
+            FAIL_BEFORE_FILES
+                .lock()
+                .unwrap()
+                .extend(std::iter::repeat_n(
+                    (collection_id, ErrorCodes::NotFound),
+                    count,
+                ));
+        };
+        fail(1);
+        let once = spann_read(&mut frontend, collection_id, SpannRead::Get).await;
+        fail(2);
+        let twice = spann_read(&mut frontend, collection_id, SpannRead::Get).await;
+        assert!(once.is_ok(), "{once:?}");
+        assert!(twice.is_err(), "{twice:?}");
+    }
+
+    // A write to a SPANN collection whose last flush cannot be read is rejected before it reaches the log, as a write to
+    // an HNSW collection whose index cannot be read: once the files are back, nothing of it is there.
+    #[tokio::test]
+    async fn a_spann_write_on_unreadable_files_leaves_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let saved = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = spann_collection_with_records(&mut frontend, "spann-unreadable").await;
+        let record_segment = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collection_id)
+            .await
+            .unwrap()
+            .record_segment
+            .id
+            .to_string();
+        drop(frontend);
+        // The roots of the blockfiles of the record segment, moved away while no server runs, so that no cache holds
+        // them.
+        let roots = files_under(&root.path().join("tenant"))
+            .into_iter()
+            .filter_map(|file| file.parent().map(|folder| folder.to_path_buf()))
+            .find(|folder| {
+                folder.ends_with("root")
+                    && folder
+                        .parent()
+                        .is_some_and(|segment| segment.ends_with(&record_segment))
+            })
+            .unwrap();
+        copy_folder(&roots, &saved.path().join("root"));
+        std::fs::remove_dir_all(&roots).unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let written = frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    vec!["x".to_string()],
+                    vec![vec![0.5, 0.5]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(written.is_err());
+        copy_folder(&saved.path().join("root"), &roots);
+        let got = frontend
+            .get(
+                GetRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    Some(vec!["x".to_string()]),
+                    None,
+                    None,
+                    0,
+                    chroma_types::IncludeList(vec![]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            got.ids.is_empty(),
+            "the write that failed is in the collection: {:?}",
+            got.ids
+        );
+    }
+
+    // The deletion of an HNSW collection does not look into the folders of SPANN segments: what one of them holds does
+    // not keep the deletion of the HNSW index pending. Here a SPANN segment folder holds a file with the name of the
+    // HNSW segment, which a walk of every SPANN folder for that name trips on.
+    #[tokio::test]
+    async fn an_hnsw_deletion_does_not_walk_the_spann_folders() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let spann = spann_collection_with_records(&mut frontend, "spann-near").await;
+        let hnsw = create_collection_for(&mut frontend, TENANT, DATABASE, "hnsw-deleted").await;
+        add_record(&mut frontend, &hnsw, "a").await;
+        let hnsw_segment = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, hnsw.collection_id)
+            .await
+            .unwrap()
+            .vector_segment
+            .id
+            .to_string();
+        let spann_segments = files_under(&root.path().join("tenant"))
+            .into_iter()
+            .find(|file| file.to_string_lossy().contains(&spann.to_string()))
+            .and_then(|file| {
+                file.ancestors()
+                    .find(|folder| folder.ends_with("segment"))
+                    .map(|folder| folder.to_path_buf())
+            })
+            .unwrap();
+        std::fs::write(spann_segments.join(&hnsw_segment), b"").unwrap();
+        frontend
+            .delete_collection(delete_collection_request("hnsw-deleted"))
+            .await
+            .unwrap();
+        frontend.executor.cleanup_deleted_indexes().await.unwrap();
+        assert_eq!(pending_cleanups(root.path()), 0);
+    }
+
+    // The deletion of a SPANN collection looks for its segments in the folder of that collection only: a walk of the
+    // folders of every collection for each segment made a deletion of a database go over them once for each segment.
+    // Here the folder of another SPANN collection holds a folder with the name of a segment of the deleted one, which
+    // such a walk removes.
+    #[tokio::test]
+    async fn a_spann_deletion_looks_only_in_the_folder_of_its_collection() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let other = spann_collection_with_records(&mut frontend, "spann-other").await;
+        let deleted = spann_collection_with_records(&mut frontend, "spann-deleted").await;
+        let deleted_segment = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, deleted)
+            .await
+            .unwrap()
+            .vector_segment
+            .id
+            .to_string();
+        let other_segments = files_under(&root.path().join("tenant"))
+            .into_iter()
+            .find(|file| file.to_string_lossy().contains(&other.to_string()))
+            .and_then(|file| {
+                file.ancestors()
+                    .find(|folder| folder.ends_with("segment"))
+                    .map(|folder| folder.to_path_buf())
+            })
+            .unwrap();
+        let marker = other_segments.join(&deleted_segment).join("marker");
+        std::fs::create_dir(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"").unwrap();
+        frontend
+            .delete_collection(delete_collection_request("spann-deleted"))
+            .await
+            .unwrap();
+        assert!(marker.exists());
+        assert!(files_under(&root.path().join("tenant"))
+            .iter()
+            .all(|file| !file.to_string_lossy().contains(&deleted.to_string())));
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use std::time::Duration;
 
 use super::{distributed::DistributedExecutor, local::LocalExecutor, Executor};
@@ -52,8 +53,17 @@ pub struct DistributedExecutorConfig {
     pub tiers: TiersConfig,
 }
 
-#[derive(Deserialize, Clone, Serialize, Debug)]
-pub struct LocalExecutorConfig {}
+#[derive(Deserialize, Clone, Serialize, Debug, Default)]
+pub struct LocalExecutorConfig {
+    /// Collections whose configuration or schema asks for SPANN get a SPANN index, as on distributed Chroma, instead of
+    /// HNSW. Off by default: a SPANN request then gets HNSW, as before. Needs a persistent data path.
+    #[serde(default)]
+    pub spann: bool,
+    /// How a read of a SPANN collection reads again after an error that distributed Chroma retries, as the retry of the
+    /// distributed executor: by default the same.
+    #[serde(default = "RetryConfig::default")]
+    pub retry: RetryConfig,
+}
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Deserialize, Clone, Serialize, Debug)]
@@ -887,5 +897,40 @@ mod tests {
             config.validate(),
             Err(TiersConfigError::DuplicateTier(0))
         ));
+    }
+
+    // The local executor reads its retry as the distributed one does: by default the same.
+    #[test]
+    fn the_local_executor_reads_its_retry_as_the_distributed_one() {
+        let retry = |config: &str| {
+            let ExecutorConfig::Local(config) = serde_json::from_str(config).unwrap() else {
+                panic!("not a local executor: {config}");
+            };
+            let retry = config.retry;
+            (
+                retry.factor,
+                retry.min_delay_ms,
+                retry.max_delay_ms,
+                retry.max_attempts,
+                retry.jitter,
+            )
+        };
+        let default = RetryConfig::default();
+        assert_eq!(
+            retry(r#"{"local": {"spann": true}}"#),
+            (
+                default.factor,
+                default.min_delay_ms,
+                default.max_delay_ms,
+                default.max_attempts,
+                default.jitter
+            )
+        );
+        assert_eq!(
+            retry(
+                r#"{"local": {"spann": true, "retry": {"factor": 3.0, "min_delay_ms": 10, "max_delay_ms": 20, "max_attempts": 2, "jitter": false}}}"#
+            ),
+            (3.0, 10, 20, 2, false)
+        );
     }
 }

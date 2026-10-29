@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 [package]
 name = "chroma-frontend"
 version = "1.0.0"
@@ -61,6 +62,7 @@ reqwest = { workspace = true }
 proptest = { workspace = true }
 proptest-state-machine = { workspace = true }
 chroma-types = { workspace = true, features = ["testing"] }
+chroma-segment = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }
 worker = { workspace = true }
 ndarray = { workspace = true }

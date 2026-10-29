@@ -1402,11 +1402,14 @@ async fn create_collection(
     let payload_clone = payload.clone();
 
     let configuration = match payload_clone.configuration {
-        Some(c) => Some(InternalCollectionConfiguration::try_from_config(
-            c,
-            server.config.frontend.default_knn_index,
-            payload_clone.metadata,
-        )?),
+        Some(c) => {
+            let knn_index = server.frontend.knn_index_for(c.spann.is_some());
+            Some(InternalCollectionConfiguration::try_from_config(
+                c,
+                knn_index,
+                payload_clone.metadata,
+            )?)
+        }
         None => Some(InternalCollectionConfiguration::try_from_config(
             CollectionConfiguration::default(),
             server.config.frontend.default_knn_index,

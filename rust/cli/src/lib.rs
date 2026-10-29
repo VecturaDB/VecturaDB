@@ -1,5 +1,6 @@
-// Changed by VecturaDB contributors for the VecturaDB branding.
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 // Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
+#![recursion_limit = "256"]
 mod client;
 mod commands;
 mod config_store;

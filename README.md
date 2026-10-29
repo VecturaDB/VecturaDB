@@ -54,10 +54,10 @@ pip install --force-reinstall --no-deps VecturaDB
 ## Docker
 
 ```bash
-docker run -p 8000:8000 -v ./data:/data ghcr.io/vecturadb/vecturadb:preview
+docker run -p 127.0.0.1:8000:8000 -v ./data:/data ghcr.io/vecturadb/vecturadb:preview
 ```
 
-Images for amd64 and arm64. `preview` is the newest preview; every release also has a tag with its version. The data lives in `/data`.
+Images for amd64 and arm64. `preview` is the newest preview; every release also has a tag with its version. The data lives in `/data`. `-p 127.0.0.1:8000:8000` publishes the port on this machine only.
 
 ## CLI
 
@@ -90,6 +90,36 @@ To copy only some collections, use `--collections <name>` once per collection in
 The copy stops at the first collection it cannot create. The collections copied before it stay in VecturaDB: copy the rest with `--collections`. Collections whose metadata holds the legacy `hnsw:*` settings fail with `Cannot set both collection config and schema simultaneously`; Chroma gives the same error.
 
 What arrives: every record with its document, metadata, embedding and URI, the metadata of the collection, and its schema, sparse and BM25 indexes included. Sparse and BM25 searches give the same scores as on Chroma Cloud. The settings of the dense index do not arrive: Chroma Cloud uses SPANN, VecturaDB uses HNSW with its default settings.
+
+## SPANN index
+
+Chroma Cloud indexes the dense vectors of a collection with SPANN, single-node Chroma with HNSW. VecturaDB can give a collection a SPANN index on the single node too, behind the server option `spann`, off by default.
+
+With a configuration file:
+
+```yaml
+persist_path: "./data"
+executor:
+  local:
+    spann: true
+```
+
+```bash
+vecturadb run config.yaml
+```
+
+With Docker, the image reads its configuration file, and an environment variable sets the option:
+
+```bash
+docker run -p 127.0.0.1:8000:8000 -v ./data:/data -e CHROMA_EXECUTOR__LOCAL__SPANN=true ghcr.io/vecturadb/vecturadb:preview
+```
+
+`run --path` reads no option, and the Python package has no SPANN in process.
+
+- With the option on, a collection created with a SPANN configuration or schema gets a SPANN index; any other collection gets HNSW, as before.
+- With the option off, a SPANN request gets HNSW, as on single-node Chroma. A SPANN collection created before still answers reads; a write to it fails with `SPANN collections need the executor option spann`.
+- A read of a SPANN collection that fails with an error that distributed Chroma retries reads again: at once after a NotFound, otherwise after the backoff of `executor: local: retry` (`factor`, `min_delay_ms`, `max_delay_ms`, `max_attempts`, `jitter`), by default that of distributed Chroma: 2.0, 100 ms, 5000 ms, 5 times, with jitter.
+- Chroma 1.5.9 and VecturaDB 1.0.0-preview.3.post1 open a data path with SPANN collections and serve the other collections as before. A SPANN collection answers there with an error, 500: do not write to it with them. Deleting it there works; VecturaDB removes its files at the next startup.
 
 ## Clients
 

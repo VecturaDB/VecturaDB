@@ -1,4 +1,5 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
+#![recursion_limit = "256"]
 use std::{path::Path, sync::Arc};
 
 pub mod config;

@@ -1,24 +1,31 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Formatter};
+use std::time::{Duration, Instant};
 
 use crate::Log;
 use async_trait::async_trait;
 use chroma_config::registry::{Injectable, Registry};
 use chroma_config::Configurable;
 use chroma_error::{ChromaError, ErrorCodes};
+use chroma_segment::blockfile_record::{
+    RecordSegmentReaderOptions, RecordSegmentReaderShard, RecordSegmentReaderShardCreationError,
+    RecordSegmentWriterShard,
+};
 use chroma_segment::local_hnsw::LocalHnswSegmentReaderError;
 use chroma_segment::local_segment_manager::{LocalSegmentManager, LocalSegmentManagerError};
 use chroma_segment::sqlite_metadata::{
     SqliteMetadataError, SqliteMetadataReader, SqliteMetadataWriter,
 };
+use chroma_segment::types::materialize_logs;
 use chroma_sqlite::db::SqliteDb;
 use chroma_sysdb::SysDb;
 use chroma_system::Handler;
 use chroma_system::{Component, ComponentContext};
 use chroma_types::{
-    Chunk, CollectionUuid, DatabaseName, GetCollectionWithSegmentsError, LogRecord, Schema,
-    SchemaError, SegmentUuid,
+    Chunk, Collection, CollectionAndSegments, CollectionUuid, DatabaseName,
+    GetCollectionWithSegmentsError, LogRecord, Schema, SchemaError, Segment, SegmentFlushInfo,
+    SegmentShard, SegmentType, SegmentUuid,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -38,7 +45,41 @@ pub struct LocalCompactionManager {
     // backfill before a read or a write goes on. Each backfill forgets its collection, any other purge request
     // skips SQLite. A change missed here only delays a purge, which never decides what a read returns.
     purged: HashSet<CollectionUuid>,
+    // The versions that the flushes of SPANN collections replaced within the grace, by segment.
+    spann_versions: HashMap<SegmentUuid, ReplacedVersions>,
+    spann_version_grace: Duration,
 }
+
+#[derive(Clone, Debug, Default)]
+struct ReplacedVersions {
+    // The files of each replaced version, with when it was replaced, oldest first.
+    replaced: VecDeque<(Instant, HashMap<String, Vec<String>>)>,
+    removed_at: Option<Instant>,
+}
+
+impl ReplacedVersions {
+    // When a flush last touched the segment.
+    fn last_flush(&self) -> Option<Instant> {
+        self.replaced
+            .back()
+            .map(|(replaced_at, _)| *replaced_at)
+            .max(self.removed_at)
+    }
+}
+
+/// How long the files of a version of a SPANN collection stay after a flush replaced it, for the reads that opened it:
+/// a minute, as the garbage collector of distributed Chroma in rust/worker/chroma_config.yaml
+/// (relative_cutoff_time_seconds). Injectable for tests.
+#[derive(Clone, Copy, Debug)]
+pub struct SpannVersionGrace(pub Duration);
+
+impl Default for SpannVersionGrace {
+    fn default() -> Self {
+        Self(Duration::from_secs(60))
+    }
+}
+
+impl Injectable for SpannVersionGrace {}
 
 // Forgetting a collection costs one more check, so the set is emptied instead of growing with every collection
 // a long-running server has read.
@@ -96,6 +137,8 @@ impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
             sysdb,
             metrics: registry.get::<LocalCompactionMetrics>().unwrap_or_default(),
             purged: HashSet::new(),
+            spann_versions: HashMap::new(),
+            spann_version_grace: registry.get::<SpannVersionGrace>().unwrap_or_default().0,
         };
         registry.register(res.clone());
         Ok(res)
@@ -146,6 +189,10 @@ pub enum CompactionManagerError {
     UnsafeHnswCheckpoint(#[source] std::io::Error),
     #[error("Failed to reconcile collection schema: {0}")]
     SchemaReconcileError(#[from] SchemaError),
+    #[error("SPANN collections need a persistent data path")]
+    SpannUnavailable,
+    #[error("Error writing the SPANN index: {0}")]
+    SpannWriteError(Box<dyn ChromaError>),
 }
 
 impl ChromaError for CompactionManagerError {
@@ -161,6 +208,8 @@ impl ChromaError for CompactionManagerError {
             CompactionManagerError::HnswReaderConstructionError(e) => e.code(),
             CompactionManagerError::PurgeLogsFailure => ErrorCodes::Internal,
             CompactionManagerError::UnsafeHnswCheckpoint(_) => ErrorCodes::FailedPrecondition,
+            CompactionManagerError::SpannUnavailable => ErrorCodes::FailedPrecondition,
+            CompactionManagerError::SpannWriteError(e) => e.code(),
             CompactionManagerError::SchemaReconcileError(e) => e.code(),
         }
     }
@@ -199,19 +248,36 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
                     .map_err(CompactionManagerError::SchemaReconcileError)?,
             );
         }
+        let spann = collection_and_segments.vector_segment.r#type == SegmentType::Spann;
+        if spann {
+            // Until the log is applied again, a read of the collection replays it.
+            self.hnsw_segment_manager
+                .set_spann_applied(message.collection_id, false);
+        }
         // If collection is uninitialized, that means nothing has been written yet.
         let dim = match collection_and_segments.collection.dimension {
             Some(dim) => dim,
-            None => return Ok(()),
+            None => {
+                if spann {
+                    self.hnsw_segment_manager
+                        .set_spann_applied(message.collection_id, true);
+                }
+                return Ok(());
+            }
         };
-        let hnsw_reader = self
-            .hnsw_segment_manager
-            .get_hnsw_reader(
-                &collection_and_segments.collection,
-                &collection_and_segments.vector_segment,
-                dim as usize,
-            )
-            .await;
+        let hnsw_reader = if spann {
+            Err(LocalSegmentManagerError::LocalHnswSegmentReaderError(
+                LocalHnswSegmentReaderError::UninitializedSegment,
+            ))
+        } else {
+            self.hnsw_segment_manager
+                .get_hnsw_reader(
+                    &collection_and_segments.collection,
+                    &collection_and_segments.vector_segment,
+                    dim as usize,
+                )
+                .await
+        };
         let hnsw_reader = match hnsw_reader {
             Ok(reader) => Some(reader),
             Err(LocalSegmentManagerError::LocalHnswSegmentReaderError(
@@ -236,6 +302,14 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
         let mt_max_seq_id = metadata_reader
             .current_max_seq_id(&collection_and_segments.metadata_segment.id)
             .await?;
+        // A SPANN index is at the log position of its last flush, which flush_compaction records.
+        let hnsw_max_seq_id = if spann {
+            metadata_reader
+                .current_max_seq_id(&collection_and_segments.vector_segment.id)
+                .await?
+        } else {
+            hnsw_max_seq_id
+        };
         // Get the logs from log service beyond this offset to backfill.
         let dbname = DatabaseName::new(collection_and_segments.collection.database.clone())
             .ok_or(CompactionManagerError::PullLogsFailure)?;
@@ -268,6 +342,20 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
         }
         mt_data_chunk.set_visibility(mt_visibility);
         hnsw_data_chunk.set_visibility(hnsw_visibility);
+        // As the flush of distributed Chroma, which changes every segment of a collection at once: the files of a SPANN
+        // collection are written first, and its records go to SQLite in the transaction that records those files, so a
+        // read in one transaction sees them at the same flush.
+        let spann_flush = match spann {
+            true => {
+                self.write_spann(
+                    &collection_and_segments,
+                    dim as usize,
+                    hnsw_data_chunk.clone(),
+                )
+                .await?
+            }
+            false => None,
+        };
         // Apply the records to the metadata writer.
         let metadata_writer = SqliteMetadataWriter::new(self.sqlite_db.clone());
         let mut tx = metadata_writer
@@ -299,9 +387,56 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
                     .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
             }
         }
+        if let Some(flush) = &spann_flush {
+            chroma_sysdb::sqlite::flush_compaction_in(
+                &mut *tx,
+                collection_and_segments.collection.collection_id,
+                flush.log_position,
+                collection_and_segments.collection.version,
+                &[
+                    SegmentFlushInfo {
+                        segment_id: collection_and_segments.record_segment.id,
+                        file_paths: flush.record_files.clone(),
+                    },
+                    SegmentFlushInfo {
+                        segment_id: collection_and_segments.vector_segment.id,
+                        file_paths: flush.vector_files.clone(),
+                    },
+                ],
+                None,
+            )
+            .await
+            .map_err(|err| CompactionManagerError::SpannWriteError(err.boxed()))?;
+        }
         tx.commit()
             .await
             .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
+        if spann {
+            if let Some(flush) = spann_flush {
+                let mut record_segment = collection_and_segments.record_segment.clone();
+                record_segment.file_path = flush.record_files.clone();
+                for (segment, files) in [
+                    (&collection_and_segments.record_segment, flush.record_files),
+                    (&collection_and_segments.vector_segment, flush.vector_files),
+                ] {
+                    if let Err(err) = self
+                        .remove_replaced_versions(
+                            &collection_and_segments.collection,
+                            segment,
+                            files,
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %err, "SPANN flush done; the files of older versions stay for the next flush");
+                    }
+                }
+                self.hnsw_segment_manager
+                    .spann_flushed(message.collection_id, record_segment);
+            }
+            self.hnsw_segment_manager
+                .set_spann_applied(message.collection_id, true);
+            return Ok(());
+        }
         // Next apply it to the hnsw writer.
         let mut hnsw_writer = self
             .hnsw_segment_manager
@@ -343,7 +478,158 @@ impl Handler<PurgeLogsMessage> for LocalCompactionManager {
     }
 }
 
+// The files of a flush of a SPANN collection, and the log position they cover.
+struct SpannFlush {
+    log_position: i64,
+    record_files: HashMap<String, Vec<String>>,
+    vector_files: HashMap<String, Vec<String>>,
+}
+
 impl LocalCompactionManager {
+    // As the compaction of distributed Chroma: the records are materialized against the record segment, applied to it
+    // and to the SPANN index, and the new files of both written; the caller records them with the log position they
+    // cover. None when the log has nothing past the last flush.
+    async fn write_spann(
+        &mut self,
+        collection_and_segments: &CollectionAndSegments,
+        dimensionality: usize,
+        logs: Chunk<LogRecord>,
+    ) -> Result<Option<SpannFlush>, CompactionManagerError> {
+        let Some(log_position) = logs.iter().map(|(log, _)| log.log_offset).max() else {
+            return Ok(None);
+        };
+        let write = |err: Box<dyn ChromaError>| CompactionManagerError::SpannWriteError(err);
+        let provider = self
+            .hnsw_segment_manager
+            .spann_provider()
+            .ok_or(CompactionManagerError::SpannUnavailable)?;
+        let collection = &collection_and_segments.collection;
+        let record_shard = SegmentShard::try_from((&collection_and_segments.record_segment, 0))
+            .map_err(|err| write(err.boxed()))?;
+        let vector_shard = SegmentShard::try_from((&collection_and_segments.vector_segment, 0))
+            .map_err(|err| write(err.boxed()))?;
+        let record_reader = match RecordSegmentReaderShard::from_segment(
+            &record_shard,
+            &provider.blockfile_provider,
+            None,
+        )
+        .await
+        {
+            Ok(reader) => Some(reader),
+            Err(err)
+                if matches!(
+                    *err,
+                    RecordSegmentReaderShardCreationError::UninitializedSegment
+                ) =>
+            {
+                None
+            }
+            Err(err) => return Err(write(err.boxed())),
+        };
+        let materialized = materialize_logs(
+            &record_reader,
+            logs,
+            None,
+            &RecordSegmentReaderOptions::default(),
+        )
+        .await
+        .map_err(|err| write(err.boxed()))?;
+        let record_writer = RecordSegmentWriterShard::from_segment(
+            &collection.tenant,
+            &collection.database_id,
+            &record_shard,
+            &provider.blockfile_provider,
+            None,
+            None,
+        )
+        .await
+        .map_err(|err| write(err.boxed()))?;
+        record_writer
+            .apply_materialized_log_chunk(&record_reader, &materialized)
+            .await
+            .map_err(|err| write(err.boxed()))?;
+        let mut spann_writer = provider
+            .write(collection, &vector_shard, dimensionality, None)
+            .await
+            .map_err(|err| write(err.boxed()))?;
+        spann_writer
+            .apply_materialized_log_chunk(&record_reader, &materialized)
+            .await
+            .map_err(|err| write(err.boxed()))?;
+        let record_files = Box::pin(record_writer.commit())
+            .await
+            .map_err(|err| write(err.boxed()))?
+            .flush()
+            .await
+            .map_err(|err| write(err.boxed()))?;
+        // As the commit of a compaction (rust/worker/src/execution/operators/commit_segment_writer.rs).
+        spann_writer.garbage_collect().await.map_err(write)?;
+        let vector_files = Box::pin(spann_writer.commit())
+            .await
+            .map_err(write)?
+            .flush()
+            .await
+            .map_err(write)?;
+        Ok(Some(SpannFlush {
+            log_position,
+            record_files,
+            vector_files,
+        }))
+    }
+
+    // The files of the versions of a SPANN segment that a flush replaced longer than the grace ago, removed, at most
+    // once a grace for each segment. The version before the current one stays, as min_versions_to_keep 2 in the garbage
+    // collector of distributed Chroma. Flushes run one at a time here, so no file of a flush to come is on disk yet;
+    // after a restart, the files of the versions replaced before it go at the first flush.
+    async fn remove_replaced_versions(
+        &mut self,
+        collection: &Collection,
+        segment: &Segment,
+        current: HashMap<String, Vec<String>>,
+    ) -> Result<(), LocalSegmentManagerError> {
+        let now = Instant::now();
+        let grace = self.spann_version_grace;
+        // A segment that no flush touched for longer than the grace, as one of a deleted collection, has no version left
+        // to keep for the reads: its next flush keeps the version before its current one anyway.
+        self.spann_versions.retain(|segment_id, versions| {
+            *segment_id == segment.id
+                || versions
+                    .last_flush()
+                    .is_some_and(|last_flush| now.duration_since(last_flush) < grace)
+        });
+        let versions = self.spann_versions.entry(segment.id).or_default();
+        if !segment.file_path.is_empty() {
+            versions
+                .replaced
+                .push_back((now, segment.file_path.clone()));
+        }
+        while versions.replaced.len() > 1
+            && versions
+                .replaced
+                .front()
+                .is_some_and(|(replaced_at, _)| now.duration_since(*replaced_at) >= grace)
+        {
+            versions.replaced.pop_front();
+        }
+        if versions
+            .removed_at
+            .is_some_and(|removed_at| now.duration_since(removed_at) < grace)
+        {
+            return Ok(());
+        }
+        versions.removed_at = Some(now);
+        let kept = std::iter::once(&current)
+            .chain(versions.replaced.iter().map(|(_, files)| files))
+            .collect::<Vec<_>>();
+        self.hnsw_segment_manager
+            .remove_unused_spann_files(
+                &segment.construct_prefix_path(&collection.tenant, &collection.database_id),
+                &kept,
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn purge_logs(
         &mut self,
         collection_id: CollectionUuid,
@@ -369,7 +655,7 @@ impl LocalCompactionManager {
                 return Ok(());
             }
         }
-        if max_seq_id > 0 {
+        if max_seq_id > 0 && collection_segments.vector_segment.r#type != SegmentType::Spann {
             self.metrics.checkpoint_inspections.add(1, &[]);
             match self
                 .hnsw_segment_manager

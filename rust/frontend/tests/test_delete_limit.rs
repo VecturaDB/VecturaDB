@@ -1,3 +1,5 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
+#![recursion_limit = "256"]
 use chroma_config::{registry::Registry, Configurable};
 use chroma_frontend::{config::FrontendServerConfig, Frontend};
 use chroma_sqlite::config::SqliteDBConfig;

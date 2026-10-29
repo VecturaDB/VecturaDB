@@ -1,3 +1,5 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
+#![recursion_limit = "256"]
 //! Model-based coverage of the complete local frontend, log, compactor and HNSW stack.
 //! Small ID spaces deliberately generate duplicate adds and add/delete/add histories.
 use std::{collections::BTreeMap, path::Path, time::Duration};

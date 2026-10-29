@@ -2062,6 +2062,7 @@ dependencies = [
  "chrono",
  "faer",
  "fastbloom",
+ "figment",
  "futures",
  "opentelemetry",
  "proptest",
