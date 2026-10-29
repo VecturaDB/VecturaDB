@@ -566,8 +566,15 @@ fn differences(
 
 // The same searches on the same SPANN collection, in one snapshot and in two moments, answer the same, and none of them
 // answers nothing: two empty answers would prove nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_spann_search_in_two_moments_answers_as_in_one_snapshot() {
+#[test]
+fn a_spann_search_in_two_moments_answers_as_in_one_snapshot() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        a_spann_search_in_two_moments_answers_as_in_one_snapshot_impl,
+    )
+}
+
+async fn a_spann_search_in_two_moments_answers_as_in_one_snapshot_impl() {
     let root = tempfile::tempdir().unwrap();
     let mut frontend = frontend_with_spann(root.path(), true).await;
     let mut numbers = Numbers(0x5eed_1234_abcd_ef01);
