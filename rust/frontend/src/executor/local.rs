@@ -1462,6 +1462,11 @@ impl LocalExecutor {
     pub(crate) fn spann_marked_read(&self, collection_id: chroma_types::CollectionUuid) -> bool {
         SpannWarmUp::lock(&self.spann_warm_up.read).contains(&collection_id)
     }
+
+    /// The manager of the segments, whose cleanup of SPANN files the tests call.
+    pub(crate) fn segment_manager(&self) -> &LocalSegmentManager {
+        &self.hnsw_manager
+    }
 }
 
 // The BM25 setting of a sparse key, as the search reads it.

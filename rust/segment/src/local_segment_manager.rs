@@ -19,10 +19,11 @@ use chroma_index::{
     IndexUuid,
 };
 use chroma_sqlite::db::SqliteDb;
-use chroma_storage::{local::LocalStorage, Storage};
+use chroma_storage::{local::LocalStorage, Storage, StorageError};
 use chroma_types::{
     Collection, CollectionUuid, Segment, SegmentUuid, HNSW_PATH, USER_ID_BLOOM_FILTER,
 };
+use futures::StreamExt;
 use sea_query_binder::SqlxBinder;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -211,6 +212,70 @@ async fn entries(path: &Path, folders: bool) -> io::Result<Vec<std::path::PathBu
         }
     }
     Ok(found)
+}
+
+/// Test hooks of the cleanup of the SPANN files under a prefix, where it touches the files: the reads of roots
+/// (ROOT_READS), the removals of files (FILE_REMOVALS) and the listings of the folders of the HNSW indexes
+/// (FOLDER_LISTINGS) are counted, and with a meeting the first two of them wait up to 5 s for each other, which they
+/// meet only when they run together.
+#[cfg(feature = "test-hooks")]
+pub static ROOT_READS: std::sync::Mutex<Vec<FileHook>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "test-hooks")]
+pub static FILE_REMOVALS: std::sync::Mutex<Vec<FileHook>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "test-hooks")]
+pub static FOLDER_LISTINGS: std::sync::Mutex<Vec<FileHook>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Debug)]
+pub struct FileHook {
+    pub prefix: String,
+    pub count: Arc<std::sync::atomic::AtomicUsize>,
+    pub meeting: Option<Arc<Meeting>>,
+}
+
+/// The first two operations of a hook: they met when the second came while the first still waited for it.
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Default)]
+pub struct Meeting {
+    // How many came, and whether the first gave up waiting.
+    state: std::sync::Mutex<(usize, bool)>,
+    second: std::sync::Condvar,
+    pub met: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "test-hooks")]
+fn file_hook(hooks: &std::sync::Mutex<Vec<FileHook>>, prefix: &str) {
+    let hook = hooks
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|hook| hook.prefix == prefix)
+        .cloned();
+    let Some(hook) = hook else {
+        return;
+    };
+    hook.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let Some(meeting) = hook.meeting else {
+        return;
+    };
+    let mut state = meeting.state.lock().unwrap();
+    state.0 += 1;
+    if state.0 == 1 {
+        let (mut state, wait) = meeting
+            .second
+            .wait_timeout_while(state, std::time::Duration::from_secs(5), |state| {
+                state.0 < 2
+            })
+            .unwrap();
+        if wait.timed_out() {
+            state.1 = true;
+        }
+    } else if state.0 == 2 && !state.1 {
+        meeting.met.store(true, std::sync::atomic::Ordering::SeqCst);
+        meeting.second.notify_all();
+    }
 }
 
 #[derive(Debug)]
@@ -603,8 +668,16 @@ impl LocalSegmentManager {
         ) else {
             return Ok(0);
         };
+        // No cache of roots, as the garbage collector of distributed Chroma by default (root_cache_config): two
+        // cleanups of a segment see versions about a grace apart, so a cache of its own would hold almost no root that
+        // a later one reads, and the cache of the reads would lose to them the roots of the collections that are read.
         let roots = RootManager::new((*storage).clone(), Box::new(NopCache));
         let mut live = HashSet::new();
+        // The roots of the blockfiles of the versions, each once, read a hundred at a time, as distributed Chroma lists
+        // the files of a version (list_files_at_version.rs). The local storage reads a file in one go, with nothing to
+        // wait for: each read goes to the blocking threads of tokio, as tokio::fs does, so that the reads run together,
+        // as those of the storage of distributed Chroma do.
+        let mut sparse_indexes = HashMap::new();
         for files in versions {
             for (file_type, paths) in files.iter() {
                 for path in paths {
@@ -618,52 +691,141 @@ impl LocalSegmentManager {
                         live.insert(path.clone());
                     } else {
                         live.insert(RootManager::get_storage_key(path_prefix, &id));
-                        let blocks = roots.get_all_block_ids(&id, path_prefix).await?;
-                        live.extend(
-                            blocks
-                                .iter()
-                                .map(|block| BlockManager::format_key(path_prefix, block)),
-                        );
+                        sparse_indexes.insert(id, path_prefix.to_string());
                     }
                 }
             }
         }
-        let root = Path::new(root);
-        let mut removed = 0;
-        let remove_unused = |key: String| {
-            let path = root.join(&key);
-            let unused = !live.contains(&key);
-            async move {
-                if unused {
-                    match tokio::fs::remove_file(path).await {
-                        Ok(()) => return Ok(true),
-                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                        Err(err) => return Err(err),
+        let handle = tokio::runtime::Handle::current();
+        let mut block_ids = futures::stream::iter(sparse_indexes)
+            .map(|(id, path_prefix)| {
+                let (roots, handle) = (roots.clone(), handle.clone());
+                #[cfg(feature = "test-hooks")]
+                let hook_prefix = prefix.to_string();
+                async move {
+                    let (blocks, path_prefix) = tokio::task::spawn_blocking(move || {
+                        #[cfg(feature = "test-hooks")]
+                        file_hook(&ROOT_READS, &hook_prefix);
+                        let blocks = handle.block_on(roots.get_all_block_ids(&id, &path_prefix));
+                        (blocks, path_prefix)
+                    })
+                    .await
+                    .map_err(io::Error::other)?;
+                    match blocks {
+                        Ok(blocks) => Ok((blocks, path_prefix)),
+                        // As distributed Chroma: a root that is not there went with its version.
+                        Err(RootManagerError::StorageGetError(StorageError::NotFound { .. })) => {
+                            tracing::debug!(
+                                "Sparse index {id} not found in storage. Assuming it was previously deleted."
+                            );
+                            Ok((Vec::new(), path_prefix))
+                        }
+                        Err(err) => Err(LocalSegmentManagerError::from(err)),
                     }
                 }
-                Ok(false)
-            }
-        };
+            })
+            .buffer_unordered(100);
+        while let Some(result) = block_ids.next().await {
+            let (blocks, path_prefix) = result?;
+            live.extend(
+                blocks
+                    .iter()
+                    .map(|block| BlockManager::format_key(&path_prefix, block)),
+            );
+        }
+        let root = Path::new(root);
+        let mut files = Vec::new();
         for kind in ["block", "root"] {
             for file in entries(&root.join(format!("{prefix}/{kind}")), false).await? {
                 if let Some(name) = file.file_name().and_then(|name| name.to_str()) {
-                    removed += remove_unused(format!("{prefix}/{kind}/{name}")).await? as usize;
+                    files.push(format!("{prefix}/{kind}/{name}"));
                 }
             }
         }
-        for index in entries(&root.join(format!("{prefix}/hnsw")), true).await? {
+        let indexes = entries(&root.join(format!("{prefix}/hnsw")), true).await?;
+        // The folders of the HNSW indexes of the centers, one for each index that a flush wrote, listed a hundred at a
+        // time as well, each listing on the blocking threads of tokio. The stream owns its paths: one that borrowed
+        // them made the future of the compaction, which must be Send, too general for the compiler to prove it.
+        let mut listings = futures::stream::iter(indexes.clone())
+            .map(|index| {
+                let folder = index.clone();
+                #[cfg(feature = "test-hooks")]
+                let hook_prefix = prefix.to_string();
+                async move {
+                    let listed = tokio::task::spawn_blocking(move || {
+                        #[cfg(feature = "test-hooks")]
+                        file_hook(&FOLDER_LISTINGS, &hook_prefix);
+                        // As entries(index, false), in one go on a blocking thread: the files of the folder, none if
+                        // it is not there.
+                        let mut found = Vec::new();
+                        let folder = match std::fs::read_dir(&folder) {
+                            Ok(folder) => folder,
+                            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(found),
+                            Err(err) => return Err(err),
+                        };
+                        for entry in folder {
+                            let entry = entry?;
+                            if !entry.file_type()?.is_dir() {
+                                found.push(entry.path());
+                            }
+                        }
+                        Ok(found)
+                    })
+                    .await
+                    .map_err(io::Error::other)?;
+                    Ok::<_, io::Error>((index, listed?))
+                }
+            })
+            .buffer_unordered(100);
+        while let Some(listed) = listings.next().await {
+            let (index, listed) = listed?;
             let Some(index_name) = index.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            for file in entries(&index, false).await? {
+            for file in listed {
                 if let Some(name) = file.file_name().and_then(|name| name.to_str()) {
-                    removed +=
-                        remove_unused(format!("{prefix}/hnsw/{index_name}/{name}")).await? as usize;
+                    files.push(format!("{prefix}/hnsw/{index_name}/{name}"));
                 }
             }
-            // A folder that still holds files stays.
-            let _ = tokio::fs::remove_dir(&index).await;
         }
+        drop(listings);
+        // The files that no version names, a hundred at a time, as distributed Chroma renames them a hundred at a time
+        // or deletes them a thousand in a request (delete_unused_files.rs): each removal goes to the blocking threads
+        // of tokio, as tokio::fs::remove_file does, so that the removals run together.
+        let unused = files.into_iter().filter(|key| !live.contains(key));
+        let mut removals = futures::stream::iter(unused)
+            .map(|key| {
+                let path = root.join(key);
+                #[cfg(feature = "test-hooks")]
+                let hook_prefix = prefix.to_string();
+                async move {
+                    let removal = tokio::task::spawn_blocking(move || {
+                        #[cfg(feature = "test-hooks")]
+                        file_hook(&FILE_REMOVALS, &hook_prefix);
+                        std::fs::remove_file(path)
+                    })
+                    .await
+                    .map_err(io::Error::other)?;
+                    match removal {
+                        Ok(()) => Ok(true),
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+                        Err(err) => Err(err),
+                    }
+                }
+            })
+            .buffer_unordered(100);
+        let mut removed = 0;
+        while let Some(result) = removals.next().await {
+            removed += result? as usize;
+        }
+        // A folder that still holds files stays. The folders go a hundred at a time too.
+        futures::stream::iter(indexes)
+            .map(|index| async move {
+                let _ = tokio::fs::remove_dir(&index).await;
+            })
+            .buffer_unordered(100)
+            .collect::<Vec<_>>()
+            .await;
         Ok(removed)
     }
 

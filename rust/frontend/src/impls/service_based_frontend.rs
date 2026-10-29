@@ -5205,6 +5205,239 @@ mod tests {
         assert_eq!(pending_cleanups(root.path()), 0);
     }
 
+    // The prefix of the files of a segment, from one of its paths.
+    fn segment_prefix(files: &std::collections::HashMap<String, Vec<String>>) -> String {
+        let path = files.values().flatten().next().unwrap();
+        chroma_types::Segment::extract_prefix_and_id(path)
+            .unwrap()
+            .0
+            .to_string()
+    }
+
+    type FileHooks = std::sync::Mutex<Vec<chroma_segment::local_segment_manager::FileHook>>;
+
+    // A hook of the cleanup of the SPANN files under a prefix, on its reads of roots or its removals of files, taken
+    // out when dropped, with the count of those operations and, when asked, the meeting of the first two.
+    struct CleanupHook(&'static FileHooks, String);
+
+    impl Drop for CleanupHook {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().retain(|hook| hook.prefix != self.1);
+        }
+    }
+
+    fn cleanup_hook(
+        hooks: &'static FileHooks,
+        prefix: &str,
+        meeting: bool,
+    ) -> (
+        CleanupHook,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Option<Arc<chroma_segment::local_segment_manager::Meeting>>,
+    ) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let meeting =
+            meeting.then(|| Arc::new(chroma_segment::local_segment_manager::Meeting::default()));
+        hooks
+            .lock()
+            .unwrap()
+            .push(chroma_segment::local_segment_manager::FileHook {
+                prefix: prefix.to_string(),
+                count: count.clone(),
+                meeting: meeting.clone(),
+            });
+        (CleanupHook(hooks, prefix.to_string()), count, meeting)
+    }
+
+    // The cleanup of the files of the replaced versions of a SPANN collection reads the roots of their blockfiles
+    // together, as distributed Chroma lists the files of a version: one after the other, on a folder mounted from
+    // another system, the reads of the roots of the versions of a minute held the compactor for 2.2 to 3.4 s. Here the
+    // first two reads of roots of the record segment meet where they read the files, which reads one after the other
+    // never do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_cleanup_reads_its_roots_together() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann_grace(root.path(), std::time::Duration::ZERO).await;
+        let collection_id = spann_collection_with_records(&mut frontend, "spann-cleanup").await;
+        let (files, _) = record_roots(&mut frontend, root.path(), collection_id).await;
+        let (_hook, count, meeting) = cleanup_hook(
+            &chroma_segment::local_segment_manager::ROOT_READS,
+            &segment_prefix(&files),
+            true,
+        );
+        tokio::time::timeout(
+            STOP_WAIT,
+            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+        )
+        .await
+        .unwrap();
+        assert!(count.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        assert!(meeting
+            .unwrap()
+            .met
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // The cleanup removes the files that no version names together, as distributed Chroma deletes them: one after the
+    // other, on a folder mounted from another system, the removals after the versions of a minute held the compactor
+    // for up to 5.6 s. Here two block files that no version names meet where they are removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_cleanup_removes_its_files_together() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = spann_collection_with_records(&mut frontend, "spann-removals").await;
+        let (files, _) = record_roots(&mut frontend, root.path(), collection_id).await;
+        let prefix = segment_prefix(&files);
+        let unused: Vec<_> = (0..2)
+            .map(|_| {
+                root.path()
+                    .join(&prefix)
+                    .join("block")
+                    .join(Uuid::new_v4().to_string())
+            })
+            .collect();
+        for file in &unused {
+            std::fs::write(file, b"").unwrap();
+        }
+        let (_hook, count, meeting) = cleanup_hook(
+            &chroma_segment::local_segment_manager::FILE_REMOVALS,
+            &prefix,
+            true,
+        );
+        local_executor(&frontend)
+            .segment_manager()
+            .remove_unused_spann_files(&prefix, &[&files])
+            .await
+            .unwrap();
+        assert!(unused.iter().all(|file| !file.exists()));
+        assert!(count.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        assert!(meeting
+            .unwrap()
+            .met
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // A root that is there but cannot be read stops the cleanup, and the files stay: only a root that is not there went
+    // with its version, and taking any error for that would remove the blocks of a version that is kept.
+    #[tokio::test]
+    async fn a_spann_cleanup_stops_on_a_root_it_cannot_read() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = spann_collection_with_records(&mut frontend, "spann-bad-root").await;
+        let (files, roots) = record_roots(&mut frontend, root.path(), collection_id).await;
+        let prefix = segment_prefix(&files);
+        std::fs::write(&roots[0], b"not a root").unwrap();
+        let unused = root
+            .path()
+            .join(&prefix)
+            .join("block")
+            .join(Uuid::new_v4().to_string());
+        std::fs::write(&unused, b"").unwrap();
+        assert!(local_executor(&frontend)
+            .segment_manager()
+            .remove_unused_spann_files(&prefix, &[&files])
+            .await
+            .is_err());
+        assert!(unused.exists());
+    }
+
+    // The cleanup lists the folders of the HNSW indexes of the centers together, as it reads the roots and removes the
+    // files: one for each index that a flush wrote, each listing a round trip on a folder mounted from another system.
+    // Here two folders of indexes that no version names meet where they are listed, and go with their files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_cleanup_lists_its_index_folders_together() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = spann_collection_with_records(&mut frontend, "spann-folders").await;
+        let files = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, collection_id)
+            .await
+            .unwrap()
+            .vector_segment
+            .file_path;
+        let prefix = segment_prefix(&files);
+        let unused: Vec<_> = (0..2)
+            .map(|_| {
+                root.path()
+                    .join(&prefix)
+                    .join("hnsw")
+                    .join(Uuid::new_v4().to_string())
+            })
+            .collect();
+        for folder in &unused {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("header.bin"), b"").unwrap();
+        }
+        let (_hook, count, meeting) = cleanup_hook(
+            &chroma_segment::local_segment_manager::FOLDER_LISTINGS,
+            &prefix,
+            true,
+        );
+        local_executor(&frontend)
+            .segment_manager()
+            .remove_unused_spann_files(&prefix, &[&files])
+            .await
+            .unwrap();
+        assert!(unused.iter().all(|folder| !folder.exists()));
+        assert!(count.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        assert!(meeting
+            .unwrap()
+            .met
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // The cleanup reads each root once, even when two versions name it, as distributed Chroma.
+    #[tokio::test]
+    async fn a_spann_cleanup_reads_each_root_once() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = spann_collection_with_records(&mut frontend, "spann-once").await;
+        let (files, _) = record_roots(&mut frontend, root.path(), collection_id).await;
+        let prefix = segment_prefix(&files);
+        let (_hook, count, _) = cleanup_hook(
+            &chroma_segment::local_segment_manager::ROOT_READS,
+            &prefix,
+            false,
+        );
+        local_executor(&frontend)
+            .segment_manager()
+            .remove_unused_spann_files(&prefix, &[&files, &files])
+            .await
+            .unwrap();
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            files.values().map(Vec::len).sum::<usize>()
+        );
+    }
+
+    // A version whose root is not there, as one whose files went with it, does not stop the cleanup, as distributed
+    // Chroma: a file that no version names still goes.
+    #[tokio::test]
+    async fn a_spann_cleanup_goes_on_without_a_root() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let collection_id = spann_collection_with_records(&mut frontend, "spann-no-root").await;
+        let (files, _) = record_roots(&mut frontend, root.path(), collection_id).await;
+        let prefix = segment_prefix(&files);
+        let gone = std::collections::HashMap::from([(
+            "offset_id_to_data".to_string(),
+            vec![format!("{prefix}/{}", Uuid::new_v4())],
+        )]);
+        let unused = root
+            .path()
+            .join(&prefix)
+            .join("block")
+            .join(Uuid::new_v4().to_string());
+        std::fs::write(&unused, b"").unwrap();
+        local_executor(&frontend)
+            .segment_manager()
+            .remove_unused_spann_files(&prefix, &[&files, &gone])
+            .await
+            .unwrap();
+        assert!(!unused.exists());
+    }
+
     // On a single node a fork copies the records of a SPANN collection into files of its own, as it copies those of an
     // HNSW collection: the fork answers after the source and its files are gone.
     #[tokio::test]
