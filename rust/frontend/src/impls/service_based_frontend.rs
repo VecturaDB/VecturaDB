@@ -6422,8 +6422,9 @@ mod tests {
         Ok(ReadAnswer::Records(answers))
     }
 
-    // How long a stopped read and the writes around it may take: a few seconds, far below the busy timeout of SQLite.
-    const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    // How long a stopped read and the writes around it may take, far below the busy timeout of SQLite: a write waits for
+    // the syncs of its files, and on the disk of Docker, with other tests syncing theirs, one took more than 10 s.
+    const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
     // The records of the collection of the stopped reads after the writes given: the ten of the add and one more for
     // each write, with r0 changed by each write, its document and its embedding.
