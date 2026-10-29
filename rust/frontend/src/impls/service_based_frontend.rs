@@ -6662,77 +6662,26 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    // A search of a SPANN collection keeps its snapshot of SQLite through its files, since it numbers the records by
-    // their rows of SQLite, and answers for it. A change of SQLite at the stop between that snapshot and the files waits
-    // for the search, and while it waits keeps out any new reader of SQLite until it commits: a search that read SQLite
-    // again after its files would see the change. The change waits for the search, never the search for the change.
+    // A search of a SPANN collection reads SQLite in its snapshot, closes it, then reads its files, as a get does: it
+    // answers for the moment of its snapshot while a write and its flush come between that snapshot and its files, and
+    // holds nothing of SQLite meanwhile, so the write does not wait for it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_spann_search_answers_for_the_snapshot_it_keeps_through_its_files() {
-        use sqlx::ConnectOptions;
-        let root = tempfile::tempdir().unwrap();
-        let mut frontend = frontend_with_spann(root.path(), true).await;
-        let collection_id = collection_to_stop(&mut frontend).await;
-        let (go_on, reading) = stopped_read(&frontend, collection_id, SpannRead::Search)
-            .await
-            .expect("the search did not stop before its files");
-        let options =
-            sqlx::sqlite::SqliteConnectOptions::new().filename(root.path().join("chroma.sqlite3"));
-        let mut change = options
-            .clone()
-            .busy_timeout(STOP_WAIT)
-            .connect()
-            .await
-            .unwrap();
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut change)
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE embedding_metadata SET string_value = 'changed r0' WHERE key = 'chroma:document' \
-             AND id IN (SELECT id FROM embeddings WHERE embedding_id = 'r0')",
-        )
-        .execute(&mut change)
-        .await
-        .unwrap();
-        let committing =
-            tokio::spawn(
-                async move { sqlx::query("COMMIT").execute(&mut change).await.map(|_| ()) },
-            );
-        // A reader that does not wait finds SQLite locked once the commit waits.
-        let mut reader = options
-            .busy_timeout(std::time::Duration::ZERO)
-            .connect()
-            .await
-            .unwrap();
-        let kept_out = tokio::time::timeout(STOP_WAIT, async {
-            while !committing.is_finished() {
-                if sqlx::query("SELECT count(*) FROM embeddings")
-                    .fetch_one(&mut reader)
-                    .await
-                    .is_err()
-                {
-                    return true;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            false
-        })
-        .await
-        .unwrap_or(false);
-        let mut wrong = Vec::new();
-        if !kept_out {
-            wrong.push("the change of SQLite did not wait for the search".to_string());
-        }
-        let _ = go_on.send(());
-        wrong.extend(answer_differences(reading, 0).await);
-        match tokio::time::timeout(STOP_WAIT, committing).await {
-            Ok(Ok(Ok(()))) => {}
-            other => wrong.push(format!(
-                "the change of SQLite did not commit once the search ended: {other:?}"
-            )),
-        }
+    async fn a_spann_search_across_a_flush_answers_for_its_snapshot() {
+        let grace = chroma_log::SpannVersionGrace::default().0;
+        let wrong = read_across_flushes(SpannRead::Search, 1, grace, 0).await;
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
+
+    // The same for a search whose files the second of two flushes removed, without a grace: it reads again from a new
+    // snapshot, as a get does, and answers for the last flush.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spann_search_whose_files_two_flushes_removed_answers_for_the_last_flush() {
+        let wrong = read_across_flushes(SpannRead::Search, 2, std::time::Duration::ZERO, 2).await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // The searches in two moments against the search in one snapshot, on the same collection.
+    mod spann_search_tests;
 
     // A count of a SPANN collection counts the records of the record segment, as distributed Chroma does, at the flush of
     // its snapshot of SQLite: an add and its flush between that snapshot and its files leave its answer as it was.

@@ -22,11 +22,12 @@ use chroma_sqlite::db::SqliteDb;
 use chroma_system::ComponentHandle;
 use chroma_types::{
     operator::{
-        CountResult, Filter, GetResult, KnnBatchResult, KnnProjection, KnnProjectionOutput,
-        KnnProjectionRecord, Limit, Merge, Projection, ProjectionRecord, RecordMeasure,
-        SearchResult,
+        CountResult, Filter, GetResult, Key, KnnBatchResult, KnnProjection, KnnProjectionOutput,
+        KnnProjectionRecord, Limit, Merge, Projection, ProjectionRecord, QueryVector,
+        RecordMeasure, SearchPayloadResult, SearchRecord, SearchResult, Select,
     },
     plan::{Count, Get, Knn, Search},
+    ranking::EnrichedRecord,
     CollectionAndSegments, ExecutorError, Segment, SegmentShard, SegmentType, SegmentUuid, Space,
 };
 use futures::future::try_join_all;
@@ -43,6 +44,10 @@ pub struct LocalExecutor {
     spann: bool,
     retry: RetryConfig,
     spann_warm_up: SpannWarmUp,
+    /// Test switch: a search of a SPANN collection runs all in its snapshot of SQLite, as before spann_search took it
+    /// in two moments, for the test that compares the answers of the two.
+    #[cfg(test)]
+    pub(crate) search_in_one_snapshot: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LocalExecutor {
@@ -58,6 +63,8 @@ impl LocalExecutor {
             spann: false,
             retry: RetryConfig::default(),
             spann_warm_up: SpannWarmUp::default(),
+            #[cfg(test)]
+            search_in_one_snapshot: Default::default(),
         }
     }
 
@@ -360,9 +367,8 @@ impl LocalExecutor {
 
     // One read of a SPANN collection: its log applied first, then a snapshot of SQLite, which reads the files of the
     // last flush with the records at one moment, as a read of distributed Chroma reads one version of every segment.
-    // The files of a flush never change, and those of a replaced flush stay at least a grace: a get, a query and a count
-    // close the snapshot before they read the files, so that writers commit meanwhile. A search keeps it through its
-    // files, since it numbers the records by their rows of SQLite.
+    // The files of a flush never change, and those of a replaced flush stay at least a grace: a get, a query, a count
+    // and a search close the snapshot before they read the files, so that writers commit meanwhile.
     async fn spann_snapshot(
         &mut self,
         collection_and_segments: &CollectionAndSegments,
@@ -919,12 +925,141 @@ impl LocalExecutor {
             .map_err(|error| ExecutorError::Internal(Box::new(error)))
     }
 
-    // A search of a SPANN collection: its files and its records at one moment.
+    // A search of a SPANN collection: its files and its records at one moment, as a get, a query and a count. In its
+    // snapshot of SQLite, what SQLite answers (spann_search_sqlite_at) and the files of the last flush; then, with the
+    // snapshot closed, the dense KNN leaves, the rank, the group by and the selection from those files, by the offsets
+    // of the record segment, as the search of distributed Chroma reads one version of every segment
+    // (rust/worker/src/execution/orchestration/rank.rs). Between records of the same score, the order is by offset.
     async fn spann_search(&mut self, plan: Search) -> Result<SearchResult, ExecutorError> {
+        #[cfg(test)]
+        if self
+            .search_in_one_snapshot
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return self.spann_search_in_one_snapshot(plan).await;
+        }
+        let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
         let (mut snapshot, collection_and_segments) = self
             .spann_snapshot(&plan.scan.collection_and_segments)
             .await?;
         // As distributed Chroma (rust/worker/src/server.rs:697-701): an uninitialized collection has no results.
+        if collection_and_segments.is_uninitialized() {
+            return Ok(SearchResult {
+                results: vec![Default::default(); plan.payloads.len()],
+                pulled_log_bytes: 0,
+            });
+        }
+        let sqlite = self
+            .metadata_reader
+            .spann_search_sqlite_at(&mut snapshot, &collection_and_segments, &plan.payloads)
+            .await
+            .map_err(internal)?;
+        snapshot.close().await.map_err(internal)?;
+        let Some(spann) = self.spann_vectors(&collection_and_segments).await? else {
+            // A collection with its dimension but no files yet, as after a first write that failed once the frontend
+            // gave the collection its dimension: SQLite holds none of its records either, and the search answers none,
+            // as a query and a get do. Records in SQLite without the files of their flush would be inconsistent.
+            let records = sqlite.iter().any(|part| {
+                part.allowed_user_ids
+                    .as_ref()
+                    .is_some_and(|ids| !ids.is_empty())
+                    || part.unranked.as_ref().is_some_and(|ids| !ids.is_empty())
+                    || part.sparse.iter().flatten().any(|leaf| !leaf.is_empty())
+            });
+            if records {
+                return Err(ExecutorError::InconsistentData);
+            }
+            return Ok(SearchResult {
+                results: vec![Default::default(); plan.payloads.len()],
+                pulled_log_bytes: 0,
+            });
+        };
+        let mut results = Vec::with_capacity(plan.payloads.len());
+        for (payload, sqlite) in plan.payloads.into_iter().zip(sqlite) {
+            let records = match &payload.rank.expr {
+                Some(expr) => {
+                    // The KNN results in the DFS order of the leaves, as the rank evaluation consumes them.
+                    let mut knn_results = Vec::new();
+                    for (knn, sparse) in expr.knn_queries().into_iter().zip(sqlite.sparse) {
+                        knn_results.push(match (knn.query, sparse) {
+                            (_, Some(sparse)) => {
+                                let mut measures = spann.measures_by_offset(sparse).await?;
+                                measures.sort_unstable();
+                                measures
+                            }
+                            (QueryVector::Dense(query), None) => {
+                                match sqlite.allowed_user_ids.as_deref() {
+                                    Some([]) => Vec::new(),
+                                    allowed => spann.dense_leaf(query, knn.limit, allowed).await?,
+                                }
+                            }
+                            (QueryVector::Sparse(_), None) => {
+                                return Err(ExecutorError::InconsistentData)
+                            }
+                        });
+                    }
+                    let mut ranks = expr.rank(knn_results);
+                    if payload.group_by.is_active() {
+                        let offset_ids = ranks
+                            .iter()
+                            .map(|record| record.offset_id)
+                            .collect::<Vec<_>>();
+                        let metadata = Projection {
+                            document: false,
+                            embedding: false,
+                            metadata: true,
+                        };
+                        let projected =
+                            spann_projection(&spann.records, &offset_ids, &metadata).await?;
+                        ranks = payload.group_by.group_ranked(
+                            ranks
+                                .into_iter()
+                                .zip(projected)
+                                .map(|(record, projected)| EnrichedRecord {
+                                    record,
+                                    metadata: projected.metadata.unwrap_or_default(),
+                                })
+                                .collect(),
+                        );
+                    }
+                    ranks
+                        .into_iter()
+                        .skip(payload.limit.offset as usize)
+                        .take(payload.limit.limit.unwrap_or(u32::MAX) as usize)
+                        .collect()
+                }
+                // Without a rank expression the records come in their storage order, and the score is the position.
+                None => {
+                    spann
+                        .measures_by_offset(
+                            sqlite
+                                .unranked
+                                .unwrap_or_default()
+                                .into_iter()
+                                .enumerate()
+                                .map(|(position, user_id)| (user_id, position as f32))
+                                .collect(),
+                        )
+                        .await?
+                }
+            };
+            results.push(spann_select(&spann.records, records, &payload.select).await?);
+        }
+        Ok(SearchResult {
+            results,
+            pulled_log_bytes: 0,
+        })
+    }
+
+    // The search of a SPANN collection all in its snapshot of SQLite, as before spann_search took it in two moments.
+    #[cfg(test)]
+    async fn spann_search_in_one_snapshot(
+        &mut self,
+        plan: Search,
+    ) -> Result<SearchResult, ExecutorError> {
+        let (mut snapshot, collection_and_segments) = self
+            .spann_snapshot(&plan.scan.collection_and_segments)
+            .await?;
         if collection_and_segments.is_uninitialized() {
             return Ok(SearchResult {
                 results: vec![Default::default(); plan.payloads.len()],
@@ -1255,6 +1390,103 @@ impl SpannVectors<'_> {
             .map(|std::cmp::Reverse(record)| record)
             .collect())
     }
+
+    // A dense KNN leaf of a search: the limit nearest of the query among the allowed user ids, or all the records
+    // without them, by offset in the record segment, by distance and then by offset, as the merge of the KNN results of
+    // distributed Chroma orders them.
+    async fn dense_leaf(
+        &self,
+        query: Vec<f32>,
+        limit: u32,
+        allowed_user_ids: Option<&[String]>,
+    ) -> Result<Vec<RecordMeasure>, ExecutorError> {
+        let internal = |err: Box<dyn ChromaError>| ExecutorError::Internal(err);
+        let allowed = match allowed_user_ids {
+            Some(user_ids) => Some(self.allowed_offsets(user_ids).await.map_err(internal)?),
+            None => None,
+        };
+        let mut nearest = SpannVectors::nearest(self, query, limit, allowed.as_ref())
+            .await
+            .map_err(internal)?;
+        nearest.sort_unstable();
+        Ok(nearest)
+    }
+
+    // The records that SQLite gives by user id, with their measures, by their offsets in the record segment, in their
+    // order. SQLite holds no record that the files of its flush do not.
+    async fn measures_by_offset(
+        &self,
+        measures: Vec<(String, f32)>,
+    ) -> Result<Vec<RecordMeasure>, ExecutorError> {
+        let mut by_offset = Vec::with_capacity(measures.len());
+        for (user_id, measure) in measures {
+            let offset_id = self
+                .records
+                .get_offset_id_for_user_id(&user_id, &RecordSegmentReaderOptions::default())
+                .await
+                .map_err(|err| ExecutorError::Internal(err.boxed()))?
+                .ok_or(ExecutorError::InconsistentData)?;
+            by_offset.push(RecordMeasure { offset_id, measure });
+        }
+        Ok(by_offset)
+    }
+}
+
+// The selected keys of the records of a search of a SPANN collection, in their order, from the record segment, as the
+// select of distributed Chroma reads them (rust/worker/src/execution/operators/select.rs), and in the shape of the
+// select of the single node (rust/segment/src/sqlite_metadata.rs): only the metadata keys selected, and no metadata
+// as none.
+async fn spann_select(
+    records: &RecordSegmentReaderShard<'_>,
+    ranked: Vec<RecordMeasure>,
+    select: &Select,
+) -> Result<SearchPayloadResult, ExecutorError> {
+    if ranked.is_empty() {
+        return Ok(SearchPayloadResult {
+            records: Vec::new(),
+        });
+    }
+    let select_document = select.keys.contains(&Key::Document);
+    let select_embedding = select.keys.contains(&Key::Embedding);
+    let select_score = select.keys.contains(&Key::Score);
+    let select_all_metadata = select.keys.contains(&Key::Metadata);
+    let metadata_fields = select
+        .keys
+        .iter()
+        .filter_map(|key| match key {
+            Key::MetadataField(field) => Some(field.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let offset_ids = ranked
+        .iter()
+        .map(|record| record.offset_id)
+        .collect::<Vec<_>>();
+    let projection = Projection {
+        document: select_document,
+        embedding: select_embedding,
+        metadata: select_all_metadata || !metadata_fields.is_empty(),
+    };
+    let projected = spann_projection(records, &offset_ids, &projection).await?;
+    Ok(SearchPayloadResult {
+        records: ranked
+            .into_iter()
+            .zip(projected)
+            .map(|(record, data)| {
+                let mut metadata = data.metadata.unwrap_or_default();
+                if !select_all_metadata {
+                    metadata.retain(|key, _| metadata_fields.contains(key));
+                }
+                SearchRecord {
+                    id: data.id,
+                    document: data.document,
+                    embedding: data.embedding,
+                    metadata: (!metadata.is_empty()).then_some(metadata),
+                    score: select_score.then_some(record.measure),
+                }
+            })
+            .collect(),
+    })
 }
 
 // The dense leaves of the Search API on a SPANN collection.

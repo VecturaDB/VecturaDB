@@ -94,6 +94,20 @@ pub trait DenseVectorReader: Send + Sync {
     async fn embedding(&self, user_id: &str) -> Result<Vec<f32>, SqliteMetadataError>;
 }
 
+/// What SQLite answers for one payload of a search of a SPANN collection on the single node
+/// ([`SqliteMetadataReader::spann_search_sqlite_at`]), by user id.
+#[derive(Clone, Debug, Default)]
+pub struct SpannSearchSqlite {
+    /// When the payload has a filter and a dense KNN leaf, the user ids of the records that pass the filter, in storage
+    /// order: the dense leaves look only among them.
+    pub allowed_user_ids: Option<Vec<String>>,
+    /// One entry for each KNN leaf of the rank expression, in its DFS order: for a sparse leaf its candidates by user
+    /// id and measure, in the order of sparse_knn; None for a dense leaf.
+    pub sparse: Vec<Option<Vec<(String, f32)>>>,
+    /// Without a rank expression, the page of the records that pass the filter, in storage order.
+    pub unranked: Option<Vec<String>>,
+}
+
 /// A dense KNN leaf on the local HNSW index (rust/worker/src/execution/operators/knn_hnsw.rs).
 #[async_trait::async_trait]
 impl DenseVectorReader for LocalHnswSegmentReader {
@@ -1516,6 +1530,119 @@ impl SqliteMetadataReader {
     ) -> Result<chroma_types::operator::SearchResult, SqliteMetadataError> {
         self.search_with_connection(collection, vectors, payloads, &mut snapshot.tx)
             .await
+    }
+
+    /// The part of a search of a SPANN collection on the single node that SQLite answers, at the moment of a snapshot:
+    /// for each payload, in their order, the records that pass its filter, its sparse KNN leaves and, without a rank
+    /// expression, its page, by user id, as search_with_connection finds them. The executor closes the snapshot after
+    /// it and takes the dense KNN leaves, the rank, the group by and the selection from the files of the flush that the
+    /// snapshot reads (rust/frontend/src/executor/local.rs, spann_search): the search keeps no read of SQLite through
+    /// its files, as a get, a query and a count.
+    pub async fn spann_search_sqlite_at(
+        &self,
+        snapshot: &mut MetadataSnapshot,
+        collection: &chroma_types::CollectionAndSegments,
+        payloads: &[chroma_types::plan::SearchPayload],
+    ) -> Result<Vec<SpannSearchSqlite>, SqliteMetadataError> {
+        use chroma_types::operator::QueryVector;
+        let conn: &mut sqlx::SqliteConnection = &mut snapshot.tx;
+        let mut parts = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let mut part = SpannSearchSqlite::default();
+            match &payload.rank.expr {
+                Some(expr) => {
+                    let mut dense = false;
+                    for knn in expr.knn_queries() {
+                        part.sparse.push(match knn.query {
+                            QueryVector::Dense(_) => {
+                                dense = true;
+                                None
+                            }
+                            QueryVector::Sparse(query) => {
+                                let measures = self
+                                    .sparse_knn(
+                                        conn,
+                                        collection,
+                                        &payload.filter,
+                                        &knn.key.to_string(),
+                                        &query,
+                                        knn.limit,
+                                    )
+                                    .await?;
+                                Some(self.user_ids_of_rows(conn, collection, measures).await?)
+                            }
+                        });
+                    }
+                    // As dense_knn: with a filter, the dense leaves look only among the records that pass it.
+                    let filtered =
+                        payload.filter.query_ids.is_some() || payload.filter.where_clause.is_some();
+                    if dense && filtered {
+                        part.allowed_user_ids = Some(
+                            self.filtered_records(conn, collection, &payload.filter, None)
+                                .await?
+                                .into_iter()
+                                .map(|(_, user_id)| user_id)
+                                .collect(),
+                        );
+                    }
+                }
+                None => {
+                    part.unranked = Some(
+                        self.filtered_records(
+                            conn,
+                            collection,
+                            &payload.filter,
+                            Some(&payload.limit),
+                        )
+                        .await?
+                        .into_iter()
+                        .map(|(_, user_id)| user_id)
+                        .collect(),
+                    );
+                }
+            }
+            parts.push(part);
+        }
+        Ok(parts)
+    }
+
+    /// The user ids of the SQLite rows of KNN results, with their measures, in their order.
+    async fn user_ids_of_rows(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        collection: &chroma_types::CollectionAndSegments,
+        measures: Vec<chroma_types::operator::RecordMeasure>,
+    ) -> Result<Vec<(String, f32)>, SqliteMetadataError> {
+        let mut user_ids = HashMap::with_capacity(measures.len());
+        for batch in measures.chunks(500) {
+            let (sql, values) = Query::select()
+                .columns([
+                    (Embeddings::Table, Embeddings::Id),
+                    (Embeddings::Table, Embeddings::EmbeddingId),
+                ])
+                .from(Embeddings::Table)
+                .and_where(
+                    Expr::col((Embeddings::Table, Embeddings::SegmentId))
+                        .eq(collection.metadata_segment.id.to_string()),
+                )
+                .and_where(
+                    Expr::col((Embeddings::Table, Embeddings::Id))
+                        .is_in(batch.iter().map(|record| record.offset_id as i64)),
+                )
+                .build_sqlx(SqliteQueryBuilder);
+            for row in sqlx::query_with(&sql, values).fetch_all(&mut *conn).await? {
+                user_ids.insert(row.try_get::<u32, _>(0)?, row.try_get::<String, _>(1)?);
+            }
+        }
+        measures
+            .into_iter()
+            .map(|record| {
+                user_ids
+                    .remove(&record.offset_id)
+                    .map(|user_id| (user_id, record.measure))
+                    .ok_or(SqliteMetadataError::PhantomRecord(record.offset_id))
+            })
+            .collect()
     }
 
     async fn search_with_connection(
