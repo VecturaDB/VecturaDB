@@ -406,6 +406,22 @@ mod tests {
         );
     }
 
+    // Each connection of the pool reads with a page cache of 8000 KiB: with the 2000 KiB of SQLite, 483 pages of 4 KiB,
+    // a get of 20000 records, which reads 985 pages, read all of them again from the file every time.
+    #[tokio::test]
+    async fn each_connection_of_the_pool_has_a_page_cache_of_8000_kib() {
+        let db = test_utils::get_new_sqlite_db().await;
+        let mut first = db.conn.acquire().await.unwrap();
+        let mut second = db.conn.acquire().await.unwrap();
+        for conn in [&mut first, &mut second] {
+            let cache_size: i64 = sqlx::query_scalar("PRAGMA cache_size")
+                .fetch_one(&mut **conn)
+                .await
+                .unwrap();
+            assert_eq!(cache_size, -8000);
+        }
+    }
+
     #[tokio::test]
     async fn test_it_initializes_and_validates() {
         let config: SqliteDBConfig = SqliteDBConfig {
