@@ -624,6 +624,56 @@ async fn upper_level_links_require_a_neighbor_at_that_level() {
     assert!(inspect_persisted_hnsw_index(&folder).is_err());
 }
 
+/// The read calls of this thread so far, from the I/O accounting of Linux; reading them is one more.
+#[cfg(target_os = "linux")]
+fn read_calls() -> u64 {
+    use std::io::Read;
+    let mut io = [0; 1024];
+    let len = std::fs::File::open("/proc/thread-self/io")
+        .unwrap()
+        .read(&mut io)
+        .unwrap();
+    std::str::from_utf8(&io[..len])
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("syscr: "))
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn validation_reads_each_index_file_at_once() {
+    let (root, _sqlite, _collection, segment, mut writer) = fixture().await;
+    let records = (1..=1000)
+        .map(|offset| {
+            let mut log = record(offset, 0, 0);
+            log.record.id = offset.to_string();
+            log
+        })
+        .collect::<Vec<_>>();
+    writer
+        .apply_log_chunk(Chunk::new(records.into()))
+        .await
+        .unwrap();
+    drop(persist(writer.index.inner.write().await).await.unwrap());
+    writer.index.close().await;
+    drop(writer);
+    let folder = root.path().join(segment.id.to_string());
+    // Many pieces of the 8 KB of a BufReader.
+    assert!(
+        std::fs::metadata(folder.join("data_level0.bin"))
+            .unwrap()
+            .len()
+            > 16 * 8192
+    );
+    let before = read_calls();
+    persistence::validate_files(&folder, None).unwrap();
+    // header.bin, data_level0.bin and link_lists.bin.
+    assert_eq!(read_calls() - before - 1, 3);
+}
+
 #[tokio::test]
 async fn exhausted_labels_do_not_change_the_map_or_graph() {
     let (_root, _sqlite, _collection, _segment, mut writer) = fixture().await;
