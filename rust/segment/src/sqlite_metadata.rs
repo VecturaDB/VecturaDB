@@ -1232,7 +1232,7 @@ impl SqliteMetadataReader {
 
         let mut records = BTreeMap::new();
 
-        for row in rows {
+        for row in &rows {
             let offset_id: u32 = row.try_get(0)?;
             let user_id: String = row.try_get(1)?;
             let record = records.entry(offset_id).or_insert(ProjectionRecord {
@@ -1326,6 +1326,16 @@ impl SqliteMetadataReader {
                 }
             }
         }
+        // The rows of the selection go only now, after the last query of the get: every query of the get runs on one
+        // connection, and the memory of those rows, freed before the next query, went back to the thread of that
+        // connection just before its first large allocation, which then had malloc merge it all (in a cold get, the copy
+        // of the text of the query of the arrays, 60 KB for 20000 records). Freed here, the next get takes it again.
+        #[cfg(test)]
+        ROWS_AFTER_LAST_QUERY
+            .lock()
+            .unwrap()
+            .push((collection_and_segments.metadata_segment.id, rows.len()));
+        drop(rows);
 
         Ok(GetResult {
             pulled_log_bytes: 0,
@@ -1924,6 +1934,11 @@ impl SqliteMetadataReader {
         Ok(SearchPayloadResult { records: selected })
     }
 }
+
+/// Test hook: for each get, its metadata segment and how many rows of its selection it still held after its last query.
+#[cfg(test)]
+static ROWS_AFTER_LAST_QUERY: std::sync::Mutex<Vec<(chroma_types::SegmentUuid, usize)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Test hook: the gets of the metadata segments that a test stops after their first query, until it lets them go on.
 #[cfg(test)]
@@ -3226,6 +3241,29 @@ mod tests {
             metadata.get("sparse"),
             Some(MetadataValue::SparseVector(_))
         ));
+    }
+
+    // A get keeps the rows of its selection until after its last query: its queries run on one connection, and rows freed
+    // before the next query had malloc merge their memory at the first large allocation of that query, on the same
+    // thread (in a cold get of 20000 records on a folder of Windows mounted in Docker, 17.4 ms inside malloc).
+    #[tokio::test]
+    async fn test_get_keeps_its_selection_until_its_last_query() {
+        let logs = (1..=3)
+            .map(|i| sparse_log(i, &format!("r{i}"), Operation::Add, Some(sparse_value(1.0))))
+            .collect();
+        let (reader, cas) = setup_with_logs(logs).await;
+        let result = reader.get(make_get_plan(&cas, None)).await.unwrap();
+        assert_eq!(result.result.records.len(), 3);
+        let held = super::ROWS_AFTER_LAST_QUERY
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(segment, _)| *segment == cas.metadata_segment.id)
+            .map(|(_, rows)| *rows);
+        assert!(
+            held.unwrap_or(0) >= 3,
+            "rows held after the last query: {held:?}"
+        );
     }
 
     #[tokio::test]
