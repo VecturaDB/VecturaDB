@@ -7487,6 +7487,46 @@ mod tests {
         assert_eq!(pending_cleanups(root.path()), 0);
     }
 
+    // The deletion of a SPANN collection looks for its segments in the folder of that collection only: a walk of the
+    // folders of every collection for each segment made a deletion of a database go over them once for each segment.
+    // Here the folder of another SPANN collection holds a folder with the name of a segment of the deleted one, which
+    // such a walk removes.
+    #[tokio::test]
+    async fn a_spann_deletion_looks_only_in_the_folder_of_its_collection() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let other = spann_collection_with_records(&mut frontend, "spann-other").await;
+        let deleted = spann_collection_with_records(&mut frontend, "spann-deleted").await;
+        let deleted_segment = frontend
+            .sysdb_client
+            .get_collection_with_segments(None, deleted)
+            .await
+            .unwrap()
+            .vector_segment
+            .id
+            .to_string();
+        let other_segments = files_under(&root.path().join("tenant"))
+            .into_iter()
+            .find(|file| file.to_string_lossy().contains(&other.to_string()))
+            .and_then(|file| {
+                file.ancestors()
+                    .find(|folder| folder.ends_with("segment"))
+                    .map(|folder| folder.to_path_buf())
+            })
+            .unwrap();
+        let marker = other_segments.join(&deleted_segment).join("marker");
+        std::fs::create_dir(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"").unwrap();
+        frontend
+            .delete_collection(delete_collection_request("spann-deleted"))
+            .await
+            .unwrap();
+        assert!(marker.exists());
+        assert!(files_under(&root.path().join("tenant"))
+            .iter()
+            .all(|file| !file.to_string_lossy().contains(&deleted.to_string())));
+    }
+
     #[tokio::test]
     async fn a_collection_created_again_before_the_sweep_is_new_and_works() {
         let root = tempfile::tempdir().unwrap();

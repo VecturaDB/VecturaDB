@@ -168,25 +168,28 @@ async fn local_spann_provider(
 
 // The folder of a segment of a SPANN collection, under the prefix of distributed Chroma
 // (tenant/{tenant}/database/{database}/collection/{collection}/segment/{segment}), removed with the folders of its
-// collection that it leaves empty. The catalog no longer names the tenant, the database or the collection of a deleted
-// segment: its folder is found by its id.
-async fn remove_blockfile_segment(root: &Path, segment_id: SegmentUuid) -> io::Result<()> {
+// collection that it leaves empty. The catalog no longer names the tenant or the database of a deleted segment: its
+// folder is looked for in the folder of its collection under each of them, never in the folders of other collections.
+async fn remove_blockfile_segment(
+    root: &Path,
+    collection_id: CollectionUuid,
+    segment_id: SegmentUuid,
+) -> io::Result<()> {
     let folders = |path: std::path::PathBuf| async move { entries(&path, true).await };
     let segment = segment_id.to_string();
     for tenant in folders(root.join("tenant")).await? {
         for database in folders(tenant.join("database")).await? {
-            for collection in folders(database.join("collection")).await? {
-                let segments = collection.join("segment");
-                match tokio::fs::remove_dir_all(segments.join(&segment)).await {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-                    Err(err) => return Err(err),
-                }
-                // A folder that still holds something stays.
-                for empty in [segments, collection] {
-                    if tokio::fs::remove_dir(&empty).await.is_err() {
-                        break;
-                    }
+            let collection = database.join("collection").join(collection_id.to_string());
+            let segments = collection.join("segment");
+            match tokio::fs::remove_dir_all(segments.join(&segment)).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            }
+            // A folder that still holds something stays.
+            for empty in [segments, collection] {
+                if tokio::fs::remove_dir(&empty).await.is_err() {
+                    break;
                 }
             }
         }
@@ -550,6 +553,7 @@ impl LocalSegmentManager {
     /// of the folders of segments that the catalog no longer has.
     pub async fn delete_blockfile_segment_files(
         &self,
+        collection_id: CollectionUuid,
         segment_id: SegmentUuid,
     ) -> Result<(), LocalSegmentManagerError> {
         let Some(root) = &self.persist_root else {
@@ -558,7 +562,7 @@ impl LocalSegmentManager {
         if self.segment_exists(segment_id).await? {
             return Ok(());
         }
-        remove_blockfile_segment(Path::new(root), segment_id).await?;
+        remove_blockfile_segment(Path::new(root), collection_id, segment_id).await?;
         Ok(())
     }
 

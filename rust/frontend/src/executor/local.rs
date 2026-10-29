@@ -171,7 +171,7 @@ impl LocalExecutor {
             ) {
                 if let Err(err) = self
                     .hnsw_manager
-                    .delete_blockfile_segment_files(segment.id)
+                    .delete_blockfile_segment_files(segment.collection, segment.id)
                     .await
                 {
                     failure.get_or_insert(err.boxed());
