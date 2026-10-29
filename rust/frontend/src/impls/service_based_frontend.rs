@@ -5248,8 +5248,15 @@ mod tests {
     // another system, the reads of the roots of the versions of a minute held the compactor for 2.2 to 3.4 s. Here the
     // first two reads of roots of the record segment meet where they read the files, which reads one after the other
     // never do.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_spann_cleanup_reads_its_roots_together() {
+    #[test]
+    fn a_spann_cleanup_reads_its_roots_together() {
+        on_a_large_stack(
+            TestRuntime::FourWorkers,
+            a_spann_cleanup_reads_its_roots_together_impl,
+        )
+    }
+
+    async fn a_spann_cleanup_reads_its_roots_together_impl() {
         let root = tempfile::tempdir().unwrap();
         let mut frontend = frontend_with_spann_grace(root.path(), std::time::Duration::ZERO).await;
         let collection_id = spann_collection_with_records(&mut frontend, "spann-cleanup").await;
@@ -5534,8 +5541,15 @@ mod tests {
     // A flush removes the files of the versions of a SPANN collection that it replaced longer than the grace ago, and
     // keeps the version before the current one, as the garbage collector of distributed Chroma with its
     // min_versions_to_keep of 2. The records still read back, after a restart too.
-    #[tokio::test]
-    async fn a_spann_flush_removes_the_versions_it_replaced() {
+    #[test]
+    fn a_spann_flush_removes_the_versions_it_replaced() {
+        on_a_large_stack(
+            TestRuntime::CurrentThread,
+            a_spann_flush_removes_the_versions_it_replaced_impl,
+        )
+    }
+
+    async fn a_spann_flush_removes_the_versions_it_replaced_impl() {
         let records = (0..2000)
             .map(|i| {
                 let x = i as f32;
@@ -5633,8 +5647,15 @@ mod tests {
 
     // The Search API on a SPANN collection: a dense KNN rank answers as on the same records in an HNSW collection, and
     // as the exact nearest, with their distance and embedding, with and without a filter.
-    #[tokio::test]
-    async fn a_spann_collection_answers_search_as_an_hnsw_collection() {
+    #[test]
+    fn a_spann_collection_answers_search_as_an_hnsw_collection() {
+        on_a_large_stack(
+            TestRuntime::CurrentThread,
+            a_spann_collection_answers_search_as_an_hnsw_collection_impl,
+        )
+    }
+
+    async fn a_spann_collection_answers_search_as_an_hnsw_collection_impl() {
         let root = tempfile::tempdir().unwrap();
         let mut frontend = frontend_with_spann(root.path(), true).await;
         let records = (0..300)
@@ -6168,7 +6189,9 @@ mod tests {
     // SPANN files of the same flush. A write commits SQLite first and then flushes SPANN, hundreds of ms later.
     #[test]
     fn spann_reads_during_writes_see_one_moment() {
-        let wrong = on_a_large_stack(|| reads_during_writes(KnnIndex::Spann, 30));
+        let wrong = on_a_large_stack(TestRuntime::FourWorkers, || {
+            reads_during_writes(KnnIndex::Spann, 30)
+        });
         let kinds = ["query", "search", "get"].map(|kind| {
             let of_kind = wrong
                 .iter()
@@ -6187,7 +6210,9 @@ mod tests {
     #[test]
     #[ignore = "a probe for the attribution, run by hand"]
     fn hnsw_reads_during_writes_see_one_moment() {
-        let wrong = on_a_large_stack(|| reads_during_writes(KnnIndex::Hnsw, 30));
+        let wrong = on_a_large_stack(TestRuntime::FourWorkers, || {
+            reads_during_writes(KnnIndex::Hnsw, 30)
+        });
         println!(
             "HNSW: {} answers mixed two moments, for example {:?}",
             wrong.len(),
@@ -6195,10 +6220,19 @@ mod tests {
         );
     }
 
-    // The tests of reads during writes run as the tests of the compactor and of SPANN of Chroma do: on a thread of
-    // 8 MiB, with workers of 8 MiB. In debug, their futures overflow the 2 MiB of the thread of a test: with Rust
-    // 1.99.1 they need 2.5 to 2.75 MiB.
-    fn on_a_large_stack<F, Fut, T>(test: F) -> T
+    // The runtime of a test on a large stack, that of the attribute it had: #[tokio::test], one thread, or
+    // #[tokio::test(flavor = "multi_thread", worker_threads = 4)].
+    enum TestRuntime {
+        CurrentThread,
+        FourWorkers,
+    }
+
+    // The tests whose futures come near the 2 MiB of the thread of a test in debug, or go past them, run as the tests of
+    // the compactor and of SPANN of Chroma do: on a thread of 8 MiB, with the runtime of their attribute, its threads of
+    // 8 MiB too. With Rust 1.99.1 the tests of reads during writes need 2.5 to 2.75 MiB there, the others 1.5 to
+    // 1.75 MiB; a_spann_flush_removes_the_versions_it_replaced, whose deepest point depends on the timing, went past the
+    // 2 MiB in the CI.
+    fn on_a_large_stack<F, Fut, T>(runtime: TestRuntime, test: F) -> T
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = T>,
@@ -6207,8 +6241,15 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
-                tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(4)
+                let mut builder = match runtime {
+                    TestRuntime::CurrentThread => tokio::runtime::Builder::new_current_thread(),
+                    TestRuntime::FourWorkers => {
+                        let mut four_workers = tokio::runtime::Builder::new_multi_thread();
+                        four_workers.worker_threads(4);
+                        four_workers
+                    }
+                };
+                builder
                     .thread_stack_size(8 * 1024 * 1024)
                     .enable_all()
                     .build()
@@ -6685,8 +6726,15 @@ mod tests {
 
     // A count of a SPANN collection counts the records of the record segment, as distributed Chroma does, at the flush of
     // its snapshot of SQLite: an add and its flush between that snapshot and its files leave its answer as it was.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_spann_count_across_a_flush_answers_for_its_snapshot() {
+    #[test]
+    fn a_spann_count_across_a_flush_answers_for_its_snapshot() {
+        on_a_large_stack(
+            TestRuntime::FourWorkers,
+            a_spann_count_across_a_flush_answers_for_its_snapshot_impl,
+        )
+    }
+
+    async fn a_spann_count_across_a_flush_answers_for_its_snapshot_impl() {
         use crate::executor::local::{StopBeforeFiles, STOP_BEFORE_FILES};
         let root = tempfile::tempdir().unwrap();
         let mut frontend = frontend_with_spann(root.path(), true).await;
@@ -7064,8 +7112,15 @@ mod tests {
 
     // An opening after a write whose files a deletion removed meanwhile fails, which only goes to the log, and leaves
     // nothing behind: a new collection writes and reads as before.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_opening_after_a_write_whose_files_went_fails_and_leaves_nothing() {
+    #[test]
+    fn an_opening_after_a_write_whose_files_went_fails_and_leaves_nothing() {
+        on_a_large_stack(
+            TestRuntime::FourWorkers,
+            an_opening_after_a_write_whose_files_went_fails_and_leaves_nothing_impl,
+        )
+    }
+
+    async fn an_opening_after_a_write_whose_files_went_fails_and_leaves_nothing_impl() {
         let root = tempfile::tempdir().unwrap();
         let mut frontend = frontend_with_spann(root.path(), true).await;
         let collection_id = collection_to_stop(&mut frontend).await;
@@ -7115,8 +7170,15 @@ mod tests {
 
     // Writes in a row open one version at a time: while an opening waits, each flush replaces the version to open after
     // it, so that the next opening is of the last write, whose roots the next read finds in memory.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn spann_writes_in_a_row_open_the_last_version_only() {
+    #[test]
+    fn spann_writes_in_a_row_open_the_last_version_only() {
+        on_a_large_stack(
+            TestRuntime::FourWorkers,
+            spann_writes_in_a_row_open_the_last_version_only_impl,
+        )
+    }
+
+    async fn spann_writes_in_a_row_open_the_last_version_only_impl() {
         let root = tempfile::tempdir().unwrap();
         let mut frontend = frontend_with_spann(root.path(), true).await;
         let collection_id = collection_to_stop(&mut frontend).await;
@@ -7169,8 +7231,15 @@ mod tests {
     }
 
     // A read does not wait for the opening after a write: with the opening stopped, the read answers.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_spann_read_does_not_wait_for_the_opening_after_a_write() {
+    #[test]
+    fn a_spann_read_does_not_wait_for_the_opening_after_a_write() {
+        on_a_large_stack(
+            TestRuntime::FourWorkers,
+            a_spann_read_does_not_wait_for_the_opening_after_a_write_impl,
+        )
+    }
+
+    async fn a_spann_read_does_not_wait_for_the_opening_after_a_write_impl() {
         let root = tempfile::tempdir().unwrap();
         let mut frontend = frontend_with_spann(root.path(), true).await;
         let collection_id = collection_to_stop(&mut frontend).await;
@@ -7206,8 +7275,15 @@ mod tests {
     }
 
     // A write does not wait for the opening after a previous write: with the opening stopped, the write answers.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_spann_write_does_not_wait_for_the_opening_after_a_write() {
+    #[test]
+    fn a_spann_write_does_not_wait_for_the_opening_after_a_write() {
+        on_a_large_stack(
+            TestRuntime::FourWorkers,
+            a_spann_write_does_not_wait_for_the_opening_after_a_write_impl,
+        )
+    }
+
+    async fn a_spann_write_does_not_wait_for_the_opening_after_a_write_impl() {
         let root = tempfile::tempdir().unwrap();
         let mut frontend = frontend_with_spann(root.path(), true).await;
         let collection_id = collection_to_stop(&mut frontend).await;
@@ -7241,8 +7317,15 @@ mod tests {
 
     // Only a SPANN collection read since its previous flush opens the files of its next one: a collection that is only
     // written opens nothing, so that it never pushes out of the cache the roots of the collections that are read.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn only_a_spann_collection_read_since_its_last_write_opens_the_next() {
+    #[test]
+    fn only_a_spann_collection_read_since_its_last_write_opens_the_next() {
+        on_a_large_stack(
+            TestRuntime::FourWorkers,
+            only_a_spann_collection_read_since_its_last_write_opens_the_next_impl,
+        )
+    }
+
+    async fn only_a_spann_collection_read_since_its_last_write_opens_the_next_impl() {
         let root = tempfile::tempdir().unwrap();
         let mut frontend = frontend_with_spann(root.path(), true).await;
         let collection_id = collection_to_stop(&mut frontend).await;
@@ -7296,8 +7379,15 @@ mod tests {
 
     // An opening after a write on a damaged root fails, which only goes to the log, and the read answers an error, as it
     // did without the opening.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_opening_after_a_write_on_a_damaged_root_fails_and_the_read_errs() {
+    #[test]
+    fn an_opening_after_a_write_on_a_damaged_root_fails_and_the_read_errs() {
+        on_a_large_stack(
+            TestRuntime::FourWorkers,
+            an_opening_after_a_write_on_a_damaged_root_fails_and_the_read_errs_impl,
+        )
+    }
+
+    async fn an_opening_after_a_write_on_a_damaged_root_fails_and_the_read_errs_impl() {
         let root = tempfile::tempdir().unwrap();
         let mut frontend = frontend_with_spann(root.path(), true).await;
         let collection_id = collection_to_stop(&mut frontend).await;
