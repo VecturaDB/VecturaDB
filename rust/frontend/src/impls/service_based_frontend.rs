@@ -1627,14 +1627,8 @@ impl ServiceBasedFrontend {
             ..
         }: CreateCollectionRequest,
     ) -> Result<CreateCollectionResponse, CreateCollectionError> {
-        let spann_requested = configuration.as_ref().is_some_and(|config| {
-            matches!(
-                config.vector_index,
-                chroma_types::VectorIndexConfiguration::Spann(_)
-            )
-        }) || schema
-            .as_ref()
-            .is_some_and(|schema| schema.get_internal_spann_config().is_some());
+        let spann_requested =
+            frontend_core::collection_ops::asks_for_spann(configuration.as_ref(), schema.as_ref());
         let knn_index = self.knn_index_for(spann_requested);
         let plan = frontend_core::collection_ops::plan_create_collection(
             configuration,

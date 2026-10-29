@@ -68,6 +68,18 @@ pub fn supported_segment_types(kind: ExecutorKind) -> Vec<SegmentType> {
     }
 }
 
+/// Whether a new collection asks for SPANN, in its configuration or in its schema. The single node asks it of the
+/// request, to choose the index of the collection, and [`plan_create_collection`] of the configuration and of the
+/// reconciled schema, to choose the segments: one check for both, so that they cannot go apart.
+pub fn asks_for_spann(
+    configuration: Option<&InternalCollectionConfiguration>,
+    schema: Option<&Schema>,
+) -> bool {
+    configuration
+        .is_some_and(|config| matches!(config.vector_index, VectorIndexConfiguration::Spann(_)))
+        || schema.is_some_and(|schema| schema.get_internal_spann_config().is_some())
+}
+
 /// Plan the creation of a collection. Validates the user-supplied
 /// configuration against the executor's supported segment types,
 /// reconciles schema + config (if `enable_schema`), applies tenant feature
@@ -208,12 +220,7 @@ pub fn plan_create_collection(
         }
         ExecutorKind::Local
             if supported.contains(&SegmentType::Spann)
-                && (reconciled_schema
-                    .as_ref()
-                    .is_some_and(|schema| schema.get_internal_spann_config().is_some())
-                    || configuration.as_ref().is_some_and(|config| {
-                        matches!(config.vector_index, VectorIndexConfiguration::Spann(_))
-                    })) =>
+                && asks_for_spann(configuration.as_ref(), reconciled_schema.as_ref()) =>
         {
             // As distributed Chroma, a record segment beside the SPANN index; the metadata stay in SQLite.
             [
@@ -272,6 +279,23 @@ mod tests {
 
     fn local_supported() -> Vec<SegmentType> {
         supported_segment_types(ExecutorKind::Local)
+    }
+
+    // A collection asks for SPANN when its configuration or its schema does, whatever the other one says.
+    #[test]
+    fn asks_for_spann_in_the_configuration_or_in_the_schema() {
+        let spann = InternalCollectionConfiguration::default_spann();
+        let hnsw = InternalCollectionConfiguration::default_hnsw();
+        let spann_schema = Schema::new_default(KnnIndex::Spann);
+        let hnsw_schema = Schema::new_default(KnnIndex::Hnsw);
+        assert!(asks_for_spann(Some(&spann), None));
+        assert!(asks_for_spann(None, Some(&spann_schema)));
+        assert!(asks_for_spann(Some(&spann), Some(&hnsw_schema)));
+        assert!(asks_for_spann(Some(&hnsw), Some(&spann_schema)));
+        assert!(!asks_for_spann(Some(&hnsw), Some(&hnsw_schema)));
+        assert!(!asks_for_spann(Some(&hnsw), None));
+        assert!(!asks_for_spann(None, Some(&hnsw_schema)));
+        assert!(!asks_for_spann(None, None));
     }
 
     #[test]
