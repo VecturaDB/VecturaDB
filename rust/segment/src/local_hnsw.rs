@@ -1532,6 +1532,25 @@ mod tests {
         assert!(persist_and_read_back(207).await.is_err());
     }
 
+    // hnswlib throws for a label it does not have while it holds the locks of the label, as when the SPANN index asks
+    // for a center that a split deleted (is_head_deleted). C++ compiled for MSVC without /EHsc does not release them on
+    // the exception, and the next operation of the thread on the index fails with "resource deadlock would occur".
+    #[cfg(windows)]
+    #[test]
+    fn a_get_of_a_deleted_label_leaves_the_index_usable_on_windows() {
+        let index = HnswIndex::init(
+            &IndexConfig::new(3, DistanceFunction::Euclidean),
+            Some(&HnswIndexConfig::new_ephemeral(16, 100, 100)),
+            IndexUuid(uuid::Uuid::new_v4()),
+        )
+        .expect("hnsw init");
+        index.add(1, &[1.0, 2.0, 3.0]).expect("hnsw add");
+        index.add(2, &[4.0, 5.0, 6.0]).expect("hnsw add");
+        index.delete(1).expect("hnsw delete");
+        assert!(index.get(1).is_err());
+        assert_eq!(index.get_all_ids().expect("hnsw ids").0, vec![2]);
+    }
+
     #[tokio::test]
     async fn reader_migrates_legacy_max_seq_id() {
         let sqlite = get_new_sqlite_db().await;

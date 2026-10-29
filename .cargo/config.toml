@@ -3,3 +3,9 @@
 # all the connections of a process share one page cache: a connection whose share another one has taken drops each page
 # right after reading it, so a read that alternates between the connections of the pool reads the database many times over.
 LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT"
+# C++ that unwinds on Windows. cc compiles the C++ of hnswlib for MSVC without /EHsc, and without it an exception does not
+# run the destructors of the frames it leaves: an exception of hnswlib, as for a label it does not have, keeps the locks
+# it holds, and the next operation on the index fails with "resource deadlock would occur" or waits for ever. With /EHsc
+# the C++ unwinds as it does on Linux.
+CXXFLAGS_x86_64-pc-windows-msvc = "/EHsc"
+CXXFLAGS_aarch64-pc-windows-msvc = "/EHsc"
