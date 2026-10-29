@@ -6172,9 +6172,9 @@ mod tests {
 
     // Reads of a SPANN collection see one moment of it, while another request writes it: the records of SQLite and the
     // SPANN files of the same flush. A write commits SQLite first and then flushes SPANN, hundreds of ms later.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn spann_reads_during_writes_see_one_moment() {
-        let wrong = reads_during_writes(KnnIndex::Spann, 30).await;
+    #[test]
+    fn spann_reads_during_writes_see_one_moment() {
+        let wrong = on_a_large_stack(|| reads_during_writes(KnnIndex::Spann, 30));
         let kinds = ["query", "search", "get"].map(|kind| {
             let of_kind = wrong
                 .iter()
@@ -6190,15 +6190,40 @@ mod tests {
     }
 
     // The same on an HNSW collection, for the attribution: run by hand, it prints what went otherwise.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test]
     #[ignore = "a probe for the attribution, run by hand"]
-    async fn hnsw_reads_during_writes_see_one_moment() {
-        let wrong = reads_during_writes(KnnIndex::Hnsw, 30).await;
+    fn hnsw_reads_during_writes_see_one_moment() {
+        let wrong = on_a_large_stack(|| reads_during_writes(KnnIndex::Hnsw, 30));
         println!(
             "HNSW: {} answers mixed two moments, for example {:?}",
             wrong.len(),
             &wrong[..wrong.len().min(8)]
         );
+    }
+
+    // The tests of reads during writes run as the tests of the compactor and of SPANN of Chroma do: on a thread of
+    // 8 MiB, with workers of 8 MiB. In debug, their futures overflow the 2 MiB of the thread of a test: with Rust
+    // 1.99.1 they need 2.5 to 2.75 MiB.
+    fn on_a_large_stack<F, Fut, T>(test: F) -> T
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T>,
+        T: Send + 'static,
+    {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .thread_stack_size(8 * 1024 * 1024)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(test())
+            })
+            .unwrap()
+            .join()
+            .unwrap()
     }
 
     // The reads of a SPANN collection that the executor stops between their snapshot of SQLite and their files.
