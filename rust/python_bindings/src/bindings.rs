@@ -499,6 +499,7 @@ impl Bindings {
             mcmr_sysdb: None,
             collections_with_segments_provider: collection_cache_config,
             log: log_config,
+            local_compaction_manager: Default::default(),
             executor: executor_config,
             default_knn_index: knn_index,
             tenants_to_migrate_immediately: vec![],
