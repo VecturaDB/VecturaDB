@@ -1090,3 +1090,113 @@ async fn with_the_option_off_a_spann_collection_reads_and_flushes_its_log_impl()
     let flushed = reads_differ(&mut off, collection_id, 6).await;
     assert!(flushed.is_empty(), "after the flush: {flushed:#?}");
 }
+
+// The count of a collection at the read level given.
+async fn count_at(
+    frontend: &mut ServiceBasedFrontend,
+    collection_id: CollectionUuid,
+    read_level: chroma_types::plan::ReadLevel,
+) -> u32 {
+    frontend
+        .count(
+            CountRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                read_level,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+// The counts of a collection at IndexAndWal, IndexOnly and IndexAndBoundedWal.
+async fn counts_at_the_read_levels(
+    frontend: &mut ServiceBasedFrontend,
+    collection_id: CollectionUuid,
+) -> Vec<u32> {
+    use chroma_types::plan::ReadLevel;
+    let mut counts = Vec::new();
+    for read_level in [
+        ReadLevel::IndexAndWal,
+        ReadLevel::IndexOnly,
+        ReadLevel::IndexAndBoundedWal,
+    ] {
+        counts.push(count_at(frontend, collection_id, read_level).await);
+    }
+    counts
+}
+
+// A count of a SPANN collection reads the log after its last flush at the read level of its request, as the count of
+// distributed Chroma (rust/worker/src/execution/orchestration/count.rs): IndexAndWal all of it, IndexOnly none of it,
+// IndexAndBoundedWal its first bounded_wal_limit records, 250 by default. 20 records flushed, 300 in the log.
+#[test]
+fn a_spann_count_reads_the_log_at_its_read_level() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_spann_count_reads_the_log_at_its_read_level_impl,
+    )
+}
+
+async fn a_spann_count_reads_the_log_at_its_read_level_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let collection_id = empty_spann_collection(&mut frontend, "levels").await;
+    add_numbers(&mut frontend, collection_id, 0..20).await;
+    flush_spann(&frontend, collection_id).await;
+    add_numbers(&mut frontend, collection_id, 20..320).await;
+    assert_eq!(
+        counts_at_the_read_levels(&mut frontend, collection_id).await,
+        vec![320, 20, 270]
+    );
+    flush_spann(&frontend, collection_id).await;
+    assert_eq!(
+        counts_at_the_read_levels(&mut frontend, collection_id).await,
+        vec![320, 320, 320]
+    );
+}
+
+// At IndexAndBoundedWal a count of a SPANN collection reads the first bounded_wal_limit records of its log, as the
+// config sets it, and as the log leaves them: 20 records flushed, then a log that deletes 5 of them and adds 300. A limit
+// under the log reads part of it, the first records; a limit at its length or over it reads all of it, as IndexAndWal.
+#[test]
+fn a_spann_count_reads_the_first_records_of_the_log_up_to_its_limit() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_spann_count_reads_the_first_records_of_the_log_up_to_its_limit_impl,
+    )
+}
+
+async fn a_spann_count_reads_the_first_records_of_the_log_up_to_its_limit_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let collection_id = empty_spann_collection(&mut frontend, "limits").await;
+    add_numbers(&mut frontend, collection_id, 0..20).await;
+    flush_spann(&frontend, collection_id).await;
+    delete_ids(
+        &mut frontend,
+        collection_id,
+        (0..5).map(|i| format!("r{i}")).collect(),
+    )
+    .await;
+    add_numbers(&mut frontend, collection_id, 20..320).await;
+    drop(frontend);
+    for (limit, bounded) in [(3, 17), (5, 15), (100, 110), (305, 315), (1000, 315)] {
+        let mut frontend = frontend_with_local_executor(
+            root.path(),
+            crate::executor::config::LocalExecutorConfig {
+                spann: true,
+                bounded_wal_limit: limit,
+                ..Default::default()
+            },
+            &Registry::new(),
+        )
+        .await;
+        assert_eq!(
+            counts_at_the_read_levels(&mut frontend, collection_id).await,
+            vec![315, 20, bounded],
+            "limit {limit}"
+        );
+    }
+}

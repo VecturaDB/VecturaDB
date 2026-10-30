@@ -53,7 +53,7 @@ pub struct DistributedExecutorConfig {
     pub tiers: TiersConfig,
 }
 
-#[derive(Deserialize, Clone, Serialize, Debug, Default)]
+#[derive(Deserialize, Clone, Serialize, Debug)]
 pub struct LocalExecutorConfig {
     /// Collections whose configuration or schema asks for SPANN get a SPANN index, as on distributed Chroma, instead of
     /// HNSW. Off by default: a SPANN request then gets HNSW, as before. Needs a persistent data path.
@@ -63,6 +63,26 @@ pub struct LocalExecutorConfig {
     /// distributed executor: by default the same.
     #[serde(default = "RetryConfig::default")]
     pub retry: RetryConfig,
+    /// The maximum number of records of the log after the last flush that a count of a SPANN collection reads at the read
+    /// level `IndexAndBoundedWal`, as the `bounded_wal_limit` of the query service of distributed Chroma
+    /// (rust/worker/src/config.rs): by default the same.
+    #[serde(default = "default_bounded_wal_limit")]
+    pub bounded_wal_limit: u32,
+}
+
+// The default of the bounded_wal_limit of the query service of distributed Chroma (rust/worker/src/config.rs).
+fn default_bounded_wal_limit() -> u32 {
+    250
+}
+
+impl Default for LocalExecutorConfig {
+    fn default() -> Self {
+        LocalExecutorConfig {
+            spann: false,
+            retry: RetryConfig::default(),
+            bounded_wal_limit: default_bounded_wal_limit(),
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -931,6 +951,24 @@ mod tests {
                 r#"{"local": {"spann": true, "retry": {"factor": 3.0, "min_delay_ms": 10, "max_delay_ms": 20, "max_attempts": 2, "jitter": false}}}"#
             ),
             (3.0, 10, 20, 2, false)
+        );
+    }
+
+    // The local executor reads its bounded_wal_limit as the query service of distributed Chroma does: by default the same,
+    // 250 (rust/worker/src/config.rs).
+    #[test]
+    fn the_local_executor_reads_its_bounded_wal_limit_as_the_distributed_one() {
+        let limit = |config: &str| {
+            let ExecutorConfig::Local(config) = serde_json::from_str(config).unwrap() else {
+                panic!("not a local executor: {config}");
+            };
+            config.bounded_wal_limit
+        };
+        assert_eq!(limit(r#"{"local": {"spann": true}}"#), 250);
+        assert_eq!(LocalExecutorConfig::default().bounded_wal_limit, 250);
+        assert_eq!(
+            limit(r#"{"local": {"spann": true, "bounded_wal_limit": 7}}"#),
+            7
         );
     }
 }

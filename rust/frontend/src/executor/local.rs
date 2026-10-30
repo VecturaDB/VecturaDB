@@ -29,7 +29,7 @@ use chroma_types::{
         KnnProjectionRecord, Limit, Merge, Projection, ProjectionRecord, QueryVector,
         RecordMeasure, SearchPayloadResult, SearchRecord, SearchResult, Select,
     },
-    plan::{Count, Get, Knn, Search},
+    plan::{Count, Get, Knn, ReadLevel, Search},
     ranking::EnrichedRecord,
     Chunk, CollectionAndSegments, ExecutorError, LogRecord, MaterializedLogOperation, Operation,
     Segment, SegmentShard, SegmentType, SegmentUuid, Space,
@@ -49,6 +49,8 @@ pub struct LocalExecutor {
     log: Option<SqliteLog>,
     spann: bool,
     retry: RetryConfig,
+    // The records of the log after the last flush that a count of a SPANN collection reads at IndexAndBoundedWal.
+    bounded_wal_limit: u32,
     spann_warm_up: SpannWarmUp,
     /// Test switch: a search of a SPANN collection runs all in its snapshot of SQLite, as before spann_search took it
     /// in two moments, for the test that compares the answers of the two.
@@ -69,6 +71,7 @@ impl LocalExecutor {
             log: None,
             spann: false,
             retry: RetryConfig::default(),
+            bounded_wal_limit: LocalExecutorConfig::default().bounded_wal_limit,
             spann_warm_up: SpannWarmUp::default(),
             #[cfg(test)]
             search_in_one_snapshot: Default::default(),
@@ -97,6 +100,13 @@ impl LocalExecutor {
     /// How a read of a SPANN collection reads again, from the config, as the retry of the distributed executor.
     pub fn with_retry(mut self, retry: RetryConfig) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// The records of the log that a count of a SPANN collection reads at IndexAndBoundedWal, from the config, as the
+    /// bounded_wal_limit of the query service of distributed Chroma.
+    pub fn with_bounded_wal_limit(mut self, bounded_wal_limit: u32) -> Self {
+        self.bounded_wal_limit = bounded_wal_limit;
         self
     }
 
@@ -241,6 +251,8 @@ impl LocalExecutor {
                 }
             }
         }
+        // Every read level counts the same records, as for a search: the local writes reach the indexes before they are
+        // acknowledged.
         self.try_backfill_collection(&plan.scan.collection_and_segments)
             .await?;
         self.metadata_reader
@@ -251,10 +263,11 @@ impl LocalExecutor {
 
     // A count of a SPANN collection as distributed Chroma counts it (rust/worker/src/execution/operators/count_records.rs):
     // the records of the record segment, at the files of the last flush that a snapshot of SQLite gives before it closes,
-    // with the tail of the log after that flush.
+    // with the tail of the log after that flush that its read level reads, as the CountOrchestrator of distributed Chroma
+    // fetches it (rust/worker/src/execution/orchestration/count.rs).
     async fn spann_count(&mut self, plan: Count) -> Result<CountResult, ExecutorError> {
         let (snapshot, collection_and_segments, tail) = self
-            .spann_snapshot(&plan.scan.collection_and_segments)
+            .spann_snapshot(&plan.scan.collection_and_segments, plan.read_level)
             .await?;
         snapshot
             .close()
@@ -390,25 +403,32 @@ impl LocalExecutor {
     // One read of a SPANN collection: its log applied first, then a snapshot of SQLite, which reads the files of the
     // last flush with the records at one moment, as a read of distributed Chroma reads one version of every segment.
     // The files of a flush never change, and those of a replaced flush stay at least a grace: a get, a query, a count
-    // and a search close the snapshot before they read the files, so that writers commit meanwhile.
+    // and a search close the snapshot before they read the files, so that writers commit meanwhile. The read level says
+    // how much of the tail of the log the read takes: only a count reads at the level of its request, as in distributed
+    // Chroma; a get, a query and a search read all of it.
     async fn spann_snapshot(
         &mut self,
         collection_and_segments: &CollectionAndSegments,
+        read_level: ReadLevel,
     ) -> Result<(MetadataSnapshot, CollectionAndSegments, Chunk<LogRecord>), ExecutorError> {
         self.spann_warm_up
             .read(collection_and_segments.collection.collection_id);
         self.spann_replay(collection_and_segments).await?;
-        self.snapshot_files(collection_and_segments).await
+        self.snapshot_files(collection_and_segments, read_level)
+            .await
     }
 
     // A snapshot of SQLite, with the segments of a SPANN collection at the files of the last flush it reads, and the tail of
     // the log after that flush, up to the last record applied to the metadata: the records that the files do not hold yet,
     // which a read merges with them, as a read of distributed Chroma fetches the logs from the log position of the
     // collection plus one (rust/worker/src/execution/operators/fetch_log.rs). The metadata, the files and the tail are of
-    // the same moment.
+    // the same moment. At the read level IndexOnly the tail is empty, at IndexAndBoundedWal it has at most
+    // bounded_wal_limit records, the first ones, as distributed Chroma fetches them at those levels
+    // (rust/worker/src/execution/orchestration/count.rs).
     async fn snapshot_files(
         &self,
         collection_and_segments: &CollectionAndSegments,
+        read_level: ReadLevel,
     ) -> Result<(MetadataSnapshot, CollectionAndSegments, Chunk<LogRecord>), ExecutorError> {
         let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
         let mut snapshot = self.metadata_reader.snapshot().await.map_err(internal)?;
@@ -418,7 +438,12 @@ impl LocalExecutor {
             .max_seq_id(&collection_and_segments.metadata_segment.id)
             .await
             .map_err(internal)?;
-        let tail = if applied > flushed {
+        let limit = match read_level {
+            ReadLevel::IndexAndWal => None,
+            ReadLevel::IndexOnly => Some(0),
+            ReadLevel::IndexAndBoundedWal => Some(self.bounded_wal_limit),
+        };
+        let tail = if applied > flushed && limit != Some(0) {
             self.log
                 .as_ref()
                 .ok_or(ExecutorError::InconsistentData)?
@@ -427,6 +452,7 @@ impl LocalExecutor {
                     collection_and_segments.collection.collection_id,
                     flushed as i64,
                     applied as i64,
+                    limit,
                 )
                 .await
                 .map_err(|err| ExecutorError::Internal(err.boxed()))?
@@ -493,7 +519,7 @@ impl LocalExecutor {
         collection_and_segments: &CollectionAndSegments,
     ) -> Result<(), Box<dyn ChromaError>> {
         let (_, collection_and_segments, _) = self
-            .snapshot_files(collection_and_segments)
+            .snapshot_files(collection_and_segments, ReadLevel::IndexAndWal)
             .await
             .map_err(|err| err.boxed())?;
         // Only the files: the records of the tail are in the log, which the write reaches anyway.
@@ -526,7 +552,7 @@ impl LocalExecutor {
     async fn spann_get(&mut self, plan: Get) -> Result<GetResult, ExecutorError> {
         let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
         let (mut snapshot, collection_and_segments, tail) = self
-            .spann_snapshot(&plan.scan.collection_and_segments)
+            .spann_snapshot(&plan.scan.collection_and_segments, ReadLevel::IndexAndWal)
             .await?;
         let projection = plan.proj.clone();
         let filter_limit = Get {
@@ -785,7 +811,7 @@ impl LocalExecutor {
             results: vec![Default::default(); plan.knn.embeddings.len()],
         });
         let (mut snapshot, collection_and_segments, tail) = self
-            .spann_snapshot(&plan.scan.collection_and_segments)
+            .spann_snapshot(&plan.scan.collection_and_segments, ReadLevel::IndexAndWal)
             .await?;
         let allowed_user_ids = match plan.filter {
             Filter {
@@ -1062,7 +1088,7 @@ impl LocalExecutor {
         }
         let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
         let (mut snapshot, collection_and_segments, tail) = self
-            .spann_snapshot(&plan.scan.collection_and_segments)
+            .spann_snapshot(&plan.scan.collection_and_segments, ReadLevel::IndexAndWal)
             .await?;
         // As distributed Chroma (rust/worker/src/server.rs:697-701): an uninitialized collection has no results.
         if collection_and_segments.is_uninitialized() {
@@ -1179,7 +1205,7 @@ impl LocalExecutor {
         plan: Search,
     ) -> Result<SearchResult, ExecutorError> {
         let (mut snapshot, collection_and_segments, tail) = self
-            .spann_snapshot(&plan.scan.collection_and_segments)
+            .spann_snapshot(&plan.scan.collection_and_segments, ReadLevel::IndexAndWal)
             .await?;
         if collection_and_segments.is_uninitialized() {
             return Ok(SearchResult {
@@ -1902,6 +1928,7 @@ impl Configurable<LocalExecutorConfig> for LocalExecutor {
         Ok(Self::new(hnsw_manager, sqlite_db, compactor_handle.clone())
             .with_spann(config.spann)
             .with_retry(config.retry.clone())
+            .with_bounded_wal_limit(config.bounded_wal_limit)
             .with_log(log))
     }
 }

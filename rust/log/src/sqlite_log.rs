@@ -271,16 +271,20 @@ impl SqliteLog {
     /// The records of the log of a collection after the position `after` and up to `up_to`, read on the connection given:
     /// a read of the log in the snapshot of another read, which sees the log at the same moment as the rest of SQLite.
     /// The first record read is the one after `after`, as the fetch of the log of distributed Chroma reads from the log
-    /// position of a collection plus one (rust/worker/src/execution/operators/fetch_log.rs).
+    /// position of a collection plus one (rust/worker/src/execution/operators/fetch_log.rs). With a limit, at most that
+    /// many records, the first ones, as the fetch of distributed Chroma with its maximum_fetch_count: the positions of
+    /// the log of the single node are shared by every collection, so the limit counts the records of the collection.
     pub async fn read_tail(
         &self,
         connection: &mut SqliteConnection,
         collection_id: CollectionUuid,
         after: i64,
         up_to: i64,
+        limit: Option<u32>,
     ) -> Result<Vec<LogRecord>, SqlitePullLogsError> {
         let topic =
             get_embeddings_queue_topic_name(&self.tenant_id, &self.topic_namespace, collection_id);
+        // A negative LIMIT is no limit in SQLite.
         let mut logs = sqlx::query(
             r#"
             SELECT
@@ -295,11 +299,13 @@ impl SqliteLog {
             AND seq_id > ?
             AND seq_id <= ?
             ORDER BY seq_id ASC
+            LIMIT ?
             "#,
         )
         .bind(topic)
         .bind(after)
         .bind(up_to)
+        .bind(limit.map_or(-1, i64::from))
         .fetch(&mut *connection);
         let mut records = Vec::new();
         while let Some(row) = logs.try_next().await.map_err(WrappedSqlxError)? {
@@ -1037,8 +1043,8 @@ mod tests {
     }
 
     // The tail of a collection starts after the position given and ends at the last one given, both positions of the log
-    // shared by every collection; its count goes to the last record written. The records of the other collections stay
-    // out.
+    // shared by every collection; with a limit, it takes that many records of the collection, the first ones. Its count
+    // goes to the last record written. The records of the other collections stay out.
     #[tokio::test]
     async fn the_tail_of_a_collection_is_between_its_positions() {
         let mut log = setup_sqlite_log().await;
@@ -1049,14 +1055,25 @@ mod tests {
         log.push_logs(other, adds(0..2)).await.unwrap();
         log.push_logs(collection, adds(3..5)).await.unwrap();
         let mut connection = log.db.get_conn().acquire().await.unwrap();
-        let tail = log
-            .read_tail(&mut connection, collection, 2, 6)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|record| (record.log_offset, record.record.id))
-            .collect::<Vec<_>>();
-        assert_eq!(tail, vec![(3, "r2".to_string()), (6, "r3".to_string())]);
+        for (up_to, limit, expected) in [
+            (6, None, vec![(3, "r2"), (6, "r3")]),
+            (7, Some(2), vec![(3, "r2"), (6, "r3")]),
+            (7, Some(5), vec![(3, "r2"), (6, "r3"), (7, "r4")]),
+            (7, Some(0), vec![]),
+        ] {
+            let tail = log
+                .read_tail(&mut connection, collection, 2, up_to, limit)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|record| (record.log_offset, record.record.id))
+                .collect::<Vec<_>>();
+            let expected = expected
+                .into_iter()
+                .map(|(offset, id)| (offset, id.to_string()))
+                .collect::<Vec<_>>();
+            assert_eq!(tail, expected, "up to {up_to}, limit {limit:?}");
+        }
         assert_eq!(
             log.count_tail(&mut connection, collection, 2)
                 .await

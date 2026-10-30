@@ -7729,6 +7729,7 @@ mod tests {
                 max_attempts: 1,
                 jitter: false,
             },
+            ..Default::default()
         };
         let mut frontend =
             frontend_with_local_executor(root.path(), executor, &Registry::new()).await;
