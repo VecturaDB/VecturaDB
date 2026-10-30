@@ -101,9 +101,16 @@ pub(crate) fn server_info() -> ServerInfo {
     ServerInfo {
         name: "VecturaDB".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        features: ["sparse_vector_index", "bm25", "search", "fork", "api_keys"]
-            .map(String::from)
-            .to_vec(),
+        features: [
+            "sparse_vector_index",
+            "bm25",
+            "search",
+            "fork",
+            "api_keys",
+            "indexing_status",
+        ]
+        .map(String::from)
+        .to_vec(),
     }
 }
 
