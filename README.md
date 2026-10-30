@@ -36,7 +36,7 @@ import chromadb
 client = chromadb.HttpClient(host="localhost", port=8000)
 ```
 
-While only previews exist, `pip install VecturaDB` installs the newest preview. Once `1.0.0` is out, a preview needs `pip install --pre VecturaDB`.
+While only previews exist, `pip install VecturaDB` installs the newest preview. Once `1.0.0` is out, install a preview with its exact version, for example `pip install VecturaDB==1.0.0rc4`: `--pre` takes the previews of the dependencies too, and a preview of httpx breaks the client.
 
 ### Packages that depend on chromadb
 
