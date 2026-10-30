@@ -59,14 +59,14 @@ fn metadata_of(i: usize, numbers: &mut Numbers) -> Metadata {
             SPARSE_KEY.to_string(),
             MetadataValue::SparseVector(numbers.sparse()),
         ),
-        ("even".to_string(), MetadataValue::Bool(i % 2 == 0)),
+        ("even".to_string(), MetadataValue::Bool(i.is_multiple_of(2))),
         (
             "weight".to_string(),
             MetadataValue::Float(numbers.next() as f64),
         ),
         (
             "flags".to_string(),
-            MetadataValue::BoolArray(vec![i % 2 == 0, i % 3 == 0]),
+            MetadataValue::BoolArray(vec![i.is_multiple_of(2), i.is_multiple_of(3)]),
         ),
         (
             "counts".to_string(),
@@ -100,14 +100,17 @@ fn update_metadata_of(i: usize, numbers: &mut Numbers) -> UpdateMetadata {
             SPARSE_KEY.to_string(),
             UpdateMetadataValue::SparseVector(numbers.sparse()),
         ),
-        ("even".to_string(), UpdateMetadataValue::Bool(i % 2 == 0)),
+        (
+            "even".to_string(),
+            UpdateMetadataValue::Bool(i.is_multiple_of(2)),
+        ),
         (
             "weight".to_string(),
             UpdateMetadataValue::Float(numbers.next() as f64),
         ),
         (
             "flags".to_string(),
-            UpdateMetadataValue::BoolArray(vec![i % 2 == 0, i % 3 == 0]),
+            UpdateMetadataValue::BoolArray(vec![i.is_multiple_of(2), i.is_multiple_of(3)]),
         ),
         (
             "counts".to_string(),

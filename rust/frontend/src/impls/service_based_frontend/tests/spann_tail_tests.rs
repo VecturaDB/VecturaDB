@@ -69,10 +69,7 @@ async fn vector_files(
 }
 
 // A SPANN collection with no record yet.
-async fn empty_spann_collection(
-    frontend: &mut ServiceBasedFrontend,
-    name: &str,
-) -> CollectionUuid {
+async fn empty_spann_collection(frontend: &mut ServiceBasedFrontend, name: &str) -> CollectionUuid {
     frontend
         .create_collection(
             CreateCollectionRequest::try_new(
@@ -246,11 +243,17 @@ async fn the_log_of_a_spann_read_ends_at_the_records_applied_to_the_metadata_imp
     .unwrap();
     let unapplied = reads_differ(&mut frontend, collection_id, 1).await;
     assert!(unapplied.is_empty(), "{unapplied:#?}");
-    assert_eq!(status(&mut frontend, collection_id).await, (10.0 / 13.0, 3, 10, 13));
+    assert_eq!(
+        status(&mut frontend, collection_id).await,
+        (10.0 / 13.0, 3, 10, 13)
+    );
     write_to_stop(&mut frontend, collection_id, 2).await;
     match spann_read(&mut frontend, collection_id, SpannRead::Get).await {
         Ok(ReadAnswer::Records(records)) => {
-            let ids = records[0].iter().map(|record| record.0.as_str()).collect::<Vec<_>>();
+            let ids = records[0]
+                .iter()
+                .map(|record| record.0.as_str())
+                .collect::<Vec<_>>();
             assert_eq!(ids.len(), 13, "{ids:?}");
             assert!(ids.contains(&"late"), "{ids:?}");
         }
@@ -279,7 +282,10 @@ async fn a_spann_collection_reads_its_log_after_a_restart_impl() {
     let mut reopened = frontend_with_spann(root.path(), true).await;
     let restarted = reads_differ(&mut reopened, collection_id, 2).await;
     assert!(restarted.is_empty(), "after the restart: {restarted:#?}");
-    assert_eq!(status(&mut reopened, collection_id).await, (10.0 / 14.0, 4, 10, 14));
+    assert_eq!(
+        status(&mut reopened, collection_id).await,
+        (10.0 / 14.0, 4, 10, 14)
+    );
     flush_spann(&reopened, collection_id).await;
     let flushed = reads_differ(&mut reopened, collection_id, 2).await;
     assert!(flushed.is_empty(), "after the flush: {flushed:#?}");
@@ -356,8 +362,16 @@ async fn the_log_of_a_spann_collection_overrides_its_files_impl() {
     let expected = (0..10)
         .filter(|&i| i != 2)
         .map(|i| match i {
-            1 => ("r1".to_string(), Some("document r1 changed".to_string()), Some(vec![50.0, 50.0])),
-            3 => ("r3".to_string(), Some("document r3 changed".to_string()), Some(vec![60.0, 60.0])),
+            1 => (
+                "r1".to_string(),
+                Some("document r1 changed".to_string()),
+                Some(vec![50.0, 50.0]),
+            ),
+            3 => (
+                "r3".to_string(),
+                Some("document r3 changed".to_string()),
+                Some(vec![60.0, 60.0]),
+            ),
             4 => (
                 "r4".to_string(),
                 Some("document r4 changed".to_string()),

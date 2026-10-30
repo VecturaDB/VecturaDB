@@ -5,7 +5,9 @@ use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder};
 use chroma_config::{registry::Registry, Configurable};
 use chroma_distance::{normalize, DistanceFunction};
 use chroma_error::{ChromaError, ErrorCodes};
-use chroma_log::{sqlite_log::SqliteLog, BackfillMessage, LocalCompactionManager, Log, PurgeLogsMessage};
+use chroma_log::{
+    sqlite_log::SqliteLog, BackfillMessage, LocalCompactionManager, Log, PurgeLogsMessage,
+};
 use chroma_segment::blockfile_record::{
     RecordSegmentReaderOptions, RecordSegmentReaderShard, RecordSegmentReaderShardCreationError,
 };
@@ -1508,8 +1510,10 @@ impl SpannView<'_> {
         // The tail, as the KnnLog of the worker (rust/worker/src/execution/operators/knn_log.rs).
         let mut nearest = BinaryHeap::with_capacity(k as usize);
         for log in self.tail.iter() {
-            if matches!(log.get_operation(), MaterializedLogOperation::DeleteExisting)
-                || allowed.is_some_and(|allowed| !allowed.contains(&log.get_offset_id()))
+            if matches!(
+                log.get_operation(),
+                MaterializedLogOperation::DeleteExisting
+            ) || allowed.is_some_and(|allowed| !allowed.contains(&log.get_offset_id()))
             {
                 continue;
             }
@@ -1686,7 +1690,8 @@ impl SpannView<'_> {
         // Ids that are absent in the segment but present in log in non deleted state.
         let mut non_deleted_absent_in_segment: HashSet<String> = HashSet::new();
         for (log_record, _) in self.tail.logs.iter() {
-            let present = deleted_and_non_deleted_present_in_segment.contains(log_record.record.id.as_str());
+            let present =
+                deleted_and_non_deleted_present_in_segment.contains(log_record.record.id.as_str());
             let ids = if present {
                 &mut non_deleted_present_in_segment
             } else {

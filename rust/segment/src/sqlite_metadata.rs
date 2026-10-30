@@ -210,7 +210,10 @@ impl MetadataSnapshot {
 
     /// The position in the log of the last record applied to a segment, in the snapshot: see
     /// SqliteMetadataReader::current_max_seq_id.
-    pub async fn max_seq_id(&mut self, segment_id: &SegmentUuid) -> Result<u64, SqliteMetadataError> {
+    pub async fn max_seq_id(
+        &mut self,
+        segment_id: &SegmentUuid,
+    ) -> Result<u64, SqliteMetadataError> {
         let (sql, values) = Query::select()
             .column(MaxSeqId::SeqId)
             .from(MaxSeqId::Table)
@@ -227,7 +230,7 @@ impl MetadataSnapshot {
 
     /// The connection of the snapshot, for the reads of other crates that must see the same moment, as those of the log.
     pub fn connection(&mut self) -> &mut SqliteConnection {
-        &mut *self.tx
+        &mut self.tx
     }
 }
 
@@ -3466,7 +3469,7 @@ mod tests {
         let logs = (0..1200)
             .map(|i| {
                 let mut log = sparse_log(
-                    i as i64 + 1,
+                    i + 1,
                     &format!("r{i}"),
                     Operation::Add,
                     Some(UpdateMetadataValue::SparseVector(

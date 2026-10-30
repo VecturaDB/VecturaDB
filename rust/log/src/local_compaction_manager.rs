@@ -655,7 +655,7 @@ impl LocalCompactionManager {
             .await
             .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
         chroma_sysdb::sqlite::flush_compaction_in(
-            &mut *tx,
+            &mut tx,
             collection_id,
             flush.log_position,
             collection_and_segments.collection.version,

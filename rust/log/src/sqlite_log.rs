@@ -318,13 +318,14 @@ impl SqliteLog {
     ) -> Result<u64, SqlitePullLogsError> {
         let topic =
             get_embeddings_queue_topic_name(&self.tenant_id, &self.topic_namespace, collection_id);
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM embeddings_queue WHERE topic = ? AND seq_id > ?")
-                .bind(topic)
-                .bind(after)
-                .fetch_one(&mut *connection)
-                .await
-                .map_err(WrappedSqlxError)?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM embeddings_queue WHERE topic = ? AND seq_id > ?",
+        )
+        .bind(topic)
+        .bind(after)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(WrappedSqlxError)?;
         Ok(count as u64)
     }
 
@@ -1056,8 +1057,18 @@ mod tests {
             .map(|record| (record.log_offset, record.record.id))
             .collect::<Vec<_>>();
         assert_eq!(tail, vec![(3, "r2".to_string()), (6, "r3".to_string())]);
-        assert_eq!(log.count_tail(&mut connection, collection, 2).await.unwrap(), 3);
-        assert_eq!(log.count_tail(&mut connection, collection, 7).await.unwrap(), 0);
+        assert_eq!(
+            log.count_tail(&mut connection, collection, 2)
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            log.count_tail(&mut connection, collection, 7)
+                .await
+                .unwrap(),
+            0
+        );
         assert_eq!(log.count_tail(&mut connection, other, 0).await.unwrap(), 2);
     }
 
@@ -1110,10 +1121,12 @@ mod tests {
             vec![spann]
         );
         // The third record waited a day.
-        sqlx::query("UPDATE embeddings_queue SET created_at = datetime('now', '-1 day', '-1 minute')")
-            .execute(log.db.get_conn())
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE embeddings_queue SET created_at = datetime('now', '-1 day', '-1 minute')",
+        )
+        .execute(log.db.get_conn())
+        .await
+        .unwrap();
         assert_eq!(
             log.get_spann_collections_to_compact(10, day).await.unwrap(),
             vec![spann]
