@@ -126,7 +126,7 @@ docker run -p 127.0.0.1:8000:8000 -v ./data:/data -e CHROMA_EXECUTOR__LOCAL__SPA
 A client that needs to know which server it talks to reads `GET /api/v2/pre-flight-checks`. VecturaDB answers with the fields of Chroma and adds a `server` block, for example:
 
 ```json
-{"max_batch_size": 5461, "supports_base64_encoding": true, "server": {"name": "VecturaDB", "version": "1.0.0-preview.N", "features": ["sparse_vector_index", "bm25", "search", "fork", "api_keys"]}}
+{"max_batch_size": 5461, "supports_base64_encoding": true, "server": {"name": "VecturaDB", "version": "1.0.0-preview.N", "features": ["sparse_vector_index", "bm25", "search", "fork", "api_keys", "indexing_status"]}}
 ```
 
 `features` lists what VecturaDB has beyond single-node Chroma:
@@ -135,7 +135,8 @@ A client that needs to know which server it talks to reads `GET /api/v2/pre-flig
 - `bm25`: sparse indexes with BM25 scoring;
 - `search`: the Search API, hybrid search included;
 - `fork`: collection fork and fork count;
-- `api_keys`: API keys, as on Chroma Cloud.
+- `api_keys`: API keys, as on Chroma Cloud;
+- `indexing_status`: the indexing status of a collection, as on Chroma Cloud.
 
 With [API keys](docs/mintlify/guides/deploy/client-server-mode.mdx), only a request with a valid key gets the block. Chroma does not send the block, and the clients of Chroma ignore it. `GET /api/v2/version` answers `1.0.0`, as Chroma does.
 
