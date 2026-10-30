@@ -497,7 +497,7 @@ impl LocalExecutor {
             .await
             .map_err(|err| err.boxed())?;
         // Only the files: the records of the tail are in the log, which the write reaches anyway.
-        self.spann_view(&collection_and_segments, Chunk::new(Vec::new().into()))
+        Box::pin(self.spann_view(&collection_and_segments, Chunk::new(Vec::new().into())))
             .await
             .map_err(|err| err.boxed())?;
         Ok(())
@@ -965,7 +965,7 @@ impl LocalExecutor {
         allowed_user_ids: Vec<String>,
     ) -> Result<Vec<KnnProjectionOutput>, ExecutorError> {
         let internal = |err: Box<dyn ChromaError>| ExecutorError::Internal(err);
-        let Some(vectors) = self.spann_view(collection_and_segments, tail).await? else {
+        let Some(vectors) = Box::pin(self.spann_view(collection_and_segments, tail)).await? else {
             return Ok(vec![Default::default(); embeddings.len()]);
         };
         let allowed = if allowed_user_ids.is_empty() {
@@ -1077,7 +1077,7 @@ impl LocalExecutor {
             .await
             .map_err(internal)?;
         snapshot.close().await.map_err(internal)?;
-        let Some(spann) = self.spann_view(&collection_and_segments, tail).await? else {
+        let Some(spann) = Box::pin(self.spann_view(&collection_and_segments, tail)).await? else {
             // A collection without its dimension, which no write has reached: SQLite holds none of its records either,
             // and the search answers none, as a query and a get do. Records in SQLite without the files or the log that
             // hold them would be inconsistent.
@@ -1187,7 +1187,7 @@ impl LocalExecutor {
                 pulled_log_bytes: 0,
             });
         }
-        let spann_vectors = self.spann_view(&collection_and_segments, tail).await?;
+        let spann_vectors = Box::pin(self.spann_view(&collection_and_segments, tail)).await?;
         let vectors = spann_vectors
             .as_ref()
             .map(|spann| spann as &dyn DenseVectorReader);
