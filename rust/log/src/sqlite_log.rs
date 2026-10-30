@@ -308,6 +308,26 @@ impl SqliteLog {
         Ok(records)
     }
 
+    /// The number of records in the log of a collection after the position `after`, counted on the connection given, as
+    /// read_tail reads them, up to the last one written.
+    pub async fn count_tail(
+        &self,
+        connection: &mut SqliteConnection,
+        collection_id: CollectionUuid,
+        after: i64,
+    ) -> Result<u64, SqlitePullLogsError> {
+        let topic =
+            get_embeddings_queue_topic_name(&self.tenant_id, &self.topic_namespace, collection_id);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM embeddings_queue WHERE topic = ? AND seq_id > ?")
+                .bind(topic)
+                .bind(after)
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(WrappedSqlxError)?;
+        Ok(count as u64)
+    }
+
     pub(super) async fn push_logs(
         &mut self,
         collection_id: CollectionUuid,

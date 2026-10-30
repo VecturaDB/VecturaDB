@@ -410,14 +410,8 @@ impl LocalExecutor {
     ) -> Result<(MetadataSnapshot, CollectionAndSegments, Chunk<LogRecord>), ExecutorError> {
         let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
         let mut snapshot = self.metadata_reader.snapshot().await.map_err(internal)?;
-        let mut files = snapshot
-            .segment_files(collection_and_segments.collection.collection_id)
-            .await
-            .map_err(internal)?;
-        let flushed = snapshot
-            .max_seq_id(&collection_and_segments.vector_segment.id)
-            .await
-            .map_err(internal)?;
+        let (collection_and_segments, flushed) =
+            flushed_files(&mut snapshot, collection_and_segments).await?;
         let applied = snapshot
             .max_seq_id(&collection_and_segments.metadata_segment.id)
             .await
@@ -437,14 +431,56 @@ impl LocalExecutor {
         } else {
             Vec::new()
         };
-        let mut collection_and_segments = collection_and_segments.clone();
-        collection_and_segments.record_segment.file_path = files
-            .remove(&collection_and_segments.record_segment.id.to_string())
-            .unwrap_or_default();
-        collection_and_segments.vector_segment.file_path = files
-            .remove(&collection_and_segments.vector_segment.id.to_string())
-            .unwrap_or_default();
         Ok((snapshot, collection_and_segments, Chunk::new(tail.into())))
+    }
+
+    /// The records of a SPANN collection in the files of its last flush, and the records of its log after that flush,
+    /// which wait for the next one, at one snapshot of SQLite: indexing_status reports them as the operations indexed and
+    /// not indexed, as distributed Chroma reports the operations of its log before and after the log position of its last
+    /// compaction. A read that finds the files of its flush gone reads again, as a count does.
+    pub async fn spann_indexing_status(
+        &mut self,
+        collection_and_segments: &CollectionAndSegments,
+    ) -> Result<(u64, u64), ExecutorError> {
+        let mut delays = spann_backoff(&self.retry);
+        loop {
+            match Box::pin(self.spann_indexed_and_waiting(collection_and_segments)).await {
+                // Each try takes the files from a new snapshot: the plan stays.
+                Err(err) => spann_replan(err, &mut delays, &|_| async { Ok(()) }).await?,
+                result => return result,
+            }
+        }
+    }
+
+    async fn spann_indexed_and_waiting(
+        &self,
+        collection_and_segments: &CollectionAndSegments,
+    ) -> Result<(u64, u64), ExecutorError> {
+        let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
+        let mut snapshot = self.metadata_reader.snapshot().await.map_err(internal)?;
+        let (collection_and_segments, flushed) =
+            flushed_files(&mut snapshot, collection_and_segments).await?;
+        let waiting = self
+            .log
+            .as_ref()
+            .ok_or(ExecutorError::InconsistentData)?
+            .count_tail(
+                snapshot.connection(),
+                collection_and_segments.collection.collection_id,
+                flushed as i64,
+            )
+            .await
+            .map_err(|err| ExecutorError::Internal(err.boxed()))?;
+        snapshot.close().await.map_err(internal)?;
+        let indexed = match Box::pin(
+            self.spann_view(&collection_and_segments, Chunk::new(Vec::new().into())),
+        )
+        .await?
+        {
+            Some(view) => view.count().await.map_err(ExecutorError::Internal)? as u64,
+            None => 0,
+        };
+        Ok((indexed, waiting))
     }
 
     /// Rejects a write to a SPANN collection whose files of the last flush cannot be read before it reaches the log, as
@@ -1285,6 +1321,31 @@ async fn open_record_segment(
 // The backoff of the reads of SPANN collections, from a retry config as the executor of distributed Chroma builds it.
 fn spann_backoff(retry: &RetryConfig) -> ExponentialBackoff {
     ExponentialBuilder::from(retry).build()
+}
+
+// The segments of a SPANN collection at the files of the last flush that a snapshot of SQLite gives, and the log position
+// of that flush.
+async fn flushed_files(
+    snapshot: &mut MetadataSnapshot,
+    collection_and_segments: &CollectionAndSegments,
+) -> Result<(CollectionAndSegments, u64), ExecutorError> {
+    let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
+    let mut files = snapshot
+        .segment_files(collection_and_segments.collection.collection_id)
+        .await
+        .map_err(internal)?;
+    let flushed = snapshot
+        .max_seq_id(&collection_and_segments.vector_segment.id)
+        .await
+        .map_err(internal)?;
+    let mut collection_and_segments = collection_and_segments.clone();
+    collection_and_segments.record_segment.file_path = files
+        .remove(&collection_and_segments.record_segment.id.to_string())
+        .unwrap_or_default();
+    collection_and_segments.vector_segment.file_path = files
+        .remove(&collection_and_segments.vector_segment.id.to_string())
+        .unwrap_or_default();
+    Ok((collection_and_segments, flushed))
 }
 
 // After a failed read of a SPANN collection, the plan to read again, as the executor of distributed Chroma decides it

@@ -3068,8 +3068,9 @@ impl ServiceBasedFrontend {
             .get_cached_collection_for_tenant(database_name.clone(), collection_id, &tenant_id)
             .await?;
 
-        // The single node indexes every write before it answers: nothing waits. Its log does not count the
-        // operations of a collection, so the operations it reports are the records.
+        // The single node indexes every write to an HNSW collection before it answers: nothing waits. Its log does not
+        // count the operations of a collection, so the operations it reports are the records. A SPANN collection waits for
+        // its flush: the records of the files of its last flush are indexed, those of its log after that flush are not.
         if matches!(self.executor, Executor::Local(_)) {
             let collection_and_segments = Self::get_collection_with_segments_for_tenant(
                 &mut self.collections_with_segments_provider,
@@ -3079,24 +3080,45 @@ impl ServiceBasedFrontend {
             )
             .await
             .map_err(IndexStatusError::Internal)?;
-            let records = Box::pin(self.fan_out_count(
-                tenant_id,
-                collection_and_segments,
-                chroma_types::plan::ReadLevel::default(),
-                0,
-            ))
-            .await
-            .map_err(|err| IndexStatusError::Internal(Box::new(err)))?
-            .count as u64;
+            let spann = if collection_and_segments.vector_segment.r#type == SegmentType::Spann {
+                Box::pin(
+                    self.executor
+                        .spann_indexing_status(&collection_and_segments),
+                )
+                .await
+                .map_err(|err| IndexStatusError::Internal(Box::new(err)))?
+            } else {
+                None
+            };
+            let (num_indexed_ops, num_unindexed_ops) = match spann {
+                Some(status) => status,
+                None => {
+                    let records = Box::pin(self.fan_out_count(
+                        tenant_id,
+                        collection_and_segments,
+                        chroma_types::plan::ReadLevel::default(),
+                        0,
+                    ))
+                    .await
+                    .map_err(|err| IndexStatusError::Internal(Box::new(err)))?
+                    .count as u64;
+                    (records, 0)
+                }
+            };
+            let total_ops = num_indexed_ops + num_unindexed_ops;
             chroma_metering::with_current(|context| {
                 context.latest_collection_logical_size_bytes(0);
                 context.finish_request(Instant::now());
             });
             return Ok(IndexStatusResponse {
-                op_indexing_progress: 1.0,
-                num_unindexed_ops: 0,
-                num_indexed_ops: records,
-                total_ops: records,
+                op_indexing_progress: if total_ops == 0 {
+                    1.0
+                } else {
+                    num_indexed_ops as f32 / total_ops as f32
+                },
+                num_unindexed_ops,
+                num_indexed_ops,
+                total_ops,
             });
         }
 

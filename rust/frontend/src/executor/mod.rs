@@ -130,6 +130,18 @@ impl Executor {
         }
     }
 
+    /// The operations of a SPANN collection of the single node indexed and not indexed: see
+    /// LocalExecutor::spann_indexing_status. Distributed Chroma counts them from its log.
+    pub async fn spann_indexing_status(
+        &mut self,
+        collection: &chroma_types::CollectionAndSegments,
+    ) -> Result<Option<(u64, u64)>, ExecutorError> {
+        match self {
+            Executor::Local(executor) => executor.spann_indexing_status(collection).await.map(Some),
+            Executor::Distributed(_) => Ok(None),
+        }
+    }
+
     pub async fn delete_segments(&mut self, segments: &[Segment]) -> Result<(), ExecutorError> {
         match self {
             Executor::Distributed(_) => Ok(()),
