@@ -10,13 +10,14 @@ use chroma_sqlite::{db::SqliteDb, helpers::get_embeddings_queue_topic_name};
 use chroma_system::{ChannelError, ComponentHandle, RequestError};
 use chroma_types::{
     CollectionUuid, LogRecord, Operation, OperationRecord, ResetError, ResetResponse,
-    ScalarEncoding, ScalarEncodingConversionError, UpdateMetadata, UpdateMetadataValue,
+    ScalarEncoding, ScalarEncodingConversionError, SegmentType, UpdateMetadata,
+    UpdateMetadataValue,
 };
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, SqliteConnection};
-use std::{str::FromStr, sync::OnceLock};
+use std::{str::FromStr, sync::OnceLock, time::Duration};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -438,6 +439,51 @@ impl SqliteLog {
         }
 
         Ok(infos)
+    }
+
+    /// The SPANN collections to flush, oldest first, as the log service of distributed Chroma picks the collections to
+    /// compact (rust/log-service/src/lib.rs, should_compact_at): those whose log holds at least min_compaction_size
+    /// records after the last flush of their SPANN segment, or whose oldest such record has waited at least the timeout.
+    /// The third rule of the log service, a log marked dirty again reinsert_threshold times, has no counterpart here:
+    /// it counts how often wal3 marks the log of a collection dirty again, which this log does not record, and since
+    /// every write carries at least one record, its default of 10 marks means at least 10 records anyway.
+    pub async fn get_spann_collections_to_compact(
+        &mut self,
+        min_compaction_size: u64,
+        timeout: Duration,
+    ) -> Result<Vec<CollectionUuid>, SqliteGetCollectionsWithNewDataError> {
+        let mut results = sqlx::query(
+            r#"
+            SELECT
+                segments.collection AS collection_id
+            FROM segments
+            INNER JOIN embeddings_queue   ON embeddings_queue.topic = CONCAT('persistent://', ?, '/', ?, '/', segments.collection)
+            LEFT JOIN max_seq_id          ON max_seq_id.segment_id  = segments.id
+            WHERE segments.type = ?
+            AND embeddings_queue.seq_id > COALESCE(CAST(max_seq_id.seq_id AS INTEGER), 0)
+            GROUP BY
+                segments.collection
+            HAVING
+                COUNT(*) >= ?
+                OR MIN(embeddings_queue.created_at) <= datetime('now', ?)
+            ORDER BY MIN(embeddings_queue.created_at) ASC
+            "#,
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.topic_namespace)
+        .bind(String::from(SegmentType::Spann))
+        .bind(min_compaction_size as i64) // (SQLite doesn't support u64)
+        .bind(format!("-{} seconds", timeout.as_secs()))
+        .fetch(self.db.get_conn());
+
+        let mut collections = Vec::new();
+        while let Some(row) = results.try_next().await.map_err(WrappedSqlxError)? {
+            collections.push(CollectionUuid::from_str(
+                row.get::<&str, _>("collection_id"),
+            )?);
+        }
+
+        Ok(collections)
     }
 
     pub async fn update_collection_log_offset(

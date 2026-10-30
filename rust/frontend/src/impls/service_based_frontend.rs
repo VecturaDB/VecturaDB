@@ -8,7 +8,7 @@ use backon::{ExponentialBuilder, Retryable};
 use chroma_api_types::{HeartbeatResponse, OccReadMode, OccReadToken, StaleReadError};
 use chroma_config::{registry, Configurable};
 use chroma_error::{status_from_chroma_error, ChromaError, ErrorCodes};
-use chroma_log::{LocalCompactionManager, LocalCompactionManagerConfig, Log, PushLogsError};
+use chroma_log::{LocalCompactionManager, Log, PushLogsError};
 use chroma_metering::{
     CollectionForkContext, CollectionReadContext, CollectionWriteContext, Enterable,
     ExternalCollectionReadContext, FinishRequest, FtsQueryLength, LatestCollectionLogicalSizeBytes,
@@ -3923,7 +3923,7 @@ impl Configurable<(FrontendConfig, System)> for ServiceBasedFrontend {
         // Create compation manager and pass handle to log service if configured
         if let Log::Sqlite(sqlite_log) = &log {
             let compaction_manager =
-                LocalCompactionManager::try_from_config(&LocalCompactionManagerConfig {}, registry)
+                LocalCompactionManager::try_from_config(&config.local_compaction_manager, registry)
                     .await?;
             // TODO: Move this inside LocalCompactionManager::try_from_config, when system is stored in registry
             let handle = system.start_component(compaction_manager);

@@ -3,7 +3,7 @@ use crate::{
     executor::config::{ExecutorConfig, LocalExecutorConfig},
     CollectionsWithSegmentsProviderConfig,
 };
-use chroma_log::config::LogConfig;
+use chroma_log::{config::LogConfig, LocalCompactionManagerConfig};
 use chroma_segment::local_segment_manager::LocalSegmentManagerConfig;
 use chroma_sqlite::config::SqliteDBConfig;
 use chroma_sysdb::{GrpcSysDbConfig, SysDbConfig};
@@ -61,6 +61,9 @@ pub struct FrontendConfig {
     pub collections_with_segments_provider: CollectionsWithSegmentsProviderConfig,
     #[serde(default = "default_log_config")]
     pub log: LogConfig,
+    /// When the SPANN collections of the single node flush their log to their files.
+    #[serde(default)]
+    pub local_compaction_manager: LocalCompactionManagerConfig,
     #[serde(default = "default_executor_config")]
     pub executor: ExecutorConfig,
     #[serde(default = "default_default_knn_index")]
@@ -100,6 +103,7 @@ impl FrontendConfig {
             collections_with_segments_provider: Default::default(),
             mcmr_sysdb: None,
             log: default_log_config(),
+            local_compaction_manager: Default::default(),
             executor: default_executor_config(),
             default_knn_index: default_default_knn_index(),
             tenants_to_migrate_immediately: vec![],

@@ -160,7 +160,7 @@ impl Fixture {
             .unwrap();
         }
         let compactor =
-            LocalCompactionManager::try_from_config(&LocalCompactionManagerConfig {}, &registry)
+            LocalCompactionManager::try_from_config(&LocalCompactionManagerConfig::default(), &registry)
                 .await
                 .unwrap();
         let system = System::new();
