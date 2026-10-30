@@ -300,6 +300,15 @@ pub struct BackfillMessage {
 #[derive(Clone, Debug)]
 pub struct ScheduledCompactMessage {}
 
+/// The flushes of the SPANN collections named, without the thresholds, as a one-off compaction of distributed Chroma
+/// (OneOffCompactMessage, rust/worker/src/compactor/types.rs), which compacts them at its next round even below
+/// min_compaction_size. Here they run at once, one after the other, and the answer is the first failure, if any: the
+/// manager has no queue of jobs to put them in, and the tests that ask for them read the files once they are written.
+#[derive(Clone, Debug)]
+pub struct OneOffCompactMessage {
+    pub collection_ids: Vec<CollectionUuid>,
+}
+
 #[async_trait]
 impl Handler<BackfillMessage> for LocalCompactionManager {
     type Result = Result<(), CompactionManagerError>;
@@ -377,11 +386,10 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
         let mt_max_seq_id = metadata_reader
             .current_max_seq_id(&collection_and_segments.metadata_segment.id)
             .await?;
-        // A SPANN index is at the log position of its last flush, which flush_compaction records.
+        // A SPANN collection takes from the log only the records that its metadata lacks: its files take them at a later
+        // flush (compact_spann_collections), and a read merges those after the last flush with the files.
         let hnsw_max_seq_id = if spann {
-            metadata_reader
-                .current_max_seq_id(&collection_and_segments.vector_segment.id)
-                .await?
+            mt_max_seq_id
         } else {
             hnsw_max_seq_id
         };
@@ -417,20 +425,6 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
         }
         mt_data_chunk.set_visibility(mt_visibility);
         hnsw_data_chunk.set_visibility(hnsw_visibility);
-        // As the flush of distributed Chroma, which changes every segment of a collection at once: the files of a SPANN
-        // collection are written first, and its records go to SQLite in the transaction that records those files, so a
-        // read in one transaction sees them at the same flush.
-        let spann_flush = match spann {
-            true => {
-                self.write_spann(
-                    &collection_and_segments,
-                    dim as usize,
-                    hnsw_data_chunk.clone(),
-                )
-                .await?
-            }
-            false => None,
-        };
         // Apply the records to the metadata writer.
         let metadata_writer = SqliteMetadataWriter::new(self.sqlite_db.clone());
         let mut tx = metadata_writer
@@ -462,52 +456,10 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
                     .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
             }
         }
-        if let Some(flush) = &spann_flush {
-            chroma_sysdb::sqlite::flush_compaction_in(
-                &mut *tx,
-                collection_and_segments.collection.collection_id,
-                flush.log_position,
-                collection_and_segments.collection.version,
-                &[
-                    SegmentFlushInfo {
-                        segment_id: collection_and_segments.record_segment.id,
-                        file_paths: flush.record_files.clone(),
-                    },
-                    SegmentFlushInfo {
-                        segment_id: collection_and_segments.vector_segment.id,
-                        file_paths: flush.vector_files.clone(),
-                    },
-                ],
-                None,
-            )
-            .await
-            .map_err(|err| CompactionManagerError::SpannWriteError(err.boxed()))?;
-        }
         tx.commit()
             .await
             .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
         if spann {
-            if let Some(flush) = spann_flush {
-                let mut record_segment = collection_and_segments.record_segment.clone();
-                record_segment.file_path = flush.record_files.clone();
-                for (segment, files) in [
-                    (&collection_and_segments.record_segment, flush.record_files),
-                    (&collection_and_segments.vector_segment, flush.vector_files),
-                ] {
-                    if let Err(err) = self
-                        .remove_replaced_versions(
-                            &collection_and_segments.collection,
-                            segment,
-                            files,
-                        )
-                        .await
-                    {
-                        tracing::warn!(error = %err, "SPANN flush done; the files of older versions stay for the next flush");
-                    }
-                }
-                self.hnsw_segment_manager
-                    .spann_flushed(message.collection_id, record_segment);
-            }
             self.hnsw_segment_manager
                 .set_spann_applied(message.collection_id, true);
             return Ok(());
@@ -578,6 +530,25 @@ impl Handler<ScheduledCompactMessage> for LocalCompactionManager {
                 ))
             },
         );
+    }
+}
+
+#[async_trait]
+impl Handler<OneOffCompactMessage> for LocalCompactionManager {
+    type Result = Result<(), CompactionManagerError>;
+
+    async fn handle(
+        &mut self,
+        message: OneOffCompactMessage,
+        _: &ComponentContext<LocalCompactionManager>,
+    ) -> Self::Result {
+        let mut failure = None;
+        for collection_id in message.collection_ids {
+            if let Err(err) = self.flush_spann_collection(collection_id).await {
+                failure.get_or_insert(err);
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 }
 

@@ -127,8 +127,8 @@ fn update_metadata_of(i: usize, numbers: &mut Numbers) -> UpdateMetadata {
 }
 
 // A SPANN collection with a sparse index on SPARSE_KEY and the records given with a document and metadata, added in
-// four writes, each with its flush; then a delete and an upsert, so that the offsets of the record segment are not the
-// rows of SQLite.
+// four writes, each with its flush; then a delete and an upsert, each with its flush too, so that the offsets of the
+// record segment are not the rows of SQLite.
 async fn collection_to_search(
     frontend: &mut ServiceBasedFrontend,
     numbers: &mut Numbers,
@@ -189,6 +189,7 @@ async fn collection_to_search(
             )
             .await
             .unwrap();
+        flush_spann(frontend, collection_id).await;
     }
     frontend
         .delete(
@@ -205,6 +206,7 @@ async fn collection_to_search(
         )
         .await
         .unwrap();
+    flush_spann(frontend, collection_id).await;
     frontend
         .upsert(
             UpsertCollectionRecordsRequest::try_new(
@@ -227,6 +229,7 @@ async fn collection_to_search(
         )
         .await
         .unwrap();
+    flush_spann(frontend, collection_id).await;
     collection_id
 }
 

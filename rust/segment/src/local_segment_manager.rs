@@ -458,9 +458,10 @@ impl LocalSegmentManager {
         self.spann_provider.as_ref()
     }
 
-    /// Whether the log of a SPANN collection is applied, as replay_complete for a local HNSW index: the compaction
-    /// clears it when it starts on the log of the collection and sets it once the records are in SQLite and in the files
-    /// of a flush. A read of a collection whose log is applied has nothing to replay. None is applied after a start.
+    /// Whether the log of a SPANN collection is applied to its metadata, as replay_complete for a local HNSW index: the
+    /// compaction clears it when it starts on the log of the collection and sets it once the records are in SQLite. The
+    /// files take them at a later flush. A read of a collection whose log is applied has nothing to replay. None is
+    /// applied after a start.
     pub fn spann_applied(&self, collection_id: CollectionUuid) -> bool {
         self.spann_applied
             .lock()

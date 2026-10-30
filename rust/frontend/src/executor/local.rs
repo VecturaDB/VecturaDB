@@ -465,8 +465,8 @@ impl LocalExecutor {
         Ok(())
     }
 
-    // The log of a SPANN collection replayed, unless the compaction has applied all of it: a read of an HNSW index
-    // replays nothing once its replay is complete, the same.
+    // The log of a SPANN collection applied to its metadata, unless the compaction has applied all of it: a read of an
+    // HNSW index replays nothing once its replay is complete, the same.
     async fn spann_replay(
         &mut self,
         collection_and_segments: &CollectionAndSegments,
@@ -1978,6 +1978,24 @@ impl LocalExecutor {
     /// The manager of the segments, whose cleanup of SPANN files the tests call.
     pub(crate) fn segment_manager(&self) -> &LocalSegmentManager {
         &self.hnsw_manager
+    }
+
+    /// A flush of a SPANN collection at once, whatever the thresholds: see OneOffCompactMessage.
+    pub(crate) async fn flush_spann(
+        &self,
+        collection_id: chroma_types::CollectionUuid,
+    ) -> Result<(), Box<dyn ChromaError>> {
+        self.compactor_handle
+            .clone()
+            .request(
+                chroma_log::OneOffCompactMessage {
+                    collection_ids: vec![collection_id],
+                },
+                None,
+            )
+            .await
+            .map_err(|err| err.boxed())?
+            .map_err(|err| err.boxed())
     }
 }
 

@@ -4428,6 +4428,14 @@ mod tests {
             .unwrap()
     }
 
+    // A timer that flushes no SPANN collection while a test runs: the tests flush with flush_spann, where they need it.
+    fn no_timer_flush() -> chroma_log::LocalCompactionManagerConfig {
+        chroma_log::LocalCompactionManagerConfig {
+            compaction_interval_sec: 3600,
+            ..Default::default()
+        }
+    }
+
     // A single node on a data path, with SPANN collections when spann is on.
     async fn frontend_with_spann(root: &std::path::Path, spann: bool) -> ServiceBasedFrontend {
         frontend_with_spann_registry(root, spann, &Registry::new()).await
@@ -4467,6 +4475,7 @@ mod tests {
             Some(root.join("chroma.sqlite3").to_str().unwrap().into());
         config.segment_manager.as_mut().unwrap().persist_path = Some(root.to_str().unwrap().into());
         config.executor = crate::executor::config::ExecutorConfig::Local(executor);
+        config.local_compaction_manager = no_timer_flush();
         ServiceBasedFrontend::try_from_config(&(config, system), registry)
             .await
             .unwrap()
@@ -4664,6 +4673,8 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // The deletes below stay in the log: the reads take them from there, before and after the restart.
+        flush_spann(&frontend, collection_id).await;
         let segments = frontend
             .sysdb_client
             .get_collection_with_segments(None, collection_id)
@@ -4783,6 +4794,7 @@ mod tests {
                 capacity: 100,
                 ..Default::default()
             });
+        config.local_compaction_manager = no_timer_flush();
         let records = (0..200)
             .map(|i| {
                 let x = i as f32;
@@ -4825,6 +4837,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            flush_spann(&frontend, collection_id).await;
             // Each query reads the records of every add so far.
             let written = &records[..100 * (round + 1)];
             let query = written.last().unwrap().1.clone();
@@ -5147,6 +5160,7 @@ mod tests {
             )
             .await
             .unwrap();
+        flush_spann(frontend, collection_id).await;
         collection_id
     }
 
@@ -5266,10 +5280,10 @@ mod tests {
             &segment_prefix(&files),
             true,
         );
-        tokio::time::timeout(
-            STOP_WAIT,
-            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
-        )
+        tokio::time::timeout(STOP_WAIT, async {
+            add_and_flush(&mut frontend, collection_id, 10..11, "r").await;
+            flush_spann(&frontend, collection_id).await;
+        })
         .await
         .unwrap();
         assert!(count.load(std::sync::atomic::Ordering::SeqCst) >= 2);
@@ -5459,6 +5473,7 @@ mod tests {
             .await
             .unwrap()
             .collection_id;
+        flush_spann(&frontend, fork).await;
         let files = |segments: &CollectionAndSegments| {
             segments
                 .record_segment
@@ -5559,6 +5574,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
+        // A write and a flush of it, one version each.
         let write =
             |frontend: &mut ServiceBasedFrontend, collection_id, chunk: &[(String, Vec<f32>)]| {
                 let mut frontend = frontend.clone();
@@ -5573,7 +5589,10 @@ mod tests {
                     None,
                 )
                 .unwrap();
-                async move { frontend.add(request).await.unwrap() }
+                async move {
+                    frontend.add(request).await.unwrap();
+                    flush_spann(&frontend, collection_id).await;
+                }
             };
         let create = |frontend: &mut ServiceBasedFrontend| {
             let mut frontend = frontend.clone();
@@ -5906,8 +5925,9 @@ mod tests {
             .unwrap();
     }
 
-    // Records with a document each, under the prefix, with the vectors of their numbers.
-    async fn add_with_documents(
+    // Records with a document each, under the prefix, with the vectors of their numbers, then flushed to the files of a
+    // SPANN collection; an HNSW collection has no flush.
+    async fn add_and_flush(
         frontend: &mut ServiceBasedFrontend,
         collection_id: CollectionUuid,
         numbers: std::ops::Range<usize>,
@@ -5938,6 +5958,7 @@ mod tests {
             )
             .await
             .unwrap();
+        flush_spann(frontend, collection_id).await;
     }
 
     // What reads see while one writer adds and deletes records of the same collection: every record that a query, a
@@ -5963,14 +5984,14 @@ mod tests {
             .await
             .unwrap()
             .collection_id;
-        add_with_documents(&mut frontend, collection_id, 0..200, "r").await;
+        add_and_flush(&mut frontend, collection_id, 0..200, "r").await;
         let done = std::sync::Arc::new(AtomicBool::new(false));
         let writer = {
             let mut frontend = frontend.clone();
             let done = done.clone();
             async move {
                 for round in 0..rounds {
-                    add_with_documents(&mut frontend, collection_id, round..round + 1, "w").await;
+                    add_and_flush(&mut frontend, collection_id, round..round + 1, "w").await;
                     frontend
                         .delete(
                             DeleteCollectionRecordsRequest::try_new(
@@ -5986,6 +6007,7 @@ mod tests {
                         )
                         .await
                         .unwrap();
+                    flush_spann(&frontend, collection_id).await;
                 }
                 done.store(true, Ordering::SeqCst);
             }
@@ -6568,7 +6590,7 @@ mod tests {
             .await
             .unwrap()
             .collection_id;
-        add_with_documents(frontend, collection_id, 0..10, "r").await;
+        add_and_flush(frontend, collection_id, 0..10, "r").await;
         collection_id
     }
 
@@ -6618,6 +6640,7 @@ mod tests {
                     )
                     .await
                     .unwrap();
+                flush_spann(&frontend, collection_id).await;
             }
         });
         let written = tokio::time::timeout(STOP_WAIT, &mut writing).await;
@@ -6768,7 +6791,7 @@ mod tests {
         }
         if tokio::time::timeout(
             STOP_WAIT,
-            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+            add_and_flush(&mut frontend, collection_id, 10..11, "r"),
         )
         .await
         .is_err()
@@ -7005,6 +7028,14 @@ mod tests {
         }
     }
 
+    // The flush of a SPANN collection that the timer runs, at once: the files take the records of its log.
+    async fn flush_spann(frontend: &ServiceBasedFrontend, collection_id: CollectionUuid) {
+        local_executor(frontend)
+            .flush_spann(collection_id)
+            .await
+            .unwrap();
+    }
+
     // The openings after a flush that ended for the collection: the files of each, and whether it opened them.
     fn warm_ups(
         collection_id: CollectionUuid,
@@ -7094,7 +7125,7 @@ mod tests {
             .await
             .unwrap();
         let ended = warm_up_end(collection_id);
-        add_with_documents(&mut frontend, collection_id, 10..11, "r").await;
+        add_and_flush(&mut frontend, collection_id, 10..11, "r").await;
         tokio::time::timeout(STOP_WAIT, ended)
             .await
             .unwrap()
@@ -7131,7 +7162,7 @@ mod tests {
         let ended = warm_up_end(collection_id);
         tokio::time::timeout(
             STOP_WAIT,
-            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+            add_and_flush(&mut frontend, collection_id, 10..11, "r"),
         )
         .await
         .unwrap();
@@ -7161,7 +7192,7 @@ mod tests {
         spann_read(&mut frontend, other, SpannRead::Get)
             .await
             .unwrap();
-        add_with_documents(&mut frontend, other, 10..11, "r").await;
+        add_and_flush(&mut frontend, other, 10..11, "r").await;
         match spann_read(&mut frontend, other, SpannRead::Get).await {
             Ok(ReadAnswer::Records(records)) => assert_eq!(records[0].len(), 11),
             answer => panic!("the new collection answered {answer:?}"),
@@ -7189,7 +7220,7 @@ mod tests {
         let ended = warm_up_end(collection_id);
         tokio::time::timeout(
             STOP_WAIT,
-            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+            add_and_flush(&mut frontend, collection_id, 10..11, "r"),
         )
         .await
         .unwrap();
@@ -7208,7 +7239,7 @@ mod tests {
             .unwrap();
             tokio::time::timeout(
                 STOP_WAIT,
-                add_with_documents(&mut frontend, collection_id, i..i + 1, "r"),
+                add_and_flush(&mut frontend, collection_id, i..i + 1, "r"),
             )
             .await
             .unwrap();
@@ -7250,7 +7281,7 @@ mod tests {
         let ended = warm_up_end(collection_id);
         tokio::time::timeout(
             STOP_WAIT,
-            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+            add_and_flush(&mut frontend, collection_id, 10..11, "r"),
         )
         .await
         .unwrap();
@@ -7294,7 +7325,7 @@ mod tests {
         let ended = warm_up_end(collection_id);
         tokio::time::timeout(
             STOP_WAIT,
-            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+            add_and_flush(&mut frontend, collection_id, 10..11, "r"),
         )
         .await
         .unwrap();
@@ -7304,7 +7335,7 @@ mod tests {
             .unwrap();
         tokio::time::timeout(
             STOP_WAIT,
-            add_with_documents(&mut frontend, collection_id, 11..12, "r"),
+            add_and_flush(&mut frontend, collection_id, 11..12, "r"),
         )
         .await
         .unwrap();
@@ -7329,19 +7360,19 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut frontend = frontend_with_spann(root.path(), true).await;
         let collection_id = collection_to_stop(&mut frontend).await;
-        add_with_documents(&mut frontend, collection_id, 10..11, "r").await;
+        add_and_flush(&mut frontend, collection_id, 10..11, "r").await;
         assert!(!warm_up_seen(&frontend, collection_id));
         spann_read(&mut frontend, collection_id, SpannRead::Get)
             .await
             .unwrap();
         let ended = warm_up_end(collection_id);
-        add_with_documents(&mut frontend, collection_id, 11..12, "r").await;
+        add_and_flush(&mut frontend, collection_id, 11..12, "r").await;
         tokio::time::timeout(STOP_WAIT, ended)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(warm_ups(collection_id).len(), 1);
-        add_with_documents(&mut frontend, collection_id, 12..13, "r").await;
+        add_and_flush(&mut frontend, collection_id, 12..13, "r").await;
         assert!(!local_executor(&frontend).spann_warm_up_runs(collection_id));
         assert_eq!(warm_ups(collection_id).len(), 1);
     }
@@ -7368,11 +7399,11 @@ mod tests {
                 .await
                 .unwrap()
                 .collection_id;
-            add_with_documents(&mut frontend, collection_id, 0..10, "r").await;
+            add_and_flush(&mut frontend, collection_id, 0..10, "r").await;
             spann_read(&mut frontend, collection_id, SpannRead::Get)
                 .await
                 .unwrap();
-            add_with_documents(&mut frontend, collection_id, 10..11, "r").await;
+            add_and_flush(&mut frontend, collection_id, 10..11, "r").await;
             assert!(!warm_up_seen(&frontend, collection_id), "spann {spann}");
         }
     }
@@ -7398,7 +7429,7 @@ mod tests {
         let ended = warm_up_end(collection_id);
         tokio::time::timeout(
             STOP_WAIT,
-            add_with_documents(&mut frontend, collection_id, 10..11, "r"),
+            add_and_flush(&mut frontend, collection_id, 10..11, "r"),
         )
         .await
         .unwrap();
@@ -7468,6 +7499,7 @@ mod tests {
             )
             .await
             .unwrap();
+        flush_spann(&frontend, collection_id).await;
         let segments = frontend
             .sysdb_client
             .get_collection_with_segments(None, collection_id)
@@ -7540,6 +7572,7 @@ mod tests {
             )
             .await
             .unwrap();
+        flush_spann(&frontend, collection_id).await;
         let number = |id: &str| id[1..].parse::<usize>().unwrap();
         let get = frontend
             .get(
