@@ -579,3 +579,514 @@ async fn the_timer_flushes_every_compaction_interval_impl() {
     );
     assert!(!vector_files(&mut frontend, collection_id).await.is_empty());
 }
+
+// One record added to a collection, with its vector and its document, and no flush.
+async fn add_one(
+    frontend: &mut ServiceBasedFrontend,
+    collection_id: CollectionUuid,
+    id: &str,
+    vector: Vec<f32>,
+    document: &str,
+) {
+    frontend
+        .add(
+            AddCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                vec![id.to_string()],
+                vec![vector],
+                Some(vec![Some(document.to_string())]),
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+// The records given deleted from a collection, without a flush.
+async fn delete_ids(
+    frontend: &mut ServiceBasedFrontend,
+    collection_id: CollectionUuid,
+    ids: Vec<String>,
+) {
+    frontend
+        .delete(
+            DeleteCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                Some(ids),
+                None,
+                None,
+            )
+            .unwrap(),
+            String::new(),
+        )
+        .await
+        .unwrap();
+}
+
+// What the reads of a collection answer otherwise than the records given, by id, and their number.
+async fn reads_differ_from(
+    frontend: &mut ServiceBasedFrontend,
+    collection_id: CollectionUuid,
+    expected: &[ReadRecord],
+) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for read in READS {
+        match spann_read(frontend, collection_id, read).await {
+            Ok(ReadAnswer::Records(lists)) => {
+                for list in lists {
+                    if list != expected {
+                        wrong.push(format!("{read:?}: {list:?}"));
+                    }
+                }
+            }
+            Ok(ReadAnswer::Count(count)) if count as usize == expected.len() => {}
+            Ok(ReadAnswer::Count(count)) => wrong.push(format!("{read:?}: {count}")),
+            Err(err) => wrong.push(format!("{read:?}: {err}")),
+        }
+    }
+    wrong
+}
+
+// The ids that a get of a collection answers, with the filter, the limit and the offset given.
+async fn get_ids(
+    frontend: &mut ServiceBasedFrontend,
+    collection_id: CollectionUuid,
+    where_clause: Option<chroma_types::Where>,
+    limit: Option<u32>,
+    offset: u32,
+) -> Vec<String> {
+    frontend
+        .get(
+            GetRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                None,
+                where_clause,
+                limit,
+                offset,
+                chroma_types::IncludeList(vec![]),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .ids
+}
+
+// A SPANN collection deleted with records in its log takes them with it: its deletion removes its log, and the next round
+// of the timer flushes the other collection and finds nothing of it.
+#[test]
+fn a_spann_collection_deleted_with_a_log_leaves_nothing_to_flush() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_spann_collection_deleted_with_a_log_leaves_nothing_to_flush_impl,
+    )
+}
+
+async fn a_spann_collection_deleted_with_a_log_leaves_nothing_to_flush_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = Registry::new();
+    let mut frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+    let deleted = empty_spann_collection(&mut frontend, "deleted").await;
+    let kept = empty_spann_collection(&mut frontend, "kept").await;
+    add_numbers(&mut frontend, deleted, 0..12).await;
+    add_numbers(&mut frontend, kept, 0..12).await;
+    frontend
+        .delete_collection(delete_collection_request("deleted"))
+        .await
+        .unwrap();
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM embeddings_queue WHERE topic LIKE ?")
+        .bind(format!("%{deleted}"))
+        .fetch_one(registry.get::<SqliteDb>().unwrap().get_conn())
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+    local_executor(&frontend).compaction_round().await.unwrap();
+    assert_eq!(status(&mut frontend, kept).await, (1.0, 0, 12, 12));
+    assert!(files_under(root.path().join("tenant").as_path())
+        .iter()
+        .all(|file| !file.to_string_lossy().contains(&deleted.to_string())));
+}
+
+// One round of the timer flushes every SPANN collection over its thresholds, one after the other, and leaves an HNSW
+// collection as it is.
+#[test]
+fn a_round_of_the_timer_flushes_every_spann_collection_over_its_thresholds() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_round_of_the_timer_flushes_every_spann_collection_over_its_thresholds_impl,
+    )
+}
+
+async fn a_round_of_the_timer_flushes_every_spann_collection_over_its_thresholds_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let first = empty_spann_collection(&mut frontend, "first").await;
+    let second = empty_spann_collection(&mut frontend, "second").await;
+    let hnsw = create_collection_for(&mut frontend, TENANT, DATABASE, "hnsw")
+        .await
+        .collection_id;
+    add_numbers(&mut frontend, first, 0..10).await;
+    add_numbers(&mut frontend, second, 0..15).await;
+    add_numbers(&mut frontend, hnsw, 0..12).await;
+    local_executor(&frontend).compaction_round().await.unwrap();
+    assert_eq!(status(&mut frontend, first).await, (1.0, 0, 10, 10));
+    assert_eq!(status(&mut frontend, second).await, (1.0, 0, 15, 15));
+    assert_eq!(status(&mut frontend, hnsw).await, (1.0, 0, 12, 12));
+    assert_eq!(get_ids(&mut frontend, hnsw, None, None, 0).await.len(), 12);
+}
+
+// A record that the log changes thirty times answers its last change, before and after the flush, among thirty records
+// that the log adds.
+#[test]
+fn a_record_changed_many_times_in_the_log_answers_its_last_change() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_record_changed_many_times_in_the_log_answers_its_last_change_impl,
+    )
+}
+
+async fn a_record_changed_many_times_in_the_log_answers_its_last_change_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let collection_id = collection_to_stop(&mut frontend).await;
+    for write in 1..=30 {
+        write_to_stop(&mut frontend, collection_id, write).await;
+    }
+    let before = reads_differ(&mut frontend, collection_id, 30).await;
+    assert!(before.is_empty(), "before the flush: {before:#?}");
+    flush_spann(&frontend, collection_id).await;
+    let after = reads_differ(&mut frontend, collection_id, 30).await;
+    assert!(after.is_empty(), "after the flush: {after:#?}");
+    assert_eq!(status(&mut frontend, collection_id).await, (1.0, 0, 40, 40));
+}
+
+// A record that the log adds and deletes is not read, and a record of the files that the log deletes and adds again
+// answers as the log adds it, before and after the flush.
+#[test]
+fn records_added_and_deleted_in_the_log_answer_as_the_log_leaves_them() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        records_added_and_deleted_in_the_log_answer_as_the_log_leaves_them_impl,
+    )
+}
+
+async fn records_added_and_deleted_in_the_log_answer_as_the_log_leaves_them_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let collection_id = collection_to_stop(&mut frontend).await;
+    add_one(
+        &mut frontend,
+        collection_id,
+        "x",
+        vec![0.5, 0.5],
+        "document x",
+    )
+    .await;
+    delete_ids(&mut frontend, collection_id, vec!["x".to_string()]).await;
+    delete_ids(&mut frontend, collection_id, vec!["r3".to_string()]).await;
+    add_one(
+        &mut frontend,
+        collection_id,
+        "r3",
+        vec![30.0, 30.0],
+        "document r3 again",
+    )
+    .await;
+    let mut expected = records_after(0);
+    expected[3] = (
+        "r3".to_string(),
+        Some("document r3 again".to_string()),
+        Some(vec![30.0, 30.0]),
+    );
+    let before = reads_differ_from(&mut frontend, collection_id, &expected).await;
+    assert!(before.is_empty(), "before the flush: {before:#?}");
+    flush_spann(&frontend, collection_id).await;
+    let after = reads_differ_from(&mut frontend, collection_id, &expected).await;
+    assert!(after.is_empty(), "after the flush: {after:#?}");
+}
+
+// A collection whose records the log deletes, all of them, reads none, counts none, and its indexing status waits for the
+// deletes; after the flush it holds nothing.
+#[test]
+fn a_spann_collection_whose_log_deletes_every_record_reads_none() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_spann_collection_whose_log_deletes_every_record_reads_none_impl,
+    )
+}
+
+async fn a_spann_collection_whose_log_deletes_every_record_reads_none_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let collection_id = collection_to_stop(&mut frontend).await;
+    delete_ids(
+        &mut frontend,
+        collection_id,
+        (0..10).map(|i| format!("r{i}")).collect(),
+    )
+    .await;
+    let before = reads_differ_from(&mut frontend, collection_id, &[]).await;
+    assert!(before.is_empty(), "before the flush: {before:#?}");
+    assert_eq!(
+        status(&mut frontend, collection_id).await,
+        (0.5, 10, 10, 20)
+    );
+    flush_spann(&frontend, collection_id).await;
+    let after = reads_differ_from(&mut frontend, collection_id, &[]).await;
+    assert!(after.is_empty(), "after the flush: {after:#?}");
+    assert_eq!(status(&mut frontend, collection_id).await, (1.0, 0, 0, 0));
+}
+
+// The filters of a get and of a query by metadata and by document read the records of the log with those of the files,
+// as they read SQLite, which holds both.
+#[test]
+fn the_filters_of_a_spann_read_take_the_records_of_the_log() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        the_filters_of_a_spann_read_take_the_records_of_the_log_impl,
+    )
+}
+
+async fn the_filters_of_a_spann_read_take_the_records_of_the_log_impl() {
+    use chroma_types::{
+        DocumentExpression, DocumentOperator, MetadataComparison, MetadataExpression,
+        PrimitiveOperator, Where,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let collection_id = empty_spann_collection(&mut frontend, "filters").await;
+    let add = |numbers: std::ops::Range<usize>| {
+        AddCollectionRecordsRequest::try_new(
+            TENANT.to_string(),
+            DATABASE.to_string(),
+            collection_id,
+            numbers.clone().map(|i| format!("r{i}")).collect(),
+            numbers
+                .clone()
+                .map(|i| vec![i as f32, (i as f32).sin()])
+                .collect(),
+            Some(
+                numbers
+                    .clone()
+                    .map(|i| Some(format!("document r{i}")))
+                    .collect(),
+            ),
+            None,
+            Some(
+                numbers
+                    .map(|i| {
+                        Some(chroma_types::Metadata::from([(
+                            "n".to_string(),
+                            MetadataValue::Int(i as i64),
+                        )]))
+                    })
+                    .collect(),
+            ),
+        )
+        .unwrap()
+    };
+    frontend.add(add(0..10)).await.unwrap();
+    flush_spann(&frontend, collection_id).await;
+    frontend.add(add(10..15)).await.unwrap();
+    let at_least = |n: i64| {
+        Where::Metadata(MetadataExpression {
+            key: "n".to_string(),
+            comparison: MetadataComparison::Primitive(
+                PrimitiveOperator::GreaterThanOrEqual,
+                MetadataValue::Int(n),
+            ),
+        })
+    };
+    assert_eq!(
+        get_ids(&mut frontend, collection_id, Some(at_least(8)), None, 0).await,
+        (8..15).map(|i| format!("r{i}")).collect::<Vec<_>>()
+    );
+    let contains = Where::Document(DocumentExpression {
+        operator: DocumentOperator::Contains,
+        pattern: "r12".to_string(),
+    });
+    assert_eq!(
+        get_ids(&mut frontend, collection_id, Some(contains), None, 0).await,
+        vec!["r12".to_string()]
+    );
+    let mut nearest = frontend
+        .query(
+            QueryRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                None,
+                Some(at_least(12)),
+                vec![vec![0.0, 0.0]],
+                10,
+                chroma_types::IncludeList::default_query(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .ids
+        .remove(0);
+    nearest.sort();
+    assert_eq!(nearest, vec!["r12", "r13", "r14"]);
+}
+
+// A get with a limit and an offset takes its page across the records of the files and those of the log, in the order of
+// the rows of SQLite.
+#[test]
+fn a_spann_get_pages_across_the_files_and_the_log() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_spann_get_pages_across_the_files_and_the_log_impl,
+    )
+}
+
+async fn a_spann_get_pages_across_the_files_and_the_log_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let collection_id = collection_to_stop(&mut frontend).await;
+    add_numbers(&mut frontend, collection_id, 10..15).await;
+    assert_eq!(
+        get_ids(&mut frontend, collection_id, None, Some(4), 8).await,
+        vec!["r8", "r9", "r10", "r11"]
+    );
+}
+
+// A fork of a SPANN collection with records in its log copies them too, as the reads of the source give them, and its
+// own flush keeps them; the source keeps its own.
+#[test]
+fn a_fork_of_a_spann_collection_takes_the_records_of_its_log() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_fork_of_a_spann_collection_takes_the_records_of_its_log_impl,
+    )
+}
+
+async fn a_fork_of_a_spann_collection_takes_the_records_of_its_log_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let source = collection_to_stop(&mut frontend).await;
+    for write in 1..=2 {
+        write_to_stop(&mut frontend, source, write).await;
+    }
+    let fork = frontend
+        .fork_collection(
+            ForkCollectionRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                source,
+                "stops-fork".to_string(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .collection_id;
+    let forked = reads_differ(&mut frontend, fork, 2).await;
+    assert!(forked.is_empty(), "the fork: {forked:#?}");
+    flush_spann(&frontend, fork).await;
+    let flushed = reads_differ(&mut frontend, fork, 2).await;
+    assert!(flushed.is_empty(), "the fork after its flush: {flushed:#?}");
+    let kept = reads_differ(&mut frontend, source, 2).await;
+    assert!(kept.is_empty(), "the source: {kept:#?}");
+}
+
+// A reset with records in the log of a SPANN collection leaves a server whose new SPANN collection writes, reads and
+// flushes, with no file of the old one.
+#[test]
+fn a_reset_with_a_spann_log_leaves_a_server_that_writes_and_flushes() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_reset_with_a_spann_log_leaves_a_server_that_writes_and_flushes_impl,
+    )
+}
+
+async fn a_reset_with_a_spann_log_leaves_a_server_that_writes_and_flushes_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = FrontendConfig::sqlite_in_memory();
+    config.allow_reset = true;
+    config.sqlitedb.as_mut().unwrap().url =
+        Some(root.path().join("chroma.sqlite3").to_str().unwrap().into());
+    config.segment_manager.as_mut().unwrap().persist_path =
+        Some(root.path().to_str().unwrap().into());
+    config.executor = crate::executor::config::ExecutorConfig::Local(
+        crate::executor::config::LocalExecutorConfig {
+            spann: true,
+            ..Default::default()
+        },
+    );
+    config.local_compaction_manager = no_timer_flush();
+    let mut frontend =
+        ServiceBasedFrontend::try_from_config(&(config, System::new()), &Registry::new())
+            .await
+            .unwrap();
+    let before = empty_spann_collection(&mut frontend, "before").await;
+    add_numbers(&mut frontend, before, 0..12).await;
+    frontend.reset().await.unwrap();
+    let after = empty_spann_collection(&mut frontend, "after").await;
+    add_numbers(&mut frontend, after, 0..12).await;
+    local_executor(&frontend).compaction_round().await.unwrap();
+    assert_eq!(status(&mut frontend, after).await, (1.0, 0, 12, 12));
+    assert_eq!(get_ids(&mut frontend, after, None, None, 0).await.len(), 12);
+    assert!(files_under(root.path().join("tenant").as_path())
+        .iter()
+        .all(|file| !file.to_string_lossy().contains(&before.to_string())));
+}
+
+// With the option spann off, a SPANN collection with records in its log still reads them, refuses a write, and the timer
+// flushes them, as the replay of its log on a read flushed them before the timer: the files take the writes that the
+// server accepted with the option on.
+#[test]
+fn with_the_option_off_a_spann_collection_reads_and_flushes_its_log() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        with_the_option_off_a_spann_collection_reads_and_flushes_its_log_impl,
+    )
+}
+
+async fn with_the_option_off_a_spann_collection_reads_and_flushes_its_log_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let collection_id = collection_to_stop(&mut frontend).await;
+    for write in 1..=6 {
+        write_to_stop(&mut frontend, collection_id, write).await;
+    }
+    drop(frontend);
+    let mut off = frontend_with_spann(root.path(), false).await;
+    let read = reads_differ(&mut off, collection_id, 6).await;
+    assert!(read.is_empty(), "with the option off: {read:#?}");
+    let written = off
+        .add(
+            AddCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                vec!["refused".to_string()],
+                vec![vec![0.5, 0.5]],
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .await;
+    assert!(
+        written
+            .as_ref()
+            .is_err_and(|err| err.to_string().contains("need the executor option spann")),
+        "{:?}",
+        written.as_ref().err().map(ToString::to_string)
+    );
+    local_executor(&off).compaction_round().await.unwrap();
+    assert_eq!(status(&mut off, collection_id).await, (1.0, 0, 16, 16));
+    let flushed = reads_differ(&mut off, collection_id, 6).await;
+    assert!(flushed.is_empty(), "after the flush: {flushed:#?}");
+}
