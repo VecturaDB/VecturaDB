@@ -17,6 +17,9 @@ mod distributed;
 pub mod local;
 
 //////////////////////// Main Types ////////////////////////
+// A frontend has one executor, which its clones copy: the local one, larger than the distributed one, costs the copy of
+// about a kilobyte more, less than the allocation of a Box at each clone.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum Executor {
     Distributed(DistributedExecutor),
