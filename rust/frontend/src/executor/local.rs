@@ -2041,6 +2041,16 @@ impl LocalExecutor {
         &self.hnsw_manager
     }
 
+    /// A round of the timer of the flushes, at once, with its thresholds: see ScheduledCompactMessage. As every round, it
+    /// schedules the next one.
+    pub(crate) async fn compaction_round(&self) -> Result<(), Box<dyn ChromaError>> {
+        self.compactor_handle
+            .clone()
+            .request(chroma_log::ScheduledCompactMessage {}, None)
+            .await
+            .map_err(|err| err.boxed())
+    }
+
     /// A flush of a SPANN collection at once, whatever the thresholds: see OneOffCompactMessage.
     pub(crate) async fn flush_spann(
         &self,

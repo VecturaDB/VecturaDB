@@ -303,6 +303,33 @@ mod tests {
         }
     }
 
+    // The timer of the flushes of SPANN collections reads local_compaction_manager, with the defaults of distributed
+    // Chroma for what it leaves out.
+    #[test]
+    fn local_compaction_manager_takes_the_defaults_of_distributed_chroma() {
+        use figment::providers::{Format, Yaml};
+        let read = |yaml: &str| {
+            let config = figment::Figment::from(Yaml::string(yaml))
+                .extract::<super::FrontendConfig>()
+                .unwrap()
+                .local_compaction_manager;
+            (
+                config.compaction_interval_sec,
+                config.min_compaction_size,
+                config.max_compaction_size,
+                config.timeout_us,
+            )
+        };
+        assert_eq!(
+            read("allow_reset: false\n"),
+            (10, 10, 10_000, 86_400_000_000)
+        );
+        assert_eq!(
+            read("local_compaction_manager:\n  compaction_interval_sec: 30\n  max_compaction_size: 500\n"),
+            (30, 10, 500, 86_400_000_000)
+        );
+    }
+
     #[test]
     fn single_node_full_config_valid() {
         let config = FrontendServerConfig::load_from_path("sample_configs/single_node_full.yaml");

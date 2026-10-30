@@ -4491,13 +4491,23 @@ mod tests {
         executor: crate::executor::config::LocalExecutorConfig,
         registry: &Registry,
     ) -> ServiceBasedFrontend {
+        frontend_with_flushes(root, executor, no_timer_flush(), registry).await
+    }
+
+    // The same, with the timer of the flushes of SPANN collections given.
+    async fn frontend_with_flushes(
+        root: &std::path::Path,
+        executor: crate::executor::config::LocalExecutorConfig,
+        flushes: chroma_log::LocalCompactionManagerConfig,
+        registry: &Registry,
+    ) -> ServiceBasedFrontend {
         let system = System::new();
         let mut config = FrontendConfig::sqlite_in_memory();
         config.sqlitedb.as_mut().unwrap().url =
             Some(root.join("chroma.sqlite3").to_str().unwrap().into());
         config.segment_manager.as_mut().unwrap().persist_path = Some(root.to_str().unwrap().into());
         config.executor = crate::executor::config::ExecutorConfig::Local(executor);
-        config.local_compaction_manager = no_timer_flush();
+        config.local_compaction_manager = flushes;
         ServiceBasedFrontend::try_from_config(&(config, system), registry)
             .await
             .unwrap()
@@ -6616,6 +6626,38 @@ mod tests {
         collection_id
     }
 
+    // The write given of the collection of the stopped reads, from 1: it changes the document and the embedding of r0, and
+    // adds a record, as records_after counts them.
+    async fn write_to_stop(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        write: usize,
+    ) {
+        let added = 9 + write;
+        frontend
+            .upsert(
+                UpsertCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    vec!["r0".to_string(), format!("r{added}")],
+                    vec![
+                        vec![100.0 * write as f32; 2],
+                        vec![added as f32, (added as f32).sin()],
+                    ],
+                    Some(vec![
+                        Some(format!("document r0 {write}")),
+                        Some(format!("document r{added}")),
+                    ]),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
     // A read of a SPANN collection of ten records, stopped by the executor between its snapshot of SQLite and its files
     // while writes run, each with its flush: each changes the document and the embedding of r0, and adds a record, so
     // that a read that takes its records, or their documents or embeddings, at another moment than its files answers a
@@ -6639,29 +6681,7 @@ mod tests {
         };
         let mut writing = tokio::spawn(async move {
             for write in 1..=writes {
-                let added = 9 + write;
-                frontend
-                    .upsert(
-                        UpsertCollectionRecordsRequest::try_new(
-                            TENANT.to_string(),
-                            DATABASE.to_string(),
-                            collection_id,
-                            vec!["r0".to_string(), format!("r{added}")],
-                            vec![
-                                vec![100.0 * write as f32; 2],
-                                vec![added as f32, (added as f32).sin()],
-                            ],
-                            Some(vec![
-                                Some(format!("document r0 {write}")),
-                                Some(format!("document r{added}")),
-                            ]),
-                            None,
-                            None,
-                        )
-                        .unwrap(),
-                    )
-                    .await
-                    .unwrap();
+                write_to_stop(&mut frontend, collection_id, write).await;
                 flush_spann(&frontend, collection_id).await;
             }
         });
@@ -6768,6 +6788,10 @@ mod tests {
 
     // The searches in two moments against the search in one snapshot, on the same collection.
     mod spann_search_tests;
+
+    // The records of the log after the last flush of a SPANN collection, in its reads, its count and its indexing status,
+    // and the timer that flushes them.
+    mod spann_tail_tests;
 
     // A count of a SPANN collection counts the records of the record segment, as distributed Chroma does, at the flush of
     // its snapshot of SQLite: an add and its flush between that snapshot and its files leave its answer as it was.

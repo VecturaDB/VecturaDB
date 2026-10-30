@@ -1020,4 +1020,108 @@ mod tests {
             });
         }
     }
+
+    // Records to add, one for each number.
+    fn adds(numbers: std::ops::Range<usize>) -> Vec<OperationRecord> {
+        numbers
+            .map(|i| OperationRecord {
+                id: format!("r{i}"),
+                embedding: Some(vec![i as f32, 1.0]),
+                encoding: Some(ScalarEncoding::FLOAT32),
+                metadata: None,
+                document: None,
+                operation: Operation::Add,
+            })
+            .collect()
+    }
+
+    // The tail of a collection starts after the position given and ends at the last one given, both positions of the log
+    // shared by every collection; its count goes to the last record written. The records of the other collections stay
+    // out.
+    #[tokio::test]
+    async fn the_tail_of_a_collection_is_between_its_positions() {
+        let mut log = setup_sqlite_log().await;
+        let collection = CollectionUuid::new();
+        let other = CollectionUuid::new();
+        // Positions 1 to 3 for the collection, 4 and 5 for the other, 6 and 7 for the collection.
+        log.push_logs(collection, adds(0..3)).await.unwrap();
+        log.push_logs(other, adds(0..2)).await.unwrap();
+        log.push_logs(collection, adds(3..5)).await.unwrap();
+        let mut connection = log.db.get_conn().acquire().await.unwrap();
+        let tail = log
+            .read_tail(&mut connection, collection, 2, 6)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| (record.log_offset, record.record.id))
+            .collect::<Vec<_>>();
+        assert_eq!(tail, vec![(3, "r2".to_string()), (6, "r3".to_string())]);
+        assert_eq!(log.count_tail(&mut connection, collection, 2).await.unwrap(), 3);
+        assert_eq!(log.count_tail(&mut connection, collection, 7).await.unwrap(), 0);
+        assert_eq!(log.count_tail(&mut connection, other, 0).await.unwrap(), 2);
+    }
+
+    // A SPANN collection is to flush with at least min_compaction_size records after its last flush, or with the oldest of
+    // them waiting at least the timeout, as should_compact_at of the log service of distributed Chroma: the records up to
+    // its last flush do not count, nor do the collections of the other types of index.
+    #[tokio::test]
+    async fn the_spann_collections_to_compact_are_over_a_threshold() {
+        let mut log = setup_sqlite_log().await;
+        let day = Duration::from_secs(86_400);
+        let spann = CollectionUuid::new();
+        let hnsw = CollectionUuid::new();
+        let spann_segment = format!("{}-vector", spann.0);
+        sqlx::query(
+            "INSERT INTO segments (id, type, scope, collection) VALUES (?, ?, 'VECTOR', ?), (?, ?, 'VECTOR', ?)",
+        )
+        .bind(&spann_segment)
+        .bind(String::from(SegmentType::Spann))
+        .bind(spann.0.to_string())
+        .bind(format!("{}-vector", hnsw.0))
+        .bind(String::from(SegmentType::HnswLocalPersisted))
+        .bind(hnsw.0.to_string())
+        .execute(log.db.get_conn())
+        .await
+        .unwrap();
+        log.push_logs(spann, adds(0..3)).await.unwrap();
+        log.push_logs(hnsw, adds(0..5)).await.unwrap();
+        assert_eq!(
+            log.get_spann_collections_to_compact(3, day).await.unwrap(),
+            vec![spann]
+        );
+        assert!(log
+            .get_spann_collections_to_compact(4, day)
+            .await
+            .unwrap()
+            .is_empty());
+        // A flush up to the second record leaves the third after it.
+        sqlx::query("INSERT INTO max_seq_id (segment_id, seq_id) VALUES (?, 2)")
+            .bind(&spann_segment)
+            .execute(log.db.get_conn())
+            .await
+            .unwrap();
+        assert!(log
+            .get_spann_collections_to_compact(2, day)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            log.get_spann_collections_to_compact(1, day).await.unwrap(),
+            vec![spann]
+        );
+        // The third record waited a day.
+        sqlx::query("UPDATE embeddings_queue SET created_at = datetime('now', '-1 day', '-1 minute')")
+            .execute(log.db.get_conn())
+            .await
+            .unwrap();
+        assert_eq!(
+            log.get_spann_collections_to_compact(10, day).await.unwrap(),
+            vec![spann]
+        );
+        assert!(log
+            .get_spann_collections_to_compact(10, day * 2)
+            .await
+            .unwrap()
+            .is_empty());
+    }
 }
