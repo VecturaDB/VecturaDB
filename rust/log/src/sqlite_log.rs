@@ -14,7 +14,8 @@ use chroma_types::{
 };
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, Row};
+use sqlx::sqlite::SqliteRow;
+use sqlx::{QueryBuilder, Row, SqliteConnection};
 use std::{str::FromStr, sync::OnceLock};
 use thiserror::Error;
 
@@ -260,70 +261,49 @@ impl SqliteLog {
 
         let mut records = Vec::new();
         while let Some(row) = logs.try_next().await.map_err(WrappedSqlxError)? {
-            let log_offset: i64 = row.get("seq_id");
-            let id: String = row.get("id");
-            let embedding_bytes = row.get::<Option<&[u8]>, _>("vector");
-            let encoding = row
-                .get::<Option<&str>, _>("encoding")
-                .map(ScalarEncoding::try_from)
-                .transpose()?;
-            let metadata_str = row.get::<Option<&str>, _>("metadata");
-
-            // Parse embedding
-            let embedding = embedding_bytes
-                .map(
-                    |embedding_bytes| -> Result<Option<_>, SqlitePullLogsError> {
-                        match encoding {
-                            Some(ScalarEncoding::FLOAT32) => {
-                                let slice: &[f32] = bytemuck::try_cast_slice(embedding_bytes)
-                                    .map_err(SqlitePullLogsError::InvalidEmbedding)?;
-                                Ok(Some(slice.to_vec()))
-                            }
-                            Some(ScalarEncoding::INT32) => {
-                                unimplemented!()
-                            }
-                            None => Ok(None),
-                        }
-                    },
-                )
-                .transpose()?
-                .flatten();
-
-            // Parse metadata
-            let parsed_metadata_and_document: Option<(UpdateMetadata, Option<String>)> =
-                metadata_str
-                    .map(|metadata_str| {
-                        let mut parsed: UpdateMetadata = serde_json::from_str(metadata_str)?;
-
-                        let document = match parsed.remove("chroma:document") {
-                            Some(UpdateMetadataValue::Str(document)) => Some(document),
-                            None => None,
-                            _ => panic!("Document not found in metadata"),
-                        };
-
-                        Ok::<_, SqlitePullLogsError>((parsed, document))
-                    })
-                    .transpose()?;
-            let document = parsed_metadata_and_document
-                .as_ref()
-                .and_then(|(_, document)| document.clone());
-            let metadata = parsed_metadata_and_document.map(|(metadata, _)| metadata);
-
-            let operation = operation_from_code(row.get("operation"));
-
-            records.push(LogRecord {
-                log_offset,
-                record: OperationRecord {
-                    id,
-                    embedding,
-                    encoding,
-                    metadata,
-                    document,
-                    operation,
-                },
-            });
+            records.push(log_record(&row)?);
         }
 
+        Ok(records)
+    }
+
+    /// The records of the log of a collection after the position `after` and up to `up_to`, read on the connection given:
+    /// a read of the log in the snapshot of another read, which sees the log at the same moment as the rest of SQLite.
+    /// The first record read is the one after `after`, as the fetch of the log of distributed Chroma reads from the log
+    /// position of a collection plus one (rust/worker/src/execution/operators/fetch_log.rs).
+    pub async fn read_tail(
+        &self,
+        connection: &mut SqliteConnection,
+        collection_id: CollectionUuid,
+        after: i64,
+        up_to: i64,
+    ) -> Result<Vec<LogRecord>, SqlitePullLogsError> {
+        let topic =
+            get_embeddings_queue_topic_name(&self.tenant_id, &self.topic_namespace, collection_id);
+        let mut logs = sqlx::query(
+            r#"
+            SELECT
+              seq_id,
+              id,
+              operation,
+              vector,
+              encoding,
+              metadata
+            FROM embeddings_queue
+            WHERE topic = ?
+            AND seq_id > ?
+            AND seq_id <= ?
+            ORDER BY seq_id ASC
+            "#,
+        )
+        .bind(topic)
+        .bind(after)
+        .bind(up_to)
+        .fetch(&mut *connection);
+        let mut records = Vec::new();
+        while let Some(row) = logs.try_next().await.map_err(WrappedSqlxError)? {
+            records.push(log_record(&row)?);
+        }
         Ok(records)
     }
 
@@ -651,6 +631,71 @@ impl ChromaError for SqliteGetMaxBatchSizeError {
             SqliteGetMaxBatchSizeError::RowParsingError(_) => ErrorCodes::Internal,
         }
     }
+}
+
+// A record of the log from its row of embeddings_queue.
+fn log_record(row: &SqliteRow) -> Result<LogRecord, SqlitePullLogsError> {
+    let log_offset: i64 = row.get("seq_id");
+    let id: String = row.get("id");
+    let embedding_bytes = row.get::<Option<&[u8]>, _>("vector");
+    let encoding = row
+        .get::<Option<&str>, _>("encoding")
+        .map(ScalarEncoding::try_from)
+        .transpose()?;
+    let metadata_str = row.get::<Option<&str>, _>("metadata");
+
+    // Parse embedding
+    let embedding = embedding_bytes
+        .map(
+            |embedding_bytes| -> Result<Option<_>, SqlitePullLogsError> {
+                match encoding {
+                    Some(ScalarEncoding::FLOAT32) => {
+                        let slice: &[f32] = bytemuck::try_cast_slice(embedding_bytes)
+                            .map_err(SqlitePullLogsError::InvalidEmbedding)?;
+                        Ok(Some(slice.to_vec()))
+                    }
+                    Some(ScalarEncoding::INT32) => {
+                        unimplemented!()
+                    }
+                    None => Ok(None),
+                }
+            },
+        )
+        .transpose()?
+        .flatten();
+
+    // Parse metadata
+    let parsed_metadata_and_document: Option<(UpdateMetadata, Option<String>)> = metadata_str
+        .map(|metadata_str| {
+            let mut parsed: UpdateMetadata = serde_json::from_str(metadata_str)?;
+
+            let document = match parsed.remove("chroma:document") {
+                Some(UpdateMetadataValue::Str(document)) => Some(document),
+                None => None,
+                _ => panic!("Document not found in metadata"),
+            };
+
+            Ok::<_, SqlitePullLogsError>((parsed, document))
+        })
+        .transpose()?;
+    let document = parsed_metadata_and_document
+        .as_ref()
+        .and_then(|(_, document)| document.clone());
+    let metadata = parsed_metadata_and_document.map(|(metadata, _)| metadata);
+
+    let operation = operation_from_code(row.get("operation"));
+
+    Ok(LogRecord {
+        log_offset,
+        record: OperationRecord {
+            id,
+            embedding,
+            encoding,
+            metadata,
+            document,
+            operation,
+        },
+    })
 }
 
 fn operation_from_code(code: u32) -> Operation {

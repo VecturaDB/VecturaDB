@@ -5,7 +5,7 @@ use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder};
 use chroma_config::{registry::Registry, Configurable};
 use chroma_distance::{normalize, DistanceFunction};
 use chroma_error::{ChromaError, ErrorCodes};
-use chroma_log::{BackfillMessage, LocalCompactionManager, PurgeLogsMessage};
+use chroma_log::{sqlite_log::SqliteLog, BackfillMessage, LocalCompactionManager, Log, PurgeLogsMessage};
 use chroma_segment::blockfile_record::{
     RecordSegmentReaderOptions, RecordSegmentReaderShard, RecordSegmentReaderShardCreationError,
 };
@@ -17,6 +17,7 @@ use chroma_segment::{
     sqlite_metadata::{
         DenseVectorReader, MetadataSnapshot, SqliteMetadataError, SqliteMetadataReader,
     },
+    types::{materialize_logs, MaterializeLogsResult},
 };
 use chroma_sqlite::db::SqliteDb;
 use chroma_system::ComponentHandle;
@@ -28,7 +29,8 @@ use chroma_types::{
     },
     plan::{Count, Get, Knn, Search},
     ranking::EnrichedRecord,
-    CollectionAndSegments, ExecutorError, Segment, SegmentShard, SegmentType, SegmentUuid, Space,
+    Chunk, CollectionAndSegments, ExecutorError, LogRecord, MaterializedLogOperation, Operation,
+    Segment, SegmentShard, SegmentType, SegmentUuid, Space,
 };
 use futures::future::try_join_all;
 use std::{
@@ -41,6 +43,8 @@ pub struct LocalExecutor {
     hnsw_manager: LocalSegmentManager,
     metadata_reader: SqliteMetadataReader,
     compactor_handle: ComponentHandle<LocalCompactionManager>,
+    // The log, from which a read of a SPANN collection takes the records that its files do not hold yet.
+    log: Option<SqliteLog>,
     spann: bool,
     retry: RetryConfig,
     spann_warm_up: SpannWarmUp,
@@ -60,6 +64,7 @@ impl LocalExecutor {
             hnsw_manager,
             metadata_reader: SqliteMetadataReader::new(sqlite_db),
             compactor_handle,
+            log: None,
             spann: false,
             retry: RetryConfig::default(),
             spann_warm_up: SpannWarmUp::default(),
@@ -90,6 +95,13 @@ impl LocalExecutor {
     /// How a read of a SPANN collection reads again, from the config, as the retry of the distributed executor.
     pub fn with_retry(mut self, retry: RetryConfig) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// The log of the single node, from which a read of a SPANN collection takes the records after the last flush of its
+    /// files, as a read of distributed Chroma fetches the logs that its compaction has not applied.
+    pub fn with_log(mut self, log: Option<SqliteLog>) -> Self {
+        self.log = log;
         self
     }
 
@@ -236,17 +248,18 @@ impl LocalExecutor {
     }
 
     // A count of a SPANN collection as distributed Chroma counts it (rust/worker/src/execution/operators/count_records.rs):
-    // the records of the record segment, at the files of the last flush that a snapshot of SQLite gives before it closes.
+    // the records of the record segment, at the files of the last flush that a snapshot of SQLite gives before it closes,
+    // with the tail of the log after that flush.
     async fn spann_count(&mut self, plan: Count) -> Result<CountResult, ExecutorError> {
-        let (snapshot, collection_and_segments) = self
+        let (snapshot, collection_and_segments, tail) = self
             .spann_snapshot(&plan.scan.collection_and_segments)
             .await?;
         snapshot
             .close()
             .await
             .map_err(|err| ExecutorError::Internal(Box::new(err)))?;
-        let count = match Box::pin(self.spann_records(&collection_and_segments)).await? {
-            Some(records) => records.count().await.map_err(ExecutorError::Internal)?,
+        let count = match Box::pin(self.spann_view(&collection_and_segments, tail)).await? {
+            Some(view) => view.count().await.map_err(ExecutorError::Internal)?,
             None => 0,
         };
         Ok(CountResult {
@@ -379,24 +392,51 @@ impl LocalExecutor {
     async fn spann_snapshot(
         &mut self,
         collection_and_segments: &CollectionAndSegments,
-    ) -> Result<(MetadataSnapshot, CollectionAndSegments), ExecutorError> {
+    ) -> Result<(MetadataSnapshot, CollectionAndSegments, Chunk<LogRecord>), ExecutorError> {
         self.spann_warm_up
             .read(collection_and_segments.collection.collection_id);
         self.spann_replay(collection_and_segments).await?;
         self.snapshot_files(collection_and_segments).await
     }
 
-    // A snapshot of SQLite, with the segments of a SPANN collection at the files of the last flush it reads.
+    // A snapshot of SQLite, with the segments of a SPANN collection at the files of the last flush it reads, and the tail of
+    // the log after that flush, up to the last record applied to the metadata: the records that the files do not hold yet,
+    // which a read merges with them, as a read of distributed Chroma fetches the logs from the log position of the
+    // collection plus one (rust/worker/src/execution/operators/fetch_log.rs). The metadata, the files and the tail are of
+    // the same moment.
     async fn snapshot_files(
         &self,
         collection_and_segments: &CollectionAndSegments,
-    ) -> Result<(MetadataSnapshot, CollectionAndSegments), ExecutorError> {
+    ) -> Result<(MetadataSnapshot, CollectionAndSegments, Chunk<LogRecord>), ExecutorError> {
         let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
         let mut snapshot = self.metadata_reader.snapshot().await.map_err(internal)?;
         let mut files = snapshot
             .segment_files(collection_and_segments.collection.collection_id)
             .await
             .map_err(internal)?;
+        let flushed = snapshot
+            .max_seq_id(&collection_and_segments.vector_segment.id)
+            .await
+            .map_err(internal)?;
+        let applied = snapshot
+            .max_seq_id(&collection_and_segments.metadata_segment.id)
+            .await
+            .map_err(internal)?;
+        let tail = if applied > flushed {
+            self.log
+                .as_ref()
+                .ok_or(ExecutorError::InconsistentData)?
+                .read_tail(
+                    snapshot.connection(),
+                    collection_and_segments.collection.collection_id,
+                    flushed as i64,
+                    applied as i64,
+                )
+                .await
+                .map_err(|err| ExecutorError::Internal(err.boxed()))?
+        } else {
+            Vec::new()
+        };
         let mut collection_and_segments = collection_and_segments.clone();
         collection_and_segments.record_segment.file_path = files
             .remove(&collection_and_segments.record_segment.id.to_string())
@@ -404,7 +444,7 @@ impl LocalExecutor {
         collection_and_segments.vector_segment.file_path = files
             .remove(&collection_and_segments.vector_segment.id.to_string())
             .unwrap_or_default();
-        Ok((snapshot, collection_and_segments))
+        Ok((snapshot, collection_and_segments, Chunk::new(tail.into())))
     }
 
     /// Rejects a write to a SPANN collection whose files of the last flush cannot be read before it reaches the log, as
@@ -414,11 +454,12 @@ impl LocalExecutor {
         &self,
         collection_and_segments: &CollectionAndSegments,
     ) -> Result<(), Box<dyn ChromaError>> {
-        let (_, collection_and_segments) = self
+        let (_, collection_and_segments, _) = self
             .snapshot_files(collection_and_segments)
             .await
             .map_err(|err| err.boxed())?;
-        self.spann_vectors(&collection_and_segments)
+        // Only the files: the records of the tail are in the log, which the write reaches anyway.
+        self.spann_view(&collection_and_segments, Chunk::new(Vec::new().into()))
             .await
             .map_err(|err| err.boxed())?;
         Ok(())
@@ -441,11 +482,12 @@ impl LocalExecutor {
     }
 
     // A get of a SPANN collection as distributed Chroma runs it (rust/worker/src/execution/orchestration/get.rs): the filter
-    // and the limit, then the projection from the record segment. The filter and the limit run on SQLite, the metadata
-    // segment of the single node, in a snapshot that gives the files of the same flush and closes before them.
+    // and the limit, then the projection from the record segment and the tail of the log. The filter and the limit run on
+    // SQLite, the metadata segment of the single node, which holds the records of the tail too, in a snapshot that gives
+    // the files of the same flush and the tail after them, and closes before them.
     async fn spann_get(&mut self, plan: Get) -> Result<GetResult, ExecutorError> {
         let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
-        let (mut snapshot, collection_and_segments) = self
+        let (mut snapshot, collection_and_segments, tail) = self
             .spann_snapshot(&plan.scan.collection_and_segments)
             .await?;
         let projection = plan.proj.clone();
@@ -468,7 +510,7 @@ impl LocalExecutor {
         {
             return Ok(result);
         }
-        let records = Box::pin(self.spann_records(&collection_and_segments))
+        let view = Box::pin(self.spann_view(&collection_and_segments, tail))
             .await?
             .ok_or(ExecutorError::InconsistentData)?;
         // The offsets of the records, one by one, as the filter of distributed Chroma takes those of its user ids
@@ -476,14 +518,13 @@ impl LocalExecutor {
         let mut offset_ids = Vec::with_capacity(result.result.records.len());
         for record in &result.result.records {
             offset_ids.push(
-                records
-                    .get_offset_id_for_user_id(&record.id, &RecordSegmentReaderOptions::default())
+                view.offset_id(&record.id)
                     .await
-                    .map_err(|err| ExecutorError::Internal(err.boxed()))?
+                    .map_err(ExecutorError::Internal)?
                     .ok_or(ExecutorError::InconsistentData)?,
             );
         }
-        result.result.records = spann_projection(&records, &offset_ids, &projection).await?;
+        result.result.records = view.projection(&offset_ids, &projection).await?;
         Ok(result)
     }
 
@@ -705,7 +746,7 @@ impl LocalExecutor {
             pulled_log_bytes: 0,
             results: vec![Default::default(); plan.knn.embeddings.len()],
         });
-        let (mut snapshot, collection_and_segments) = self
+        let (mut snapshot, collection_and_segments, tail) = self
             .spann_snapshot(&plan.scan.collection_and_segments)
             .await?;
         let allowed_user_ids = match plan.filter {
@@ -750,6 +791,7 @@ impl LocalExecutor {
         snapshot.close().await.map_err(internal)?;
         let results = Box::pin(self.spann_query(
             &collection_and_segments,
+            tail,
             plan.knn.embeddings,
             plan.knn.fetch,
             &plan.proj,
@@ -792,12 +834,14 @@ impl LocalExecutor {
         }
     }
 
-    // The SPANN index and the record segment of a SPANN collection, at the files of its last flush; none before its
-    // first flush.
-    async fn spann_vectors(
+    // The records of a SPANN collection at one moment: the SPANN index and the record segment at the files of its last
+    // flush, none before its first flush, and the tail of the log after that flush, materialized on that record segment;
+    // none for a collection without a dimension, which no write has reached yet.
+    async fn spann_view(
         &self,
         collection_and_segments: &CollectionAndSegments,
-    ) -> Result<Option<SpannVectors<'_>>, ExecutorError> {
+        tail: Chunk<LogRecord>,
+    ) -> Result<Option<SpannView<'_>>, ExecutorError> {
         let internal = |err: Box<dyn ChromaError>| ExecutorError::Internal(err);
         let (Some(provider), Some(dimension)) = (
             self.hnsw_manager.spann_provider(),
@@ -805,24 +849,27 @@ impl LocalExecutor {
         ) else {
             return Ok(None);
         };
-        let Some(records) = self.spann_records(collection_and_segments).await? else {
-            return Ok(None);
-        };
-        let shard = SegmentShard::try_from((&collection_and_segments.vector_segment, 0))
-            .map_err(|err| internal(err.boxed()))?;
-        let reader = match SpannSegmentReaderShard::from_segment(
-            &collection_and_segments.collection,
-            &shard,
-            &provider.blockfile_provider,
-            &provider.hnsw_provider,
-            dimension as usize,
-            provider.adaptive_search_nprobe,
-        )
-        .await
-        {
-            Ok(reader) => reader,
-            Err(SpannSegmentReaderShardError::UninitializedSegment) => return Ok(None),
-            Err(err) => return Err(internal(err.boxed())),
+        let records = self.spann_records(collection_and_segments).await?;
+        let index = match &records {
+            None => None,
+            Some(_) => {
+                let shard = SegmentShard::try_from((&collection_and_segments.vector_segment, 0))
+                    .map_err(|err| internal(err.boxed()))?;
+                match SpannSegmentReaderShard::from_segment(
+                    &collection_and_segments.collection,
+                    &shard,
+                    &provider.blockfile_provider,
+                    &provider.hnsw_provider,
+                    dimension as usize,
+                    provider.adaptive_search_nprobe,
+                )
+                .await
+                {
+                    Ok(reader) => Some(reader),
+                    Err(SpannSegmentReaderShardError::UninitializedSegment) => None,
+                    Err(err) => return Err(internal(err.boxed())),
+                }
+            }
         };
         let space = collection_and_segments
             .collection
@@ -831,27 +878,56 @@ impl LocalExecutor {
             .and_then(|schema| schema.get_internal_spann_config())
             .map(|config| config.space)
             .ok_or(ExecutorError::CollectionMissingHnswConfiguration)?;
-        Ok(Some(SpannVectors {
-            reader,
+        // As the operators of distributed Chroma materialize the logs they fetch on the record segment
+        // (rust/worker/src/execution/operators/knn_log.rs, projection.rs).
+        let tail = materialize_logs(&records, tail, None, &RecordSegmentReaderOptions::default())
+            .await
+            .map_err(|err| internal(err.boxed()))?;
+        let mut tail_ids = HashMap::with_capacity(tail.len());
+        let mut overwritten = HashSet::new();
+        for log in tail.iter() {
+            let operation = log.get_operation();
+            if !matches!(operation, MaterializedLogOperation::AddNew) {
+                overwritten.insert(log.get_offset_id());
+            }
+            let user_id = log
+                .get_user_id(records.as_ref())
+                .await
+                .map_err(|err| internal(err.boxed()))?;
+            tail_ids.insert(
+                user_id,
+                (
+                    log.get_offset_id(),
+                    matches!(operation, MaterializedLogOperation::DeleteExisting),
+                ),
+            );
+        }
+        Ok(Some(SpannView {
+            index,
             records,
+            tail,
+            tail_ids,
+            overwritten,
             distance_function: DistanceFunction::from(space),
             adaptive: provider.adaptive_search_nprobe,
         }))
     }
 
     // The KNN of a SPANN collection for the query API. An empty filter allows every record, as in the HNSW path. The
-    // nearest records come from the record segment, with their documents, embeddings and metadata as the projection
-    // asks, as the projection of distributed Chroma takes them (rust/worker/src/execution/operators/projection.rs).
+    // nearest records come from the record segment and the tail of the log, with their documents, embeddings and
+    // metadata as the projection asks, as the projection of distributed Chroma takes them
+    // (rust/worker/src/execution/operators/projection.rs).
     async fn spann_query(
         &self,
         collection_and_segments: &CollectionAndSegments,
+        tail: Chunk<LogRecord>,
         embeddings: Vec<Vec<f32>>,
         k: u32,
         proj: &KnnProjection,
         allowed_user_ids: Vec<String>,
     ) -> Result<Vec<KnnProjectionOutput>, ExecutorError> {
         let internal = |err: Box<dyn ChromaError>| ExecutorError::Internal(err);
-        let Some(vectors) = self.spann_vectors(collection_and_segments).await? else {
+        let Some(vectors) = self.spann_view(collection_and_segments, tail).await? else {
             return Ok(vec![Default::default(); embeddings.len()]);
         };
         let allowed = if allowed_user_ids.is_empty() {
@@ -874,7 +950,7 @@ impl LocalExecutor {
                 .iter()
                 .map(|record| record.offset_id)
                 .collect::<Vec<_>>();
-            let records = spann_projection(&vectors.records, &offset_ids, &proj.projection).await?;
+            let records = vectors.projection(&offset_ids, &proj.projection).await?;
             results.push(KnnProjectionOutput {
                 records: records
                     .into_iter()
@@ -933,10 +1009,11 @@ impl LocalExecutor {
     }
 
     // A search of a SPANN collection: its files and its records at one moment, as a get, a query and a count. In its
-    // snapshot of SQLite, what SQLite answers (spann_search_sqlite_at) and the files of the last flush; then, with the
-    // snapshot closed, the dense KNN leaves, the rank, the group by and the selection from those files, by the offsets
-    // of the record segment, as the search of distributed Chroma reads one version of every segment
-    // (rust/worker/src/execution/orchestration/rank.rs). Between records of the same score, the order is by offset.
+    // snapshot of SQLite, what SQLite answers (spann_search_sqlite_at), the files of the last flush and the tail of the log
+    // after it; then, with the snapshot closed, the dense KNN leaves, the rank, the group by and the selection from those
+    // files and that tail, by their offsets, as the search of distributed Chroma reads one version of every segment and
+    // the logs after it (rust/worker/src/execution/orchestration/rank.rs). Between records of the same score, the order
+    // is by offset.
     async fn spann_search(&mut self, plan: Search) -> Result<SearchResult, ExecutorError> {
         #[cfg(test)]
         if self
@@ -946,7 +1023,7 @@ impl LocalExecutor {
             return self.spann_search_in_one_snapshot(plan).await;
         }
         let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
-        let (mut snapshot, collection_and_segments) = self
+        let (mut snapshot, collection_and_segments, tail) = self
             .spann_snapshot(&plan.scan.collection_and_segments)
             .await?;
         // As distributed Chroma (rust/worker/src/server.rs:697-701): an uninitialized collection has no results.
@@ -962,10 +1039,10 @@ impl LocalExecutor {
             .await
             .map_err(internal)?;
         snapshot.close().await.map_err(internal)?;
-        let Some(spann) = self.spann_vectors(&collection_and_segments).await? else {
-            // A collection with its dimension but no files yet, as after a first write that failed once the frontend
-            // gave the collection its dimension: SQLite holds none of its records either, and the search answers none,
-            // as a query and a get do. Records in SQLite without the files of their flush would be inconsistent.
+        let Some(spann) = self.spann_view(&collection_and_segments, tail).await? else {
+            // A collection without its dimension, which no write has reached: SQLite holds none of its records either,
+            // and the search answers none, as a query and a get do. Records in SQLite without the files or the log that
+            // hold them would be inconsistent.
             let records = sqlite.iter().any(|part| {
                 part.allowed_user_ids
                     .as_ref()
@@ -1016,8 +1093,7 @@ impl LocalExecutor {
                             embedding: false,
                             metadata: true,
                         };
-                        let projected =
-                            spann_projection(&spann.records, &offset_ids, &metadata).await?;
+                        let projected = spann.projection(&offset_ids, &metadata).await?;
                         ranks = payload.group_by.group_ranked(
                             ranks
                                 .into_iter()
@@ -1050,7 +1126,7 @@ impl LocalExecutor {
                         .await?
                 }
             };
-            results.push(spann_select(&spann.records, records, &payload.select).await?);
+            results.push(spann_select(&spann, records, &payload.select).await?);
         }
         Ok(SearchResult {
             results,
@@ -1064,7 +1140,7 @@ impl LocalExecutor {
         &mut self,
         plan: Search,
     ) -> Result<SearchResult, ExecutorError> {
-        let (mut snapshot, collection_and_segments) = self
+        let (mut snapshot, collection_and_segments, tail) = self
             .spann_snapshot(&plan.scan.collection_and_segments)
             .await?;
         if collection_and_segments.is_uninitialized() {
@@ -1073,7 +1149,7 @@ impl LocalExecutor {
                 pulled_log_bytes: 0,
             });
         }
-        let spann_vectors = self.spann_vectors(&collection_and_segments).await?;
+        let spann_vectors = self.spann_view(&collection_and_segments, tail).await?;
         let vectors = spann_vectors
             .as_ref()
             .map(|spann| spann as &dyn DenseVectorReader);
@@ -1091,58 +1167,6 @@ impl LocalExecutor {
     pub async fn reset(&mut self) -> Result<(), Box<dyn ChromaError>> {
         self.hnsw_manager.reset().await.map_err(|err| err.boxed())?;
         Ok(())
-    }
-}
-
-// The records of the given offsets from the record segment, in their order, with their documents, embeddings and metadata
-// as the projection asks, as the projection of distributed Chroma reads them (rust/worker/src/execution/operators/
-// projection.rs): the blocks of the records loaded first, then the records read at once, or their user ids one by one
-// from the blocks loaded when no data is asked.
-async fn spann_projection(
-    records: &RecordSegmentReaderShard<'_>,
-    offset_ids: &[u32],
-    projection: &Projection,
-) -> Result<Vec<ProjectionRecord>, ExecutorError> {
-    if offset_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let internal = |err: Box<dyn ChromaError>| ExecutorError::Internal(err);
-    let offset_id_set = offset_ids.iter().copied().collect::<HashSet<_>>();
-    if projection.document || projection.embedding || projection.metadata {
-        records.load_id_to_data(offset_id_set.into_iter()).await;
-        try_join_all(offset_ids.iter().map(|offset_id| async move {
-            let data = records
-                .get_data_for_offset_id(*offset_id)
-                .await
-                .map_err(|err| internal(err.boxed()))?
-                .ok_or(ExecutorError::InconsistentData)?;
-            Ok::<_, ExecutorError>(ProjectionRecord {
-                id: data.id.to_string(),
-                document: data
-                    .document
-                    .filter(|_| projection.document)
-                    .map(str::to_string),
-                embedding: projection.embedding.then(|| data.embedding.to_vec()),
-                metadata: data.metadata.filter(|_| projection.metadata),
-            })
-        }))
-        .await
-    } else {
-        records.load_id_to_user_id(offset_id_set.into_iter()).await;
-        let mut projected = Vec::with_capacity(offset_ids.len());
-        for offset_id in offset_ids {
-            projected.push(ProjectionRecord {
-                id: records
-                    .get_user_id_for_offset_id(*offset_id)
-                    .await
-                    .map_err(|err| internal(err.boxed()))?
-                    .to_string(),
-                document: None,
-                embedding: None,
-                metadata: None,
-            });
-        }
-        Ok(projected)
     }
 }
 
@@ -1295,12 +1319,21 @@ where
     replan(code.into()).await.map_err(ExecutorError::Internal)
 }
 
-// The SPANN index of a collection with its record segment, for the KNN of distributed Chroma
-// (rust/worker/src/execution/orchestration/spann_knn.rs): the nearest centers of a query, their posting lists in brute
-// force under the filter, and the merge of the k nearest.
-struct SpannVectors<'me> {
-    reader: SpannSegmentReaderShard<'me>,
-    records: RecordSegmentReaderShard<'me>,
+// The records of a SPANN collection at one moment, as distributed Chroma reads them: the SPANN index and the record segment
+// at the files of the last flush, and the tail of the log after that flush, which the compaction has not applied yet,
+// materialized on that record segment (rust/worker/src/execution/orchestration/spann_knn.rs, get.rs and count.rs). A record
+// of the tail answers for its user id. The records of the files that the tail updates, overwrites or deletes are left out
+// of what the files answer, as the filter of distributed Chroma leaves out the offsets that the logs overwrite
+// (rust/worker/src/execution/operators/filter.rs).
+struct SpannView<'me> {
+    // None before the first flush.
+    index: Option<SpannSegmentReaderShard<'me>>,
+    records: Option<RecordSegmentReaderShard<'me>>,
+    tail: MaterializeLogsResult,
+    // The user ids of the tail, each with its offset and whether the tail deletes it.
+    tail_ids: HashMap<String, (u32, bool)>,
+    // The offsets of the files that the tail updates, overwrites or deletes.
+    overwritten: HashSet<u32>,
     distance_function: DistanceFunction,
     adaptive: bool,
 }
@@ -1319,27 +1352,50 @@ pub(crate) async fn spann_probe_records(
     }
 }
 
-impl SpannVectors<'_> {
-    // The offsets of the user ids in the record segment; ids it does not hold are left out.
+// One of the k nearest, kept in a heap whose top is the furthest, as the brute force of the worker keeps them.
+fn keep_nearest(nearest: &mut BinaryHeap<RecordMeasure>, record: RecordMeasure, k: u32) {
+    if nearest.len() < k as usize {
+        nearest.push(record);
+    } else if nearest.peek().is_some_and(|furthest| &record < furthest) {
+        nearest.pop();
+        nearest.push(record);
+    }
+}
+
+impl SpannView<'_> {
+    // The offset of a user id: the one of the tail, or of the files; none for an id that neither holds, or that the tail
+    // deletes.
+    async fn offset_id(&self, user_id: &str) -> Result<Option<u32>, Box<dyn ChromaError>> {
+        if let Some((offset_id, deleted)) = self.tail_ids.get(user_id) {
+            return Ok((!deleted).then_some(*offset_id));
+        }
+        match &self.records {
+            Some(records) => records
+                .get_offset_id_for_user_id(user_id, &RecordSegmentReaderOptions::default())
+                .await
+                .map_err(|err| err.boxed()),
+            None => Ok(None),
+        }
+    }
+
+    // The offsets of the user ids; ids that the view does not hold are left out.
     async fn allowed_offsets(
         &self,
         user_ids: &[String],
     ) -> Result<HashSet<u32>, Box<dyn ChromaError>> {
         let mut allowed = HashSet::new();
         for user_id in user_ids {
-            if let Some(offset_id) = self
-                .records
-                .get_offset_id_for_user_id(user_id, &RecordSegmentReaderOptions::default())
-                .await
-                .map_err(|err| err.boxed())?
-            {
+            if let Some(offset_id) = self.offset_id(user_id).await? {
                 allowed.insert(offset_id);
             }
         }
         Ok(allowed)
     }
 
-    // The k nearest of the query among the allowed offsets, or all the records without them, nearest first.
+    // The k nearest of the query among the allowed offsets, or all the records without them, nearest first: those of the
+    // posting lists of the files under the filter, without the offsets that the tail overwrites, and those of the tail in
+    // brute force, merged, as the KNN of distributed Chroma merges its KnnLog with the KNN of its files
+    // (rust/worker/src/execution/orchestration/spann_knn.rs).
     async fn nearest(
         &self,
         query: Vec<f32>,
@@ -1351,46 +1407,75 @@ impl SpannVectors<'_> {
         } else {
             query
         };
-        let collection_size = spann_probe_records(self.adaptive, &self.records).await?;
-        let (centers, _, _) = self
-            .reader
-            .rng_query(&query, collection_size, k as usize)
-            .await
-            .map_err(|err| err.boxed())?;
-        let mut batches = Vec::with_capacity(centers.len());
-        for center in centers {
-            let postings = self
-                .reader
-                .fetch_posting_list(center as u32)
+        let mut batches = Vec::new();
+        if let (Some(index), Some(records)) = (&self.index, &self.records) {
+            let collection_size = spann_probe_records(self.adaptive, records).await?;
+            let (centers, _, _) = index
+                .rng_query(&query, collection_size, k as usize)
                 .await
                 .map_err(|err| err.boxed())?;
-            let mut nearest = BinaryHeap::with_capacity(k as usize);
-            for posting in postings {
-                if allowed.is_some_and(|allowed| !allowed.contains(&posting.doc_offset_id)) {
-                    continue;
+            for center in centers {
+                let postings = index
+                    .fetch_posting_list(center as u32)
+                    .await
+                    .map_err(|err| err.boxed())?;
+                let mut nearest = BinaryHeap::with_capacity(k as usize);
+                for posting in postings {
+                    if self.overwritten.contains(&posting.doc_offset_id)
+                        || allowed.is_some_and(|allowed| !allowed.contains(&posting.doc_offset_id))
+                    {
+                        continue;
+                    }
+                    let record = RecordMeasure {
+                        offset_id: posting.doc_offset_id,
+                        measure: self
+                            .distance_function
+                            .distance(&posting.doc_embedding, &query),
+                    };
+                    keep_nearest(&mut nearest, record, k);
                 }
-                let record = RecordMeasure {
-                    offset_id: posting.doc_offset_id,
-                    measure: self
-                        .distance_function
-                        .distance(&posting.doc_embedding, &query),
-                };
-                if nearest.len() < k as usize {
-                    nearest.push(record);
-                } else if nearest.peek().is_some_and(|furthest| &record < furthest) {
-                    nearest.pop();
-                    nearest.push(record);
-                }
+                // Merge takes the largest first, so the nearest go in reversed, as in the KnnMerge of the worker.
+                batches.push(
+                    nearest
+                        .into_sorted_vec()
+                        .into_iter()
+                        .map(std::cmp::Reverse)
+                        .collect::<Vec<_>>(),
+                );
             }
-            // Merge takes the largest first, so the nearest go in reversed, as in the KnnMerge of the worker.
-            batches.push(
-                nearest
-                    .into_sorted_vec()
-                    .into_iter()
-                    .map(std::cmp::Reverse)
-                    .collect::<Vec<_>>(),
-            );
         }
+        // The tail, as the KnnLog of the worker (rust/worker/src/execution/operators/knn_log.rs).
+        let mut nearest = BinaryHeap::with_capacity(k as usize);
+        for log in self.tail.iter() {
+            if matches!(log.get_operation(), MaterializedLogOperation::DeleteExisting)
+                || allowed.is_some_and(|allowed| !allowed.contains(&log.get_offset_id()))
+            {
+                continue;
+            }
+            let log = log
+                .hydrate(self.records.as_ref())
+                .await
+                .map_err(|err| err.boxed())?;
+            let normalized;
+            let embedding = if self.distance_function == DistanceFunction::Cosine {
+                normalized = normalize(log.merged_embeddings_ref());
+                &normalized
+            } else {
+                log.merged_embeddings_ref()
+            };
+            let record = RecordMeasure {
+                offset_id: log.get_offset_id(),
+                measure: self.distance_function.distance(embedding, &query),
+            };
+            keep_nearest(&mut nearest, record, k);
+        }
+        batches.push(
+            nearest
+                .into_sorted_vec()
+                .into_iter()
+                .map(std::cmp::Reverse)
+                .collect::<Vec<_>>(),
+        );
         Ok((Merge { k })
             .merge(batches)
             .into_iter()
@@ -1398,9 +1483,175 @@ impl SpannVectors<'_> {
             .collect())
     }
 
+    // The records of the offsets, with what the projection asks: those of the tail from the log, the others from the
+    // record segment, as the projection of distributed Chroma takes them
+    // (rust/worker/src/execution/operators/projection.rs).
+    async fn projection(
+        &self,
+        offset_ids: &[u32],
+        projection: &Projection,
+    ) -> Result<Vec<ProjectionRecord>, ExecutorError> {
+        if offset_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let internal = |err: Box<dyn ChromaError>| ExecutorError::Internal(err);
+        let offset_id_set = offset_ids.iter().copied().collect::<HashSet<_>>();
+        let tail = self
+            .tail
+            .iter()
+            .filter(|log| offset_id_set.contains(&log.get_offset_id()))
+            .map(|log| (log.get_offset_id(), log))
+            .collect::<HashMap<_, _>>();
+        let needs_data = projection.document || projection.embedding || projection.metadata;
+        if let Some(records) = &self.records {
+            let in_files = offset_id_set
+                .iter()
+                .filter(|offset_id| !tail.contains_key(offset_id))
+                .copied()
+                .collect::<Vec<_>>();
+            if needs_data {
+                records.load_id_to_data(in_files.into_iter()).await;
+            } else {
+                records.load_id_to_user_id(in_files.into_iter()).await;
+            }
+        }
+        if !needs_data {
+            // The user ids one by one, from the blocks loaded above, as the projection of the worker reads them when no
+            // data is asked.
+            let mut projected = Vec::with_capacity(offset_ids.len());
+            for offset_id in offset_ids {
+                let id = match tail.get(offset_id) {
+                    Some(log) => log
+                        .get_user_id(self.records.as_ref())
+                        .await
+                        .map_err(|err| internal(err.boxed()))?,
+                    None => self
+                        .records
+                        .as_ref()
+                        .ok_or(ExecutorError::InconsistentData)?
+                        .get_user_id_for_offset_id(*offset_id)
+                        .await
+                        .map_err(|err| internal(err.boxed()))?
+                        .to_string(),
+                };
+                projected.push(ProjectionRecord {
+                    id,
+                    document: None,
+                    embedding: None,
+                    metadata: None,
+                });
+            }
+            return Ok(projected);
+        }
+        let tail = &tail;
+        try_join_all(offset_ids.iter().map(|offset_id| async move {
+            if let Some(log) = tail.get(offset_id) {
+                let log = log
+                    .hydrate(self.records.as_ref())
+                    .await
+                    .map_err(|err| internal(err.boxed()))?;
+                return Ok(ProjectionRecord {
+                    id: log.get_user_id().to_string(),
+                    document: log
+                        .merged_document_ref()
+                        .filter(|_| projection.document)
+                        .map(str::to_string),
+                    embedding: projection
+                        .embedding
+                        .then(|| log.merged_embeddings_ref().to_vec()),
+                    metadata: projection
+                        .metadata
+                        .then(|| log.merged_metadata())
+                        .filter(|metadata| !metadata.is_empty()),
+                });
+            }
+            let data = self
+                .records
+                .as_ref()
+                .ok_or(ExecutorError::InconsistentData)?
+                .get_data_for_offset_id(*offset_id)
+                .await
+                .map_err(|err| internal(err.boxed()))?
+                .ok_or(ExecutorError::InconsistentData)?;
+            Ok::<_, ExecutorError>(ProjectionRecord {
+                id: data.id.to_string(),
+                document: data
+                    .document
+                    .filter(|_| projection.document)
+                    .map(str::to_string),
+                embedding: projection.embedding.then(|| data.embedding.to_vec()),
+                metadata: data.metadata.filter(|_| projection.metadata),
+            })
+        }))
+        .await
+    }
+
+    // The records at the moment of the view, as the CountRecords of distributed Chroma counts them
+    // (rust/worker/src/execution/operators/count_records.rs): those of the record segment, without the ids that the tail
+    // deletes last and with the ids that the tail adds last and the record segment does not hold.
+    async fn count(&self) -> Result<usize, Box<dyn ChromaError>> {
+        let Some(reader) = &self.records else {
+            // Before the first flush only the tail holds records.
+            let mut seen_id_set = HashSet::new();
+            for (log_record, _) in self.tail.logs.iter() {
+                match log_record.record.operation {
+                    Operation::Add | Operation::Upsert => {
+                        seen_id_set.insert(log_record.record.id.clone());
+                    }
+                    Operation::Delete => {
+                        seen_id_set.remove(log_record.record.id.as_str());
+                    }
+                    Operation::Update => {}
+                    Operation::BackfillFn => {}
+                }
+            }
+            return Ok(seen_id_set.len());
+        };
+        let options = RecordSegmentReaderOptions::default();
+        // Ids that exist in both the log and the segment (can be in both deleted and not deleted state).
+        let mut deleted_and_non_deleted_present_in_segment: HashSet<String> = HashSet::new();
+        for (log_record, _) in self.tail.logs.iter() {
+            if reader
+                .data_exists_for_user_id(log_record.record.id.as_str(), &options)
+                .await
+                .map_err(|err| err.boxed())?
+            {
+                deleted_and_non_deleted_present_in_segment.insert(log_record.record.id.clone());
+            }
+        }
+        // Ids that are present in the log and segment and their end state is not deleted.
+        let mut non_deleted_present_in_segment: HashSet<String> =
+            deleted_and_non_deleted_present_in_segment.clone();
+        // Ids that are absent in the segment but present in log in non deleted state.
+        let mut non_deleted_absent_in_segment: HashSet<String> = HashSet::new();
+        for (log_record, _) in self.tail.logs.iter() {
+            let present = deleted_and_non_deleted_present_in_segment.contains(log_record.record.id.as_str());
+            let ids = if present {
+                &mut non_deleted_present_in_segment
+            } else {
+                &mut non_deleted_absent_in_segment
+            };
+            match log_record.record.operation {
+                Operation::Add | Operation::Upsert => {
+                    ids.insert(log_record.record.id.clone());
+                }
+                Operation::Delete => {
+                    ids.remove(log_record.record.id.as_str());
+                }
+                Operation::Update => {}
+                Operation::BackfillFn => {}
+            }
+        }
+        let count = reader.count().await? as i64;
+        Ok((count
+            - (deleted_and_non_deleted_present_in_segment.len()
+                - non_deleted_present_in_segment.len()) as i64
+            + non_deleted_absent_in_segment.len() as i64) as usize)
+    }
+
     // A dense KNN leaf of a search: the limit nearest of the query among the allowed user ids, or all the records
-    // without them, by offset in the record segment, by distance and then by offset, as the merge of the KNN results of
-    // distributed Chroma orders them.
+    // without them, by offset, by distance and then by offset, as the merge of the KNN results of distributed Chroma
+    // orders them.
     async fn dense_leaf(
         &self,
         query: Vec<f32>,
@@ -1412,15 +1663,15 @@ impl SpannVectors<'_> {
             Some(user_ids) => Some(self.allowed_offsets(user_ids).await.map_err(internal)?),
             None => None,
         };
-        let mut nearest = SpannVectors::nearest(self, query, limit, allowed.as_ref())
+        let mut nearest = SpannView::nearest(self, query, limit, allowed.as_ref())
             .await
             .map_err(internal)?;
         nearest.sort_unstable();
         Ok(nearest)
     }
 
-    // The records that SQLite gives by user id, with their measures, by their offsets in the record segment, in their
-    // order. SQLite holds no record that the files of its flush do not.
+    // The records that SQLite gives by user id, with their measures, by their offsets, in their order. SQLite holds no
+    // record that the files of its flush and the tail after it do not.
     async fn measures_by_offset(
         &self,
         measures: Vec<(String, f32)>,
@@ -1428,23 +1679,42 @@ impl SpannVectors<'_> {
         let mut by_offset = Vec::with_capacity(measures.len());
         for (user_id, measure) in measures {
             let offset_id = self
-                .records
-                .get_offset_id_for_user_id(&user_id, &RecordSegmentReaderOptions::default())
+                .offset_id(&user_id)
                 .await
-                .map_err(|err| ExecutorError::Internal(err.boxed()))?
+                .map_err(ExecutorError::Internal)?
                 .ok_or(ExecutorError::InconsistentData)?;
             by_offset.push(RecordMeasure { offset_id, measure });
         }
         Ok(by_offset)
     }
+
+    // The user id of an offset: the one of the tail, or of the files.
+    async fn user_id(&self, offset_id: u32) -> Result<String, Box<dyn ChromaError>> {
+        for log in self.tail.iter() {
+            if log.get_offset_id() == offset_id {
+                return log
+                    .get_user_id(self.records.as_ref())
+                    .await
+                    .map_err(|err| err.boxed());
+            }
+        }
+        match &self.records {
+            Some(records) => Ok(records
+                .get_user_id_for_offset_id(offset_id)
+                .await
+                .map_err(|err| err.boxed())?
+                .to_string()),
+            None => Err(Box::new(ExecutorError::InconsistentData)),
+        }
+    }
 }
 
-// The selected keys of the records of a search of a SPANN collection, in their order, from the record segment, as the
-// select of distributed Chroma reads them (rust/worker/src/execution/operators/select.rs), and in the shape of the
-// select of the single node (rust/segment/src/sqlite_metadata.rs): only the metadata keys selected, and no metadata
-// as none.
+// The selected keys of the records of a search of a SPANN collection, in their order, from the record segment and the
+// tail of the log, as the select of distributed Chroma reads them (rust/worker/src/execution/operators/select.rs), and in
+// the shape of the select of the single node (rust/segment/src/sqlite_metadata.rs): only the metadata keys selected, and
+// no metadata as none.
 async fn spann_select(
-    records: &RecordSegmentReaderShard<'_>,
+    view: &SpannView<'_>,
     ranked: Vec<RecordMeasure>,
     select: &Select,
 ) -> Result<SearchPayloadResult, ExecutorError> {
@@ -1474,7 +1744,7 @@ async fn spann_select(
         embedding: select_embedding,
         metadata: select_all_metadata || !metadata_fields.is_empty(),
     };
-    let projected = spann_projection(records, &offset_ids, &projection).await?;
+    let projected = view.projection(&offset_ids, &projection).await?;
     Ok(SearchPayloadResult {
         records: ranked
             .into_iter()
@@ -1498,7 +1768,7 @@ async fn spann_select(
 
 // The dense leaves of the Search API on a SPANN collection.
 #[async_trait]
-impl DenseVectorReader for SpannVectors<'_> {
+impl DenseVectorReader for SpannView<'_> {
     async fn nearest(
         &self,
         _: &CollectionAndSegments,
@@ -1513,16 +1783,11 @@ impl DenseVectorReader for SpannVectors<'_> {
         };
         let mut nearest = Vec::new();
         for RecordMeasure { offset_id, measure } in
-            SpannVectors::nearest(self, query, limit, allowed.as_ref())
+            SpannView::nearest(self, query, limit, allowed.as_ref())
                 .await
                 .map_err(spann)?
         {
-            let user_id = self
-                .records
-                .get_user_id_for_offset_id(offset_id)
-                .await
-                .map_err(|err| spann(err.boxed()))?
-                .to_string();
+            let user_id = self.user_id(offset_id).await.map_err(spann)?;
             nearest.push((offset_id, user_id, measure));
         }
         Ok(nearest)
@@ -1530,21 +1795,24 @@ impl DenseVectorReader for SpannVectors<'_> {
 
     async fn embedding(&self, user_id: &str) -> Result<Vec<f32>, SqliteMetadataError> {
         let spann = SqliteMetadataError::DenseVectors;
-        let offset_id = self
-            .records
-            .get_offset_id_for_user_id(user_id, &RecordSegmentReaderOptions::default())
-            .await
-            .map_err(|err| spann(err.boxed()))?;
-        let data = match offset_id {
+        let offset_id = self.offset_id(user_id).await.map_err(spann)?;
+        let embedding = match offset_id {
             Some(offset_id) => self
-                .records
-                .get_data_for_offset_id(offset_id)
+                .projection(
+                    &[offset_id],
+                    &Projection {
+                        document: false,
+                        embedding: true,
+                        metadata: false,
+                    },
+                )
                 .await
-                .map_err(|err| spann(err.boxed()))?,
+                .map_err(|err| spann(err.boxed()))?
+                .pop()
+                .and_then(|record| record.embedding),
             None => None,
         };
-        data.map(|data| data.embedding.to_vec())
-            .ok_or_else(|| SqliteMetadataError::MissingEmbedding(user_id.to_string()))
+        embedding.ok_or_else(|| SqliteMetadataError::MissingEmbedding(user_id.to_string()))
     }
 }
 
@@ -1561,9 +1829,14 @@ impl Configurable<LocalExecutorConfig> for LocalExecutor {
         let compactor_handle = registry
             .get::<ComponentHandle<LocalCompactionManager>>()
             .map_err(|err| err.boxed())?;
+        let log = match registry.get::<Log>() {
+            Ok(Log::Sqlite(log)) => Some(log),
+            _ => None,
+        };
         Ok(Self::new(hnsw_manager, sqlite_db, compactor_handle.clone())
             .with_spann(config.spann)
-            .with_retry(config.retry.clone()))
+            .with_retry(config.retry.clone())
+            .with_log(log))
     }
 }
 

@@ -33,7 +33,7 @@ use sea_query::{
     SimpleExpr, SqliteQueryBuilder, UpdateStatement,
 };
 use sea_query_binder::SqlxBinder;
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 use thiserror::Error;
 
 const SUBQ_ALIAS: &str = "filter_limit_subq";
@@ -206,6 +206,28 @@ impl MetadataSnapshot {
             );
         }
         Ok(files)
+    }
+
+    /// The position in the log of the last record applied to a segment, in the snapshot: see
+    /// SqliteMetadataReader::current_max_seq_id.
+    pub async fn max_seq_id(&mut self, segment_id: &SegmentUuid) -> Result<u64, SqliteMetadataError> {
+        let (sql, values) = Query::select()
+            .column(MaxSeqId::SeqId)
+            .from(MaxSeqId::Table)
+            .and_where(Expr::col(MaxSeqId::SegmentId).eq(segment_id.to_string()))
+            .build_sqlx(SqliteQueryBuilder);
+        let row_opt = sqlx::query_with(&sql, values)
+            .fetch_optional(&mut *self.tx)
+            .await?;
+        Ok(row_opt
+            .map(|row| row.try_get::<u64, _>(0))
+            .transpose()?
+            .unwrap_or_default())
+    }
+
+    /// The connection of the snapshot, for the reads of other crates that must see the same moment, as those of the log.
+    pub fn connection(&mut self) -> &mut SqliteConnection {
+        &mut *self.tx
     }
 }
 
