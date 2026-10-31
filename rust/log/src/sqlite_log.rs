@@ -8,6 +8,7 @@ use chroma_config::Configurable;
 use chroma_error::{ChromaError, ErrorCodes, WrappedSqlxError};
 use chroma_sqlite::{db::SqliteDb, helpers::get_embeddings_queue_topic_name};
 use chroma_system::{ChannelError, ComponentHandle, RequestError};
+use chroma_types::chroma_proto::PushLogsCondition;
 use chroma_types::{
     CollectionUuid, LogRecord, Operation, OperationRecord, ResetError, ResetResponse,
     ScalarEncoding, ScalarEncodingConversionError, SegmentType, UpdateMetadata,
@@ -78,6 +79,12 @@ pub enum SqlitePushLogsError {
     // the flushes should have taken the log under the limit, which distributed Chroma does not give.
     #[error("log needs compaction; too full")]
     BackoffCompaction { retry_after: u64 },
+    // A conditional write that the log refuses, with the code and the message of the log service of distributed
+    // Chroma (rust/log-service/src/lib.rs: validate_conditional_log_bounds and the scan of the committed log).
+    #[error("conditional write conflict")]
+    ConditionalWriteConflict,
+    #[error("{1}")]
+    ConditionalWriteRefused(ErrorCodes, &'static str),
 }
 
 impl ChromaError for SqlitePushLogsError {
@@ -94,6 +101,8 @@ impl ChromaError for SqlitePushLogsError {
             SqlitePushLogsError::Unimplemented(_) => ErrorCodes::Unimplemented,
             SqlitePushLogsError::InvalidSparseMetadata => ErrorCodes::InvalidArgument,
             SqlitePushLogsError::BackoffCompaction { .. } => ErrorCodes::ResourceExhausted,
+            SqlitePushLogsError::ConditionalWriteConflict => ErrorCodes::Aborted,
+            SqlitePushLogsError::ConditionalWriteRefused(code, _) => *code,
         }
     }
 }
@@ -323,14 +332,127 @@ impl SqliteLog {
             .map_err(|_| SqlitePushLogsError::MaxBatchSizeSetError)
     }
 
+    // The offset of the next record of the log, as the scout of the log service gives the tail of a collection: the
+    // seq_id of SQLite is the offset of the single node, and it grows over the whole table, so the tail is its next one.
     pub(super) async fn scout_logs(
         &mut self,
         _collection_id: CollectionUuid,
         _starting_offset: i64,
     ) -> Result<u64, SqlitePullLogsError> {
-        Err(SqlitePullLogsError::NotImplemented(
-            "scout_logs".to_string(),
-        ))
+        let max: Option<i64> = sqlx::query_scalar("SELECT MAX(seq_id) FROM embeddings_queue")
+            .fetch_one(self.db.get_conn())
+            .await
+            .map_err(WrappedSqlxError)?;
+        Ok(max.unwrap_or(0) as u64 + 1)
+    }
+
+    // The seq_id up to which the records of a collection are applied to both its segments, as max_purge_seq_id: the
+    // compactor may purge the log below it, and a read sees every record up to it. It is what the log_position of a
+    // collection is to distributed Chroma, which the SQLite sysdb does not keep.
+    async fn applied_up_to(
+        conn: &mut SqliteConnection,
+        collection_id: CollectionUuid,
+    ) -> Result<i64, WrappedSqlxError> {
+        sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(MIN(COALESCE(CAST(max_seq_id.seq_id AS INTEGER), 0)), 0)
+            FROM segments
+            LEFT JOIN max_seq_id ON max_seq_id.segment_id = segments.id
+            WHERE segments.collection = ?
+            "#,
+        )
+        .bind(collection_id.0.to_string())
+        .fetch_one(conn)
+        .await
+        .map_err(WrappedSqlxError)
+    }
+
+    /// The log position of a collection for the stale reads of the conditional transactions: see applied_up_to.
+    pub async fn log_position(
+        &self,
+        collection_id: CollectionUuid,
+    ) -> Result<i64, WrappedSqlxError> {
+        let mut conn = self
+            .db
+            .get_conn()
+            .acquire()
+            .await
+            .map_err(WrappedSqlxError)?;
+        Self::applied_up_to(&mut conn, collection_id).await
+    }
+
+    // As validate_conditional_log_bounds and the scan of the committed log of the log service of distributed Chroma, in
+    // the transaction of the write: the window goes from the observed offset to the tail; the readable lower bound is
+    // the watermark up to which the compactor may have purged the log of the collection (the lower of the watermarks of
+    // its segments, as max_purge_seq_id), or 0 when the log is never purged; a record in the window with an id read or
+    // written is a conflict.
+    async fn check_condition(
+        &mut self,
+        tx: &mut SqliteConnection,
+        topic: &str,
+        collection_id: CollectionUuid,
+        condition: &PushLogsCondition,
+        write_ids: &HashSet<String>,
+    ) -> Result<(), SqlitePushLogsError> {
+        let refused = SqlitePushLogsError::ConditionalWriteRefused;
+        if condition.observed_log_offset < 0 {
+            return Err(refused(
+                ErrorCodes::InvalidArgument,
+                "observed_log_offset must be non-negative",
+            ));
+        }
+        if condition.read_ids.iter().any(String::is_empty) {
+            return Err(refused(
+                ErrorCodes::InvalidArgument,
+                "read_ids must not contain empty ids",
+            ));
+        }
+        if write_ids.contains("") {
+            return Err(refused(
+                ErrorCodes::InvalidArgument,
+                "records must not contain empty ids",
+            ));
+        }
+        let observed = condition.observed_log_offset;
+        let max: Option<i64> = sqlx::query_scalar("SELECT MAX(seq_id) FROM embeddings_queue")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(WrappedSqlxError)?;
+        if observed > max.unwrap_or(0) + 1 {
+            return Err(refused(
+                ErrorCodes::InvalidArgument,
+                "observed_log_offset is beyond the current log tail",
+            ));
+        }
+        let purged = self
+            .get_legacy_embeddings_queue_config()
+            .await
+            .map_or(true, |config| config.automatically_purge);
+        let lower_bound = if purged {
+            Self::applied_up_to(&mut *tx, collection_id).await?
+        } else {
+            0
+        };
+        if observed < lower_bound {
+            return Err(refused(
+                ErrorCodes::FailedPrecondition,
+                "observed_log_offset is before the readable log lower bound",
+            ));
+        }
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM embeddings_queue WHERE topic = ? AND seq_id >= ?")
+                .bind(topic)
+                .bind(observed)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(WrappedSqlxError)?;
+        if ids
+            .iter()
+            .any(|id| write_ids.contains(id) || condition.read_ids.contains(id))
+        {
+            return Err(SqlitePushLogsError::ConditionalWriteConflict);
+        }
+        Ok(())
     }
 
     pub(super) async fn read(
@@ -467,14 +589,28 @@ impl SqliteLog {
         Ok(count as u64)
     }
 
+    // A write without a condition, as the tests of the log write.
+    #[cfg(test)]
     pub(super) async fn push_logs(
         &mut self,
         collection_id: CollectionUuid,
         records: Vec<OperationRecord>,
     ) -> Result<(), SqlitePushLogsError> {
+        self.push_logs_with_condition(collection_id, records, None)
+            .await
+    }
+
+    // A write to the log; with a condition, the conditional write of distributed Chroma.
+    pub(super) async fn push_logs_with_condition(
+        &mut self,
+        collection_id: CollectionUuid,
+        records: Vec<OperationRecord>,
+        condition: Option<&PushLogsCondition>,
+    ) -> Result<(), SqlitePushLogsError> {
         if records.is_empty() {
             return Ok(());
         }
+        let write_ids: HashSet<String> = records.iter().map(|record| record.id.clone()).collect();
         self.check_for_backpressure(collection_id).await?;
 
         let topic =
@@ -513,7 +649,18 @@ impl SqliteLog {
             .get()
             .copied()
             .unwrap_or(DEFAULT_MAX_BATCH_SIZE) as usize;
-        let mut tx = self.db.get_conn().begin().await.map_err(WrappedSqlxError)?;
+        // A conditional write takes the write lock of SQLite before its check, so that no write comes between the check
+        // and its own, as the admission of the log service of distributed Chroma.
+        let mut tx = if condition.is_some() {
+            self.db.get_conn().begin_with("BEGIN IMMEDIATE").await
+        } else {
+            self.db.get_conn().begin().await
+        }
+        .map_err(WrappedSqlxError)?;
+        if let Some(condition) = condition {
+            self.check_condition(&mut tx, &topic, collection_id, condition, &write_ids)
+                .await?;
+        }
         for batch in records_and_serialized_metadatas.chunks(max_batch_size) {
             let mut query_builder = QueryBuilder::new(
                 "INSERT INTO embeddings_queue (topic, id, operation, vector, encoding, metadata) ",
@@ -984,6 +1131,148 @@ mod tests {
         .unwrap();
 
         SqliteLog::new(db, "default".to_string(), "default".to_string())
+    }
+
+    fn conditional_record(id: &str) -> OperationRecord {
+        OperationRecord {
+            id: id.into(),
+            embedding: Some(vec![1.0, 2.0]),
+            encoding: Some(ScalarEncoding::FLOAT32),
+            metadata: None,
+            document: None,
+            operation: Operation::Upsert,
+        }
+    }
+
+    fn condition(observed_log_offset: i64, read_ids: &[&str]) -> PushLogsCondition {
+        PushLogsCondition {
+            observed_log_offset,
+            read_ids: read_ids.iter().map(|id| id.to_string()).collect(),
+        }
+    }
+
+    async fn push_conditional(
+        log: &mut SqliteLog,
+        collection: CollectionUuid,
+        ids: &[&str],
+        condition: &PushLogsCondition,
+    ) -> Result<(), SqlitePushLogsError> {
+        log.push_logs_with_condition(
+            collection,
+            ids.iter().map(|id| conditional_record(id)).collect(),
+            Some(condition),
+        )
+        .await
+    }
+
+    // As the log service of distributed Chroma: a conditional write is refused with a conflict when a record written
+    // after the offset it observed has an id it read or writes, and accepted otherwise; the scout gives the offset of
+    // the next record.
+    #[tokio::test]
+    async fn a_conditional_write_conflicts_with_a_record_written_after_its_offset() {
+        let mut log = setup_sqlite_log().await;
+        let collection = CollectionUuid::new();
+        log.push_logs(collection, vec![conditional_record("a")])
+            .await
+            .unwrap();
+        let observed = log.scout_logs(collection, 0).await.unwrap() as i64;
+        assert_eq!(observed, 2);
+        log.push_logs(collection, vec![conditional_record("b")])
+            .await
+            .unwrap();
+        assert_eq!(log.scout_logs(collection, 0).await.unwrap(), 3);
+        // Written after the offset: b, read or written.
+        assert!(matches!(
+            push_conditional(&mut log, collection, &["c"], &condition(observed, &["b"])).await,
+            Err(SqlitePushLogsError::ConditionalWriteConflict)
+        ));
+        assert!(matches!(
+            push_conditional(&mut log, collection, &["b"], &condition(observed, &[])).await,
+            Err(SqlitePushLogsError::ConditionalWriteConflict)
+        ));
+        // a was written before the offset; a record of another collection does not count.
+        log.push_logs(CollectionUuid::new(), vec![conditional_record("d")])
+            .await
+            .unwrap();
+        push_conditional(&mut log, collection, &["d"], &condition(observed, &["a"]))
+            .await
+            .unwrap();
+        // The refused writes wrote nothing: b, then d.
+        assert_eq!(log.scout_logs(collection, 0).await.unwrap(), 5);
+    }
+
+    // The bounds of the log service of distributed Chroma: an offset that is negative or beyond the tail, or empty ids,
+    // are invalid; an offset below what the compactor applied, so that the log may be purged, cannot be checked and is
+    // refused, not passed.
+    #[tokio::test]
+    async fn a_conditional_write_is_refused_outside_the_readable_log() {
+        let mut log = setup_sqlite_log().await;
+        let collection = CollectionUuid::new();
+        log.push_logs(
+            collection,
+            vec![conditional_record("a"), conditional_record("b")],
+        )
+        .await
+        .unwrap();
+        let refused = |result: Result<(), SqlitePushLogsError>| match result {
+            Err(SqlitePushLogsError::ConditionalWriteRefused(code, message)) => (code, message),
+            other => panic!("not refused: {other:?}"),
+        };
+        assert_eq!(
+            refused(push_conditional(&mut log, collection, &["c"], &condition(-1, &[])).await),
+            (
+                ErrorCodes::InvalidArgument,
+                "observed_log_offset must be non-negative"
+            )
+        );
+        assert_eq!(
+            refused(push_conditional(&mut log, collection, &["c"], &condition(4, &[])).await),
+            (
+                ErrorCodes::InvalidArgument,
+                "observed_log_offset is beyond the current log tail"
+            )
+        );
+        assert_eq!(
+            refused(push_conditional(&mut log, collection, &["c"], &condition(3, &[""])).await),
+            (
+                ErrorCodes::InvalidArgument,
+                "read_ids must not contain empty ids"
+            )
+        );
+        assert_eq!(
+            refused(push_conditional(&mut log, collection, &[""], &condition(3, &[])).await),
+            (
+                ErrorCodes::InvalidArgument,
+                "records must not contain empty ids"
+            )
+        );
+        // Both segments of the collection applied up to 2.
+        for (segment, scope) in [("m", "METADATA"), ("v", "VECTOR")] {
+            sqlx::query("INSERT INTO segments (id, type, scope, collection) VALUES (?, ?, ?, ?)")
+                .bind(segment)
+                .bind(segment)
+                .bind(scope)
+                .bind(collection.0.to_string())
+                .execute(log.db.get_conn())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO max_seq_id (segment_id, seq_id) VALUES (?, 2)")
+                .bind(segment)
+                .execute(log.db.get_conn())
+                .await
+                .unwrap();
+        }
+        assert_eq!(log.log_position(collection).await.unwrap(), 2);
+        assert_eq!(
+            refused(push_conditional(&mut log, collection, &["c"], &condition(1, &[])).await),
+            (
+                ErrorCodes::FailedPrecondition,
+                "observed_log_offset is before the readable log lower bound"
+            )
+        );
+        push_conditional(&mut log, collection, &["c"], &condition(2, &[]))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

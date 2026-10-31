@@ -55,7 +55,7 @@ from chromadb.execution.expression.plan import Search
 import chromadb_rust_bindings
 
 
-from typing import Optional, Sequence, List, Dict, Any, Tuple, NoReturn, cast
+from typing import Optional, Sequence, List, Dict, Any, Tuple, cast
 from overrides import override
 from uuid import UUID
 import json
@@ -699,16 +699,11 @@ class RustBindingsAPI(ServerAPI):
 
         return DeleteResult(deleted=deleted)
 
+    # The conditional transactions of distributed Chroma, through the bindings of the frontend, as the HTTP client
+    # goes through its routes: the transaction is the state the bindings keep.
     @override
     def _begin_conditional_transaction(self) -> object:
-        self._unsupported_conditional_transactions()
-
-    def _unsupported_conditional_transactions(self) -> NoReturn:
-        raise NotImplementedError(
-            "Conditional transactions are only supported when connecting "
-            "to a Chroma server via HttpClient. The Rust bindings "
-            "(embedded mode) do not support conditional transaction operations."
-        )
+        return self.bindings.begin_conditional_transaction()
 
     @override
     def _conditional_get(
@@ -724,7 +719,34 @@ class RustBindingsAPI(ServerAPI):
         tenant: str = DEFAULT_TENANT,
         database: str = DEFAULT_DATABASE,
     ) -> GetResult:
-        self._unsupported_conditional_transactions()
+        rust_response = self.bindings.conditional_get(
+            transaction,
+            str(collection_id),
+            ids,
+            json.dumps(where) if where else None,
+            limit,
+            offset or 0,
+            json.dumps(where_document) if where_document else None,
+            include,
+            tenant,
+            database,
+        )
+
+        metadatas = rust_response.metadatas
+        return GetResult(
+            ids=rust_response.ids,
+            embeddings=rust_response.embeddings,
+            documents=rust_response.documents,
+            uris=rust_response.uris,
+            included=include,
+            data=None,
+            metadatas=cast(
+                Metadatas,
+                [deserialize_metadata(metadata) for metadata in metadatas],
+            )
+            if metadatas is not None
+            else None,
+        )
 
     @override
     def _conditional_add(
@@ -739,7 +761,19 @@ class RustBindingsAPI(ServerAPI):
         tenant: str = DEFAULT_TENANT,
         database: str = DEFAULT_DATABASE,
     ) -> bool:
-        self._unsupported_conditional_transactions()
+        return self.bindings.conditional_add(
+            transaction,
+            ids,
+            str(collection_id),
+            embeddings,
+            [serialize_metadata(metadata) for metadata in metadatas]
+            if metadatas is not None
+            else None,
+            documents,
+            uris,
+            tenant,
+            database,
+        )
 
     @override
     def _conditional_update(
@@ -754,7 +788,19 @@ class RustBindingsAPI(ServerAPI):
         tenant: str = DEFAULT_TENANT,
         database: str = DEFAULT_DATABASE,
     ) -> bool:
-        self._unsupported_conditional_transactions()
+        return self.bindings.conditional_update(
+            transaction,
+            str(collection_id),
+            ids,
+            embeddings,
+            [serialize_metadata(metadata) for metadata in metadatas]
+            if metadatas is not None
+            else None,
+            documents,
+            uris,
+            tenant,
+            database,
+        )
 
     @override
     def _conditional_upsert(
@@ -769,7 +815,19 @@ class RustBindingsAPI(ServerAPI):
         tenant: str = DEFAULT_TENANT,
         database: str = DEFAULT_DATABASE,
     ) -> bool:
-        self._unsupported_conditional_transactions()
+        return self.bindings.conditional_upsert(
+            transaction,
+            str(collection_id),
+            ids,
+            embeddings,
+            [serialize_metadata(metadata) for metadata in metadatas]
+            if metadatas is not None
+            else None,
+            documents,
+            uris,
+            tenant,
+            database,
+        )
 
     @override
     def _conditional_delete(
@@ -780,14 +838,24 @@ class RustBindingsAPI(ServerAPI):
         tenant: str = DEFAULT_TENANT,
         database: str = DEFAULT_DATABASE,
     ) -> bool:
-        self._unsupported_conditional_transactions()
+        return self.bindings.conditional_delete(
+            transaction,
+            str(collection_id),
+            ids,
+            tenant,
+            database,
+        )
 
     @override
     def _conditional_commit(
         self,
         transaction: object,
     ) -> ConditionalCommitResult:
-        self._unsupported_conditional_transactions()
+        result = self.bindings.conditional_commit(transaction)
+        return ConditionalCommitResult(
+            first_inserted_record_offset=result.first_inserted_record_offset,
+            record_count=result.record_count,
+        )
 
     @override
     def reset(self) -> bool:

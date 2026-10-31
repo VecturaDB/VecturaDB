@@ -127,7 +127,7 @@ impl Log {
     }
 
     pub fn supports_conditional_transactions(&self) -> bool {
-        matches!(self, Log::Grpc(_))
+        matches!(self, Log::Grpc(_) | Log::Sqlite(_))
     }
 
     #[tracing::instrument(skip(self))]
@@ -254,17 +254,17 @@ impl Log {
             .map_err(|_| PushLogsError::RecordCountOutOfRange(records.len()))?;
         match self {
             Log::Sqlite(log) => {
-                if condition.is_some() {
-                    return Err(PushLogsError::ConditionalWritesUnsupported("sqlite"));
-                }
                 // A log too full answers as the log service of distributed Chroma, through the frontend.
-                log.push_logs(collection_id, records)
+                log.push_logs_with_condition(collection_id, records, condition.as_ref())
                     .await
                     .map_err(|e| match e {
                         SqlitePushLogsError::BackoffCompaction { retry_after } => {
                             PushLogsError::BackoffCompaction {
                                 retry_after: Some(retry_after),
                             }
+                        }
+                        SqlitePushLogsError::ConditionalWriteConflict => {
+                            PushLogsError::ConditionalWriteConflict
                         }
                         other => PushLogsError::Other(Box::new(other)),
                     })?;

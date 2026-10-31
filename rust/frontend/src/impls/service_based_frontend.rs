@@ -3227,10 +3227,15 @@ impl ServiceBasedFrontend {
             scouted_log_upper_bound_offset,
         )?;
         if let Some(read_token) = read_plan.stale_read_token {
-            Self::validate_occ_read_snapshot(
-                collection_and_segments.collection.log_position,
-                read_token,
-            )?;
+            // The SQLite sysdb keeps no log position: on the single node the log gives it.
+            let log_position = match &self.log_client {
+                Log::Sqlite(log) => log
+                    .log_position(collection_and_segments.collection.collection_id)
+                    .await
+                    .map_err(|err| QueryError::Other(Box::new(err)))?,
+                _ => collection_and_segments.collection.log_position,
+            };
+            Self::validate_occ_read_snapshot(log_position, read_token)?;
         }
         let get_result = Box::pin(self.fan_out_get(
             tenant_id,
@@ -4298,8 +4303,10 @@ mod tests {
         assert_eq!(ErrorCodes::Unimplemented, err.code());
     }
 
+    // The SQLite log of the single node takes conditional writes: with transactions on, an empty commit is answered as
+    // by distributed Chroma, with no record.
     #[tokio::test]
-    async fn conditional_commit_unsupported_log_returns_transactions_not_supported() {
+    async fn conditional_commit_on_the_sqlite_log_is_supported() {
         let registry = Registry::new();
         let system = System::new();
         let mut config = FrontendConfig::sqlite_in_memory();
@@ -4308,7 +4315,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = frontend
+        let result = frontend
             .conditional_commit(
                 ConditionalCommitRequest {
                     buffered_writes: Vec::new(),
@@ -4318,14 +4325,10 @@ mod tests {
                 String::new(),
             )
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(
-            err,
-            ConditionalCommitError::TransactionsNotSupported { ref implementation }
-                if implementation == "sqlite"
-        ));
-        assert_eq!(ErrorCodes::Unimplemented, err.code());
+        assert_eq!(result.record_count, 0);
+        assert_eq!(result.first_inserted_record_offset, None);
     }
 
     #[tokio::test]
@@ -4356,24 +4359,14 @@ mod tests {
         let system = System::new();
         let mut config = FrontendConfig::sqlite_in_memory();
         config.tenants_with_transactions_enabled = vec!["enabled_tenant".to_string()];
-        let mut frontend = ServiceBasedFrontend::try_from_config(&(config, system), &registry)
+        let frontend = ServiceBasedFrontend::try_from_config(&(config, system), &registry)
             .await
             .unwrap();
 
-        let err = frontend
-            .conditional_commit(
-                conditional_commit_request_for_tenant("enabled_tenant"),
-                String::new(),
-            )
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            ConditionalCommitError::TransactionsNotSupported { ref implementation }
-                if implementation == "sqlite"
-        ));
-        assert_eq!(ErrorCodes::Unimplemented, err.code());
+        // The SQLite log of the single node takes conditional writes.
+        frontend
+            .ensure_conditional_commit_supported_for_tenant("enabled_tenant")
+            .unwrap();
     }
 
     #[test]
