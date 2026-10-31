@@ -2074,21 +2074,27 @@ impl LocalExecutor {
     }
 
     /// A round of the timer of the flushes, at once, with its thresholds: see ScheduledCompactMessage. As every round, it
-    /// schedules the next one.
+    /// schedules the next one. It answers once the flushes of the round are done.
     pub(crate) async fn compaction_round(&self) -> Result<(), Box<dyn ChromaError>> {
         self.compactor_handle
             .clone()
             .request(chroma_log::ScheduledCompactMessage {}, None)
             .await
-            .map_err(|err| err.boxed())
+            .map_err(|err| err.boxed())?
+            .await
+            .map_err(|err| {
+                chroma_log::CompactionManagerError::SpannFlushFailed(err.to_string()).boxed()
+            })
     }
 
-    /// A flush of a SPANN collection at once, whatever the thresholds: see OneOffCompactMessage.
+    /// A flush of a SPANN collection at once, whatever the thresholds: see OneOffCompactMessage. It answers once the flush
+    /// is done; with a flush of the collection in progress, after its own flush, which follows that one.
     pub(crate) async fn flush_spann(
         &self,
         collection_id: chroma_types::CollectionUuid,
     ) -> Result<(), Box<dyn ChromaError>> {
-        self.compactor_handle
+        let answers = self
+            .compactor_handle
             .clone()
             .request(
                 chroma_log::OneOffCompactMessage {
@@ -2097,8 +2103,16 @@ impl LocalExecutor {
                 None,
             )
             .await
-            .map_err(|err| err.boxed())?
-            .map_err(|err| err.boxed())
+            .map_err(|err| err.boxed())?;
+        for answer in answers {
+            answer
+                .await
+                .map_err(|err| {
+                    chroma_log::CompactionManagerError::SpannFlushFailed(err.to_string()).boxed()
+                })?
+                .map_err(|err| err.boxed())?;
+        }
+        Ok(())
     }
 }
 

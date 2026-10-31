@@ -95,6 +95,8 @@ impl Fixture {
             min_compaction_size: 10,
             max_compaction_size: 10_000,
             compaction_timeout: Duration::from_secs(86_400),
+            spann_flushes: SpannFlushes::default(),
+            spann_flush_stop: None,
         });
         Self {
             db,
@@ -231,6 +233,8 @@ impl Fixture {
             min_compaction_size: 10,
             max_compaction_size: 10_000,
             compaction_timeout: Duration::from_secs(86_400),
+            spann_flushes: SpannFlushes::default(),
+            spann_flush_stop: None,
         });
     }
 
@@ -1562,6 +1566,8 @@ async fn replaced_spann_versions_are_forgotten_after_the_grace() {
         min_compaction_size: 10,
         max_compaction_size: 10_000,
         compaction_timeout: Duration::from_secs(86_400),
+        spann_flushes: SpannFlushes::default(),
+        spann_flush_stop: None,
     };
     let collection = Collection::test_collection(3);
     for _ in 0..100 {
