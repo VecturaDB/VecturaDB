@@ -216,6 +216,11 @@ impl LocalHnswSegmentReader {
                 let _files = acquire_hnsw_files().await;
                 let path = Path::new(&path_str);
                 let index_folder = path.join(segment.id.to_string());
+                // A save cut by a stop leaves its journal: its bytes go back to the files before anything reads them.
+                if index_folder.exists() {
+                    HnswIndex::apply_persist_journal(&index_folder)
+                        .map_err(|_| LocalHnswSegmentReaderError::HnswIndexLoadError)?;
+                }
                 if !index_folder.join(METADATA_FILE).is_file()
                     && get_current_seq_id(segment, &sql_db).await? > 0
                 {
@@ -920,6 +925,11 @@ impl LocalHnswSegmentWriter {
                 let _files = acquire_hnsw_files().await;
                 let path = Path::new(&path_str);
                 let index_folder = path.join(segment.id.to_string());
+                // A save cut by a stop leaves its journal: its bytes go back to the files before anything reads them.
+                if index_folder.exists() {
+                    HnswIndex::apply_persist_journal(&index_folder)
+                        .map_err(|_| LocalHnswSegmentWriterError::HnswIndexLoadError)?;
+                }
                 if !index_folder.join(METADATA_FILE).is_file()
                     && get_current_seq_id(segment, &sql_db).await? > 0
                 {
@@ -1377,7 +1387,7 @@ async fn persist(
                 .map_err(|_| LocalHnswSegmentWriterError::HnswIndexPersistError)?;
             files
                 .0
-                .save()
+                .save_with_journal()
                 .map_err(|_| LocalHnswSegmentWriterError::HnswIndexPersistError)?;
         }
         // Persist id map.

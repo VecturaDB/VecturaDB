@@ -1,9 +1,13 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use super::{IndexConfig, IndexUuid};
 use chroma_distance::DistanceFunction;
 use chroma_error::{ChromaError, ErrorCodes};
 use std::{io::Read, mem::size_of, path::Path};
 use thiserror::Error;
 use tracing::instrument;
+
+/// The journal that a save keeps in the folder of a local index while it writes the files, and what a load finds.
+pub use hnswlib::{PersistJournal, PERSIST_JOURNAL_FILE};
 
 // Setting it to a small value to prevent
 // bloating of the index which directly impacts query latency by increasing
@@ -300,6 +304,27 @@ impl HnswIndex {
         self.index.save().map_err(|e| WrappedHnswError(e).boxed())
     }
 
+    /// `save` with a journal of what it writes, synced first and removed once the files are synced: a stop in the
+    /// middle leaves files that `apply_persist_journal` makes whole again.
+    pub fn save_with_journal(&self) -> Result<(), Box<dyn ChromaError>> {
+        self.index
+            .save_with_journal()
+            .map_err(|e| WrappedHnswError(e).boxed())
+    }
+
+    /// The journal of a save alone, the files untouched: for tests of a save cut after its journal.
+    pub fn write_persist_journal(&self) -> Result<(), Box<dyn ChromaError>> {
+        self.index
+            .write_persist_journal()
+            .map_err(|e| WrappedHnswError(e).boxed())
+    }
+
+    /// The journal of a save cut by a stop, written again to the files of the index in `path`, before anything reads
+    /// them.
+    pub fn apply_persist_journal(path: &Path) -> Result<PersistJournal, Box<dyn ChromaError>> {
+        hnswlib::apply_persist_journal(path).map_err(|e| WrappedHnswInitError::Other(e).boxed())
+    }
+
     fn validate_header_dimension(header: &[u8], expected: i32) -> Result<(), Box<dyn ChromaError>> {
         let actual = parse_persisted_hnsw_dim(header)
             .ok_or_else(|| WrappedHnswInitError::InvalidHeader.boxed())?;
@@ -407,5 +432,54 @@ mod tests {
             prop_assert_eq!((index.len(), index.get(1).unwrap()), (1, before));
             prop_assert_eq!(index.query(&vector, 1, &[], &[]).unwrap(), (vec![1], vec![0.0]));
         }
+    }
+
+    // splitmix64: the same vectors on every platform and with every version of rand.
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn vector(&mut self, dim: usize) -> Vec<f32> {
+            (0..dim)
+                .map(|_| (self.next() >> 40) as f32 / (1u64 << 23) as f32 - 1.0)
+                .collect()
+        }
+    }
+
+    // Updates of vectors, one after the other, must leave every element reachable: a query for all of them, which
+    // explores the whole graph from its entry point, returns all of them. With the updatePoint of hnswlib at e6db8c2, an
+    // update could drop a link from a list that had room for it, and rounds 70 and 151 left elements that no query
+    // reaches.
+    #[test]
+    fn updates_of_vectors_keep_every_element_reachable() {
+        let mut lost = Vec::new();
+        for round in 0..160 {
+            let mut rng = SplitMix64(round);
+            let index = HnswIndex::init(
+                &IndexConfig::new(8, DistanceFunction::Euclidean),
+                Some(&HnswIndexConfig::new_ephemeral(16, 100, 60)),
+                IndexUuid(uuid::Uuid::new_v4()),
+            )
+            .unwrap();
+            for id in 1..=60 {
+                index.add(id, &rng.vector(8)).unwrap();
+            }
+            for _ in 0..600 {
+                let id = 1 + (rng.next() % 60) as usize;
+                index.add(id, &rng.vector(8)).unwrap();
+            }
+            let (ids, _) = index.query(&rng.vector(8), 60, &[], &[]).unwrap();
+            if ids.len() < 60 {
+                lost.push(round);
+            }
+        }
+        assert!(lost.is_empty(), "rounds that lose elements: {lost:?}");
     }
 }
