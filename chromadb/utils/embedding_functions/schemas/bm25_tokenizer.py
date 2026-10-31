@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 from __future__ import annotations
 
 import re
@@ -199,11 +200,14 @@ class _SnowballStemmerAdapter:
     """Adapter that provides the uniform `stem` API used across languages."""
 
     def __init__(self) -> None:
+        # snowballstemmer 2, a dependency of the package: version 3 stems some English
+        # words otherwise (university, added, international, organization), and the
+        # sparse vectors would not be those of the Rust and JS clients.
         try:
             import snowballstemmer
         except ImportError:
             raise ValueError(
-                "The snowballstemmer python package is not installed. Please install it with `pip install snowballstemmer`"
+                'The snowballstemmer python package is not installed. Please install it with `pip install "snowballstemmer>=2.2.0,<3"`'
             )
 
         self._stemmer = snowballstemmer.stemmer("english")
