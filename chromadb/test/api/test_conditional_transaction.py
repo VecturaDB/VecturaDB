@@ -17,6 +17,7 @@ from chromadb.errors import (
     BackoffError,
     ConditionalWriteConflictError,
     StaleReadError,
+    TransactionsNotSupportedError,
 )
 from chromadb.types import Collection as CollectionModel
 
@@ -158,15 +159,16 @@ def test_sync_conditional_transaction_routes_to_internal_hooks() -> None:
     os.getenv("CHROMA_RUST_BINDINGS_TEST_ONLY") != "1",
     reason="Rust bindings support check only runs in rust-bindings test mode",
 )
-def test_rust_bindings_conditional_transactions_require_grpc_log(
+def test_rust_bindings_conditional_transactions_follow_the_frontend_configuration(
     client: ClientAPI,
 ) -> None:
+    # The single node takes conditional transactions; enable_transactions is off by default, as in distributed Chroma.
     collection = client.create_collection(
-        name=f"conditional_unsupported_{uuid4().hex}",
+        name=f"conditional_disabled_{uuid4().hex}",
         embedding_function=None,
     )
 
-    with pytest.raises(NotImplementedError, match="only supported.*HttpClient"):
+    with pytest.raises(TransactionsNotSupportedError, match="disabled by frontend configuration"):
         collection.conditional()
 
 
@@ -200,7 +202,7 @@ def test_async_conditional_transaction_routes_to_internal_hooks() -> None:
     asyncio.run(run())
 
 
-def test_embedded_conditional_transaction_reports_unsupported(
+def test_embedded_conditional_transaction_follows_the_frontend_configuration(
     sqlite: System,
 ) -> None:
     client = ClientCreator.from_system(sqlite)
@@ -210,8 +212,16 @@ def test_embedded_conditional_transaction_reports_unsupported(
             embedding_function=None,
         )
 
-        with pytest.raises(NotImplementedError, match="Conditional transactions"):
-            collection.conditional()
+        # The Rust bindings take conditional transactions, off by default as in distributed Chroma; the Python
+        # segment API does not have them.
+        if os.getenv("CHROMA_RUST_BINDINGS_TEST_ONLY") == "1":
+            with pytest.raises(
+                TransactionsNotSupportedError, match="disabled by frontend configuration"
+            ):
+                collection.conditional()
+        else:
+            with pytest.raises(NotImplementedError, match="Conditional transactions"):
+                collection.conditional()
     finally:
         client.clear_system_cache()
 
