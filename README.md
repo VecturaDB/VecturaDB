@@ -146,6 +146,21 @@ docker run -p 127.0.0.1:8000:8000 -v ./data:/data -e CHROMA_EXECUTOR__LOCAL__SPA
 - A write to a SPANN collection whose log holds `log: sqlite: num_records_before_backpressure` records after its last flush, 100,000 by default as in distributed Chroma, is refused until a flush takes them, with the answer of distributed Chroma: 429, `log needs compaction before accepting more writes; please backoff exponentially and retry`. Unlike distributed Chroma, the answer also has the header `Retry-After`: the seconds, at least 1, until the end of the flushes that should take the log under the limit, estimated from the rounds of the compactor.
 - Chroma 1.5.9 and VecturaDB 1.0.0-preview.3.post1 open a data path with SPANN collections and serve the other collections as before. A SPANN collection answers there with an error, 500: do not write to it with them. Deleting it there works; VecturaDB removes its files at the next startup.
 
+## Conditional transactions
+
+The conditional transactions of distributed Chroma work on the single node, on by default as on Chroma Cloud, with the same API and the same answers as Chroma Cloud: `collection.conditional()` reads records, buffers writes, and commits them only if no record it read or writes changed after its reads; otherwise the commit fails with `ConditionalWriteConflictError` (409), and the client retries with a new transaction. They work over HTTP and in process, with the Rust bindings.
+
+Reads and writes outside a transaction do not look at the log, and a collection that never uses them works as on Chroma 1.5.9. To turn them off:
+
+```yaml
+enable_transactions: false
+enable_log_scouting: false
+```
+
+With Docker, `-e CHROMA_ENABLE_TRANSACTIONS=false -e CHROMA_ENABLE_LOG_SCOUTING=false`.
+
+A commit checks the records written after its reads in the log of the collection. From its first conditional read or write, a collection keeps them for `log: sqlite: purge_cutoff_time_seconds` after they are written, by default 43,200 (12 hours), as distributed Chroma keeps its log, and purges them every `local_compaction_manager: purge_interval_sec`, by default 7,200 (2 hours). A collection that has used no transaction for that long, or since the server started, purges what it applied at once, as Chroma 1.5.9. A transaction whose reads are older than the cutoff or than a restart of the server may be refused, and the client starts it again. A lower cutoff keeps the database file smaller.
+
 ## Clients
 
 A client that needs to know which server it talks to reads `GET /api/v2/pre-flight-checks`. VecturaDB answers with the fields of Chroma and adds a `server` block, for example:

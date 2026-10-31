@@ -4282,7 +4282,9 @@ mod tests {
     async fn conditional_commit_disabled_returns_transactions_disabled() {
         let registry = Registry::new();
         let system = System::new();
-        let config = FrontendConfig::sqlite_in_memory();
+        let mut config = FrontendConfig::sqlite_in_memory();
+        // Off, as the configuration of distributed Chroma that these tests copy.
+        config.enable_transactions = false;
         let mut frontend = ServiceBasedFrontend::try_from_config(&(config, system), &registry)
             .await
             .unwrap();
@@ -4336,6 +4338,8 @@ mod tests {
         let registry = Registry::new();
         let system = System::new();
         let mut config = FrontendConfig::sqlite_in_memory();
+        // Off, as the configuration of distributed Chroma that these tests copy.
+        config.enable_transactions = false;
         config.tenants_with_transactions_enabled = vec!["enabled_tenant".to_string()];
         let mut frontend = ServiceBasedFrontend::try_from_config(&(config, system), &registry)
             .await
@@ -4358,6 +4362,8 @@ mod tests {
         let registry = Registry::new();
         let system = System::new();
         let mut config = FrontendConfig::sqlite_in_memory();
+        // Off, as the configuration of distributed Chroma that these tests copy.
+        config.enable_transactions = false;
         config.tenants_with_transactions_enabled = vec!["enabled_tenant".to_string()];
         let frontend = ServiceBasedFrontend::try_from_config(&(config, system), &registry)
             .await

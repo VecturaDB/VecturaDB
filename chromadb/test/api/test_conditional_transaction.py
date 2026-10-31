@@ -17,7 +17,6 @@ from chromadb.errors import (
     BackoffError,
     ConditionalWriteConflictError,
     StaleReadError,
-    TransactionsNotSupportedError,
 )
 from chromadb.types import Collection as CollectionModel
 
@@ -159,17 +158,20 @@ def test_sync_conditional_transaction_routes_to_internal_hooks() -> None:
     os.getenv("CHROMA_RUST_BINDINGS_TEST_ONLY") != "1",
     reason="Rust bindings support check only runs in rust-bindings test mode",
 )
-def test_rust_bindings_conditional_transactions_follow_the_frontend_configuration(
+def test_rust_bindings_take_conditional_transactions(
     client: ClientAPI,
 ) -> None:
-    # The single node takes conditional transactions; enable_transactions is off by default, as in distributed Chroma.
+    # The single node takes conditional transactions, on by default.
     collection = client.create_collection(
-        name=f"conditional_disabled_{uuid4().hex}",
+        name=f"conditional_{uuid4().hex}",
         embedding_function=None,
     )
 
-    with pytest.raises(TransactionsNotSupportedError, match="disabled by frontend configuration"):
-        collection.conditional()
+    txn = collection.conditional()
+    assert txn.get(ids="new-id")["ids"] == []
+    txn.add(ids="new-id", embeddings=[1.0, 2.0])
+    assert txn.commit()["record_count"] == 1
+    assert collection.get(ids="new-id")["ids"] == ["new-id"]
 
 
 def test_async_conditional_transaction_routes_to_internal_hooks() -> None:
@@ -202,7 +204,7 @@ def test_async_conditional_transaction_routes_to_internal_hooks() -> None:
     asyncio.run(run())
 
 
-def test_embedded_conditional_transaction_follows_the_frontend_configuration(
+def test_embedded_conditional_transaction_on_the_rust_bindings_only(
     sqlite: System,
 ) -> None:
     client = ClientCreator.from_system(sqlite)
@@ -212,13 +214,12 @@ def test_embedded_conditional_transaction_follows_the_frontend_configuration(
             embedding_function=None,
         )
 
-        # The Rust bindings take conditional transactions, off by default as in distributed Chroma; the Python
-        # segment API does not have them.
+        # The Rust bindings take conditional transactions, on by default; the Python segment API does not have them.
         if os.getenv("CHROMA_RUST_BINDINGS_TEST_ONLY") == "1":
-            with pytest.raises(
-                TransactionsNotSupportedError, match="disabled by frontend configuration"
-            ):
-                collection.conditional()
+            txn = collection.conditional()
+            assert txn.get(ids="new-id")["ids"] == []
+            txn.add(ids="new-id", embeddings=[1.0, 2.0])
+            assert txn.commit()["record_count"] == 1
         else:
             with pytest.raises(NotImplementedError, match="Conditional transactions"):
                 collection.conditional()

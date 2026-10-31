@@ -515,8 +515,9 @@ impl Bindings {
             tenants_with_maxscore_enabled: vec![],
             tenants_with_token_bitmap_fts_enabled: vec![],
             tenants_with_transactions_enabled: vec![],
-            enable_log_scouting: false,
-            enable_transactions: false,
+            // On by default on the single node, as the server: see default_enable_transactions.
+            enable_log_scouting: true,
+            enable_transactions: true,
         };
 
         let frontend = runtime.block_on(async {
