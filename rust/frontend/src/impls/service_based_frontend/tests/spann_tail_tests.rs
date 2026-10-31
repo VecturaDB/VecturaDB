@@ -1417,3 +1417,35 @@ async fn a_round_leaves_a_collection_whose_flush_runs_to_a_later_one_impl() {
     round.await.unwrap().unwrap();
     assert_eq!(status(&mut frontend, collection_id).await, (1.0, 0, 12, 12));
 }
+
+// A flush writes with the providers of the compactor: the HNSW index of the centers that it forks and changes is in their
+// cache, not in the cache of the readers, where a reader would wait on its lock (see compaction_spann_provider).
+#[test]
+fn a_spann_flush_keeps_its_index_of_the_centers_out_of_the_cache_of_the_readers() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_spann_flush_keeps_its_index_of_the_centers_out_of_the_cache_of_the_readers_impl,
+    )
+}
+
+async fn a_spann_flush_keeps_its_index_of_the_centers_out_of_the_cache_of_the_readers_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = Registry::new();
+    let mut frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+    let collection_id = empty_spann_collection(&mut frontend, "centers_of_a_flush").await;
+    add_numbers(&mut frontend, collection_id, 0..20).await;
+    flush_spann(&frontend, collection_id).await;
+    let files = vector_files(&mut frontend, collection_id).await;
+    let (_, id) =
+        chroma_types::Segment::extract_prefix_and_id(&files[chroma_types::HNSW_PATH][0]).unwrap();
+    let id = chroma_index::IndexUuid(id);
+    let manager = registry
+        .get::<chroma_segment::local_segment_manager::LocalSegmentManager>()
+        .unwrap();
+    let cached = |provider: &chroma_segment::spann_provider::SpannProvider| {
+        let provider = provider.hnsw_provider.clone();
+        async move { provider.get(&id, &collection_id).await.is_some() }
+    };
+    assert!(cached(manager.compaction_spann_provider().unwrap()).await);
+    assert!(!cached(manager.spann_provider().unwrap()).await);
+}

@@ -1130,7 +1130,7 @@ impl SpannFlusher {
         let write = |err: Box<dyn ChromaError>| CompactionManagerError::SpannWriteError(err);
         let provider = self
             .hnsw_segment_manager
-            .spann_provider()
+            .compaction_spann_provider()
             .ok_or(CompactionManagerError::SpannUnavailable)?;
         let collection = &collection_and_segments.collection;
         let record_shard = SegmentShard::try_from((&collection_and_segments.record_segment, 0))
