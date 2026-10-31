@@ -1,4 +1,4 @@
-# Changed by VecturaDB contributors for the VecturaDB branding.
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 # Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
 from typing import (
     Optional,
@@ -21,6 +21,7 @@ from typing_extensions import TypeAlias
 from dataclasses import dataclass
 from numpy.typing import NDArray
 import numpy as np
+import os
 import warnings
 from typing_extensions import TypedDict, Protocol, runtime_checkable
 from pydantic import BaseModel, field_validator, model_validator
@@ -960,6 +961,12 @@ class EmbeddingFunction(Protocol[D]):
 class DefaultEmbeddingFunction(EmbeddingFunction[Documents]):
     """Default embedding function that delegates to ONNXMiniLM_L6_V2."""
 
+    # One ONNXMiniLM_L6_V2 for each process, kept as SentenceTransformerEmbeddingFunction
+    # keeps its models: a new one at every call loaded the model and started an ONNX
+    # session again. By process id, so that a child of fork() does not use the session
+    # of its parent.
+    models: Dict[int, "EmbeddingFunction[Documents]"] = {}
+
     def __init__(self) -> None:
         if is_thin_client:
             return
@@ -970,7 +977,11 @@ class DefaultEmbeddingFunction(EmbeddingFunction[Documents]):
             ONNXMiniLM_L6_V2,
         )
 
-        return ONNXMiniLM_L6_V2()(input)
+        model = self.models.get(os.getpid())
+        if model is None:
+            # Two threads here at once: setdefault keeps the first one for both.
+            model = self.models.setdefault(os.getpid(), ONNXMiniLM_L6_V2())
+        return model(input)
 
     @staticmethod
     def build_from_config(config: Dict[str, Any]) -> "DefaultEmbeddingFunction":
