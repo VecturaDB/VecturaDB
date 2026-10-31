@@ -5,6 +5,9 @@ use std::{io::Read, mem::size_of, path::Path};
 use thiserror::Error;
 use tracing::instrument;
 
+/// The journal that a save keeps in the folder of a local index while it writes the files, and what a load finds.
+pub use hnswlib::{PersistJournal, PERSIST_JOURNAL_FILE};
+
 // Setting it to a small value to prevent
 // bloating of the index which directly impacts query latency by increasing
 // the amount of bytes that need to be fetched from s3. The trade off is that
@@ -298,6 +301,27 @@ impl HnswIndex {
 
     pub fn save(&self) -> Result<(), Box<dyn ChromaError>> {
         self.index.save().map_err(|e| WrappedHnswError(e).boxed())
+    }
+
+    /// `save` with a journal of what it writes, synced first and removed once the files are synced: a stop in the
+    /// middle leaves files that `apply_persist_journal` makes whole again.
+    pub fn save_with_journal(&self) -> Result<(), Box<dyn ChromaError>> {
+        self.index
+            .save_with_journal()
+            .map_err(|e| WrappedHnswError(e).boxed())
+    }
+
+    /// The journal of a save alone, the files untouched: for tests of a save cut after its journal.
+    pub fn write_persist_journal(&self) -> Result<(), Box<dyn ChromaError>> {
+        self.index
+            .write_persist_journal()
+            .map_err(|e| WrappedHnswError(e).boxed())
+    }
+
+    /// The journal of a save cut by a stop, written again to the files of the index in `path`, before anything reads
+    /// them.
+    pub fn apply_persist_journal(path: &Path) -> Result<PersistJournal, Box<dyn ChromaError>> {
+        hnswlib::apply_persist_journal(path).map_err(|e| WrappedHnswInitError::Other(e).boxed())
     }
 
     fn validate_header_dimension(header: &[u8], expected: i32) -> Result<(), Box<dyn ChromaError>> {

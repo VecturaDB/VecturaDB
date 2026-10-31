@@ -1067,3 +1067,147 @@ async fn checkpoint_validation_reuses_successful_saves_and_detects_external_chan
         .await
         .unwrap());
 }
+
+// A writer with the records 1-20 saved, then 21-60 and updates of 1-5 applied in memory only, and the records that the
+// log replays after the saved checkpoint.
+async fn journal_fixture() -> (
+    tempfile::TempDir,
+    SqliteDb,
+    Collection,
+    Segment,
+    LocalHnswSegmentWriter,
+    Vec<LogRecord>,
+) {
+    let (root, sqlite, collection, segment, mut writer) = fixture().await;
+    writer.index.inner.write().await.sync_threshold = 1;
+    let first: Vec<_> = (1..=20).map(|id| record(id, id as u8, 0)).collect();
+    writer
+        .apply_log_chunk(Chunk::new(first.into()))
+        .await
+        .unwrap();
+    writer.index.inner.write().await.sync_threshold = 1000;
+    let tail: Vec<_> = (21..=60)
+        .map(|id| record(id, id as u8, 0))
+        .chain((61..=65).map(|offset| record(offset, (offset - 60) as u8, 2)))
+        .collect();
+    writer
+        .apply_log_chunk(Chunk::new(tail.clone().into()))
+        .await
+        .unwrap();
+    (root, sqlite, collection, segment, writer, tail)
+}
+
+// After a stop in a save of journal_fixture: the writer opens the collection, replays the log after the saved
+// checkpoint and saves; then the reader has all the records.
+async fn assert_journal_fixture_recovers(
+    root: &tempfile::TempDir,
+    sqlite: &SqliteDb,
+    collection: &Collection,
+    segment: &Segment,
+    tail: Vec<LogRecord>,
+) {
+    let folder = root.path().join(segment.id.to_string());
+    let persist_path = Some(root.path().to_str().unwrap().to_string());
+    let mut reopened = LocalHnswSegmentWriter::from_segment(
+        collection,
+        segment,
+        3,
+        persist_path.clone(),
+        sqlite.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(!folder.join(chroma_index::PERSIST_JOURNAL_FILE).exists());
+    reopened.index.inner.write().await.sync_threshold = 1;
+    reopened
+        .apply_log_chunk(Chunk::new(tail.into()))
+        .await
+        .unwrap();
+    reopened.index.close().await;
+    drop(reopened);
+    let reader =
+        LocalHnswSegmentReader::from_segment(collection, segment, 3, persist_path, sqlite.clone())
+            .await
+            .unwrap();
+    for id in 1..=60u8 {
+        let offset = if id <= 5 { 60 + id } else { id };
+        assert_eq!(
+            reader
+                .get_embedding_by_user_id(&id.to_string())
+                .await
+                .unwrap(),
+            vec![offset as f32; 3]
+        );
+    }
+    assert_eq!(reader.index.inner.read().await.index.len(), 60);
+    assert_eq!(get_current_seq_id(segment, sqlite).await.unwrap(), 65);
+}
+
+// A save cut by a stop after header.bin, as a kill -9 in the middle of it: the header of the new checkpoint, the other
+// files of the old one, which the validation of the files rejects. The journal of the save gives back the files of the
+// new checkpoint before anything reads them, whether the writer or the reader opens the collection first.
+#[tokio::test]
+async fn a_save_cut_after_its_header_is_mended_by_its_journal() {
+    for reader_first in [false, true] {
+        let (root, sqlite, collection, segment, writer, tail) = journal_fixture().await;
+        let folder = root.path().join(segment.id.to_string());
+        let cut = ["data_level0.bin", "length.bin", "link_lists.bin"];
+        let old: Vec<_> = cut
+            .iter()
+            .map(|name| std::fs::read(folder.join(name)).unwrap())
+            .collect();
+        {
+            let guard = writer.index.inner.write().await;
+            let _permit = acquire_hnsw_files().await;
+            let files = HnswFiles(&guard.index);
+            files.0.open_fd().unwrap();
+            files.0.write_persist_journal().unwrap();
+            files.0.save().unwrap();
+        }
+        writer.index.close().await;
+        drop(writer);
+        for (name, bytes) in cut.iter().zip(&old) {
+            std::fs::write(folder.join(name), bytes).unwrap();
+        }
+        if reader_first {
+            let reader = LocalHnswSegmentReader::from_segment(
+                &collection,
+                &segment,
+                3,
+                Some(root.path().to_str().unwrap().to_string()),
+                sqlite.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(!folder.join(chroma_index::PERSIST_JOURNAL_FILE).exists());
+            assert_eq!(
+                reader
+                    .get_embedding_by_user_id(&"20".to_string())
+                    .await
+                    .unwrap(),
+                vec![20.0; 3]
+            );
+        }
+        assert_journal_fixture_recovers(&root, &sqlite, &collection, &segment, tail).await;
+    }
+}
+
+// A save that fails in the middle, as on a full disk: hnswlib writes header.bin and fails on data_level0.bin, and the
+// journal of the save stays. The next load gives back the files of that save.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_save_that_fails_in_the_middle_leaves_its_journal() {
+    let (root, sqlite, collection, segment, writer, tail) = journal_fixture().await;
+    let folder = root.path().join(segment.id.to_string());
+    let data = folder.join("data_level0.bin");
+    let backup = folder.join("data_level0.backup");
+    std::fs::rename(&data, &backup).unwrap();
+    std::os::unix::fs::symlink("/dev/full", &data).unwrap();
+    assert!(persist(writer.index.inner.write().await).await.is_err());
+    assert!(folder.join(chroma_index::PERSIST_JOURNAL_FILE).exists());
+    std::fs::remove_file(&data).unwrap();
+    std::fs::rename(&backup, &data).unwrap();
+    writer.index.close().await;
+    drop(writer);
+    assert_journal_fixture_recovers(&root, &sqlite, &collection, &segment, tail).await;
+}
