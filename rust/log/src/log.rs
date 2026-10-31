@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use crate::grpc_log::{GrpcLog, GrpcPushLogsError, GrpcSealLogError, ScoutLogFragmentsResponse};
 use crate::in_memory_log::InMemoryLog;
 use crate::sqlite_log::{SqliteLog, SqlitePushLogsError};

@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use chroma_memberlist::config::CustomResourceMemberlistProviderConfig;
 use serde::{Deserialize, Serialize};
 
