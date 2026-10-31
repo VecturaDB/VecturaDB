@@ -1200,3 +1200,220 @@ async fn a_spann_count_reads_the_first_records_of_the_log_up_to_its_limit_impl()
         );
     }
 }
+
+// A frontend of the single node with SPANN on whose first flush out of the actor stops, with its log read and before it
+// writes its files, until the test lets it go on.
+async fn frontend_with_a_stopped_flush(
+    root: &std::path::Path,
+) -> (ServiceBasedFrontend, chroma_log::SpannFlushStop) {
+    let registry = Registry::new();
+    let stop = chroma_log::SpannFlushStop::default();
+    registry.register(stop.clone());
+    (
+        frontend_with_spann_registry(root, true, &registry).await,
+        stop,
+    )
+}
+
+// A round of the timer on a task of its own, once its flush stopped.
+async fn a_round_that_stops(
+    frontend: &ServiceBasedFrontend,
+    stop: &chroma_log::SpannFlushStop,
+) -> tokio::task::JoinHandle<Result<(), Box<dyn ChromaError>>> {
+    let executor = local_executor(frontend).clone();
+    let round = tokio::spawn(async move { executor.compaction_round().await });
+    tokio::time::timeout(std::time::Duration::from_secs(60), stop.reached())
+        .await
+        .expect("the flush did not reach its stop in 60 s, the limit of the wait");
+    round
+}
+
+// A write answers while a flush of its collection runs, out of the actor, as a write of distributed Chroma does not wait
+// for a compaction: its record waits for the next flush, and the reads see it. The flush then ends as the others.
+#[test]
+fn a_write_answers_while_a_flush_of_its_collection_runs() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_write_answers_while_a_flush_of_its_collection_runs_impl,
+    )
+}
+
+async fn a_write_answers_while_a_flush_of_its_collection_runs_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut frontend, stop) = frontend_with_a_stopped_flush(root.path()).await;
+    let collection_id = empty_spann_collection(&mut frontend, "written").await;
+    add_numbers(&mut frontend, collection_id, 0..12).await;
+    let round = a_round_that_stops(&frontend, &stop).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        add_numbers(&mut frontend, collection_id, 12..13),
+    )
+    .await
+    .expect("the write waited for the flush up to 10 s, the limit of the wait");
+    assert_eq!(
+        get_ids(&mut frontend, collection_id, None, None, 0)
+            .await
+            .len(),
+        13
+    );
+    stop.go_on();
+    round.await.unwrap().unwrap();
+    assert_eq!(
+        status(&mut frontend, collection_id).await,
+        (12.0 / 13.0, 1, 12, 13)
+    );
+}
+
+// A SPANN collection deleted while its first flush runs leaves no file: the flush, stopped before its files, writes them
+// after the delete removed those of the collection, its registration fails, as the catalog no longer has the collection,
+// and its files go with the segments that the catalog lost. The delete does not wait for the flush.
+#[test]
+fn a_spann_collection_deleted_during_its_flush_leaves_no_file() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_spann_collection_deleted_during_its_flush_leaves_no_file_impl,
+    )
+}
+
+async fn a_spann_collection_deleted_during_its_flush_leaves_no_file_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut frontend, stop) = frontend_with_a_stopped_flush(root.path()).await;
+    let deleted = empty_spann_collection(&mut frontend, "deleted").await;
+    add_numbers(&mut frontend, deleted, 0..12).await;
+    let round = a_round_that_stops(&frontend, &stop).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        frontend.delete_collection(delete_collection_request("deleted")),
+    )
+    .await
+    .expect("the delete waited for the flush up to 10 s, the limit of the wait")
+    .unwrap();
+    stop.go_on();
+    round.await.unwrap().unwrap();
+    let files = files_under(root.path().join("tenant").as_path());
+    assert!(
+        files
+            .iter()
+            .all(|file| !file.to_string_lossy().contains(&deleted.to_string())),
+        "{files:#?}"
+    );
+}
+
+// A reset while the first flush of a SPANN collection runs leaves no file of it: the flush writes its files after the
+// reset, its registration fails, and its files go, as after a delete. The reset does not wait for the flush.
+#[test]
+fn a_reset_during_a_spann_flush_leaves_no_file_of_it() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_reset_during_a_spann_flush_leaves_no_file_of_it_impl,
+    )
+}
+
+async fn a_reset_during_a_spann_flush_leaves_no_file_of_it_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = Registry::new();
+    let stop = chroma_log::SpannFlushStop::default();
+    registry.register(stop.clone());
+    let mut config = FrontendConfig::sqlite_in_memory();
+    config.allow_reset = true;
+    config.sqlitedb.as_mut().unwrap().url =
+        Some(root.path().join("chroma.sqlite3").to_str().unwrap().into());
+    config.segment_manager.as_mut().unwrap().persist_path =
+        Some(root.path().to_str().unwrap().into());
+    config.executor = crate::executor::config::ExecutorConfig::Local(
+        crate::executor::config::LocalExecutorConfig {
+            spann: true,
+            ..Default::default()
+        },
+    );
+    config.local_compaction_manager = no_timer_flush();
+    let mut frontend = ServiceBasedFrontend::try_from_config(&(config, System::new()), &registry)
+        .await
+        .unwrap();
+    let before = empty_spann_collection(&mut frontend, "before").await;
+    add_numbers(&mut frontend, before, 0..12).await;
+    let round = a_round_that_stops(&frontend, &stop).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), frontend.reset())
+        .await
+        .expect("the reset waited for the flush up to 10 s, the limit of the wait")
+        .unwrap();
+    stop.go_on();
+    round.await.unwrap().unwrap();
+    let files = files_under(root.path().join("tenant").as_path());
+    assert!(
+        files
+            .iter()
+            .all(|file| !file.to_string_lossy().contains(&before.to_string())),
+        "{files:#?}"
+    );
+}
+
+// A one-off flush asked while a flush of its collection runs gets a flush of its own after that one, with no error, as a
+// one-off compaction of distributed Chroma asked during one in progress runs at a later round
+// (rust/worker/src/compactor/scheduler.rs): it answers once its own flush took the records written meanwhile.
+#[test]
+fn a_one_off_flush_asked_during_a_flush_gets_its_own_after_it() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_one_off_flush_asked_during_a_flush_gets_its_own_after_it_impl,
+    )
+}
+
+async fn a_one_off_flush_asked_during_a_flush_gets_its_own_after_it_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut frontend, stop) = frontend_with_a_stopped_flush(root.path()).await;
+    let collection_id = empty_spann_collection(&mut frontend, "queued").await;
+    add_numbers(&mut frontend, collection_id, 0..12).await;
+    let round = a_round_that_stops(&frontend, &stop).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        add_numbers(&mut frontend, collection_id, 12..15),
+    )
+    .await
+    .expect("the write waited for the flush up to 10 s, the limit of the wait");
+    let executor = local_executor(&frontend).clone();
+    let one_off = tokio::spawn(async move { executor.flush_spann(collection_id).await });
+    // The time for the request to reach the manager, which has nothing else to do: it waits for the flush in progress.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !one_off.is_finished(),
+        "the one-off flush answered before the flush in progress ended"
+    );
+    stop.go_on();
+    round.await.unwrap().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(60), one_off)
+        .await
+        .expect("the one-off flush did not end in 60 s, the limit of the wait")
+        .unwrap()
+        .unwrap();
+    assert_eq!(status(&mut frontend, collection_id).await, (1.0, 0, 15, 15));
+}
+
+// A round of the timer while a flush of a collection runs leaves that collection to a later round, as the scheduler of
+// distributed Chroma skips a collection whose compaction is in progress: one flush per collection at a time.
+#[test]
+fn a_round_leaves_a_collection_whose_flush_runs_to_a_later_one() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_round_leaves_a_collection_whose_flush_runs_to_a_later_one_impl,
+    )
+}
+
+async fn a_round_leaves_a_collection_whose_flush_runs_to_a_later_one_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut frontend, stop) = frontend_with_a_stopped_flush(root.path()).await;
+    let collection_id = empty_spann_collection(&mut frontend, "skipped").await;
+    add_numbers(&mut frontend, collection_id, 0..12).await;
+    let round = a_round_that_stops(&frontend, &stop).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        local_executor(&frontend).compaction_round(),
+    )
+    .await
+    .expect("the second round did not end in 10 s, the limit of the wait")
+    .unwrap();
+    assert_eq!(status(&mut frontend, collection_id).await, (0.0, 12, 0, 12));
+    stop.go_on();
+    round.await.unwrap().unwrap();
+    assert_eq!(status(&mut frontend, collection_id).await, (1.0, 0, 12, 12));
+}
