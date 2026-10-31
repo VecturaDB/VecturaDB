@@ -313,3 +313,25 @@ jobs:
           chroma run --path ./smoke-data --port 8001 &
           for i in $(seq 1 30); do curl -sf http://localhost:8001/api/v2/heartbeat && break; sleep 2; done
           python vecturadb/smoke.py 8001 localhost
+
+  hosted-embedding-functions:
+    name: Hosted embedding functions (models from Hugging Face)
+    needs: wheel-linux-x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/python
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheel-linux-x86_64
+          path: dist
+      - run: pip install --no-index --find-links dist VecturaDB
+      # Qwen3-Embedding-0.6B in float16 and SPLADE, 1.7 GB, downloaded every time by the functions themselves: in the cache of
+      # Actions they would push out the caches of Rust.
+      - name: chroma-cloud-qwen and chroma-cloud-splade against the vectors of Chroma Cloud
+        env:
+          CHROMA_RUST_BINDINGS_TEST_ONLY: "1"
+          CHROMA_TEST_HOSTED_MODELS: qwen-float16,splade
+        run: python -m pytest -v --color=yes -rs chromadb/test/ef/test_chroma_cloud_local.py
