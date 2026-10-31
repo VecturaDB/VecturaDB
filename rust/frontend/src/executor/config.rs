@@ -55,9 +55,10 @@ pub struct DistributedExecutorConfig {
 
 #[derive(Deserialize, Clone, Serialize, Debug)]
 pub struct LocalExecutorConfig {
-    /// Collections whose configuration or schema asks for SPANN get a SPANN index, as on distributed Chroma, instead of
-    /// HNSW. Off by default: a SPANN request then gets HNSW, as before. Needs a persistent data path.
-    #[serde(default)]
+    /// Collections whose configuration or schema asks for SPANN get a SPANN index, as on distributed Chroma and Chroma
+    /// Cloud, instead of HNSW; the other collections get HNSW. On by default; off, a SPANN request gets HNSW, as on
+    /// single-node Chroma. Without a persistent data path, every collection gets HNSW.
+    #[serde(default = "default_spann")]
     pub spann: bool,
     /// How a read of a SPANN collection reads again after an error that distributed Chroma retries, as the retry of the
     /// distributed executor: by default the same.
@@ -70,6 +71,11 @@ pub struct LocalExecutorConfig {
     pub bounded_wal_limit: u32,
 }
 
+// SPANN for the collections that ask for it, as on distributed Chroma.
+fn default_spann() -> bool {
+    true
+}
+
 // The default of the bounded_wal_limit of the query service of distributed Chroma (rust/worker/src/config.rs).
 fn default_bounded_wal_limit() -> u32 {
     250
@@ -78,7 +84,7 @@ fn default_bounded_wal_limit() -> u32 {
 impl Default for LocalExecutorConfig {
     fn default() -> Self {
         LocalExecutorConfig {
-            spann: false,
+            spann: default_spann(),
             retry: RetryConfig::default(),
             bounded_wal_limit: default_bounded_wal_limit(),
         }
@@ -970,5 +976,19 @@ mod tests {
             limit(r#"{"local": {"spann": true, "bounded_wal_limit": 7}}"#),
             7
         );
+    }
+
+    // SPANN is on by default, for the collections that ask for it; a configuration turns it off.
+    #[test]
+    fn the_local_executor_gives_spann_by_default() {
+        let spann = |config: &str| {
+            let ExecutorConfig::Local(config) = serde_json::from_str(config).unwrap() else {
+                panic!("not a local executor: {config}");
+            };
+            config.spann
+        };
+        assert!(spann(r#"{"local": {}}"#));
+        assert!(!spann(r#"{"local": {"spann": false}}"#));
+        assert!(LocalExecutorConfig::default().spann);
     }
 }

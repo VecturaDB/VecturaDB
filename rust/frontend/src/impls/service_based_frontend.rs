@@ -4514,12 +4514,19 @@ mod tests {
     }
 
     // With the option off, a request for SPANN, in the configuration or in the schema, gets HNSW as before; with it on,
-    // the segments of distributed Chroma. A request without SPANN gets HNSW either way.
+    // and without it, as the option is on by default, the segments of distributed Chroma. A request without SPANN gets
+    // HNSW either way.
     #[tokio::test]
     async fn a_spann_request_gets_hnsw_unless_the_option_asks_for_spann() {
-        for spann in [false, true] {
+        for (option, spann) in [(Some(false), false), (Some(true), true), (None, true)] {
             let root = tempfile::tempdir().unwrap();
-            let mut frontend = frontend_with_spann(root.path(), spann).await;
+            let mut frontend = match option {
+                Some(option) => frontend_with_spann(root.path(), option).await,
+                None => {
+                    frontend_with_local_executor(root.path(), Default::default(), &Registry::new())
+                        .await
+                }
+            };
             let request = |name: &str, configuration, schema| {
                 CreateCollectionRequest::try_new(
                     TENANT.to_string(),

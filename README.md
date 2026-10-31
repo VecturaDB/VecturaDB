@@ -114,15 +114,15 @@ What arrives: every record with its document, metadata, embedding and URI, the m
 
 ## SPANN index
 
-Chroma Cloud indexes the dense vectors of a collection with SPANN, single-node Chroma with HNSW. VecturaDB can give a collection a SPANN index on the single node too, behind the server option `spann`, off by default.
+Chroma Cloud indexes the dense vectors of a collection with SPANN, single-node Chroma with HNSW. VecturaDB gives a collection that asks for SPANN a SPANN index on the single node too, with the server option `spann`, on by default; every other collection gets HNSW, as before.
 
-With a configuration file:
+To turn it off, with a configuration file:
 
 ```yaml
 persist_path: "./data"
 executor:
   local:
-    spann: true
+    spann: false
 ```
 
 ```bash
@@ -132,10 +132,10 @@ vecturadb run config.yaml
 With Docker, the image reads its configuration file, and an environment variable sets the option:
 
 ```bash
-docker run -p 127.0.0.1:8000:8000 -v ./data:/data -e CHROMA_EXECUTOR__LOCAL__SPANN=true ghcr.io/vecturadb/vecturadb:preview
+docker run -p 127.0.0.1:8000:8000 -v ./data:/data -e CHROMA_EXECUTOR__LOCAL__SPANN=false ghcr.io/vecturadb/vecturadb:preview
 ```
 
-`run --path` reads no option, and the Python package has no SPANN in process.
+`run --path` and the Python package in process (`PersistentClient`) have the option on and read no other option. A server or a client without a persistent data path gives every collection HNSW.
 
 - With the option on, a collection created with a SPANN configuration or schema gets a SPANN index; any other collection gets HNSW, as before.
 - With the option off, a SPANN request gets HNSW, as on single-node Chroma. A SPANN collection created before still answers reads; a write to it fails with `SPANN collections need the executor option spann`.
