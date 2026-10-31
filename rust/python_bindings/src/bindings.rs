@@ -480,6 +480,7 @@ impl Bindings {
             topic_namespace: "default".to_string(),
             num_records_before_backpressure:
                 SqliteLogConfig::default_num_records_before_backpressure(),
+            purge_cutoff_time_seconds: SqliteLogConfig::default_purge_cutoff_time_seconds(),
         });
 
         let collection_cache_config = CollectionsWithSegmentsProviderConfig {

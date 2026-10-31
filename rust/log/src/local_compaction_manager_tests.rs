@@ -74,7 +74,9 @@ impl Fixture {
                 file_path: Default::default(),
             });
         }
-        let log = SqliteLog::new(db.clone(), "default".into(), "default".into());
+        // These tests purge what the compactor applied at once: no cutoff (purge_cutoff_time_seconds 0).
+        let log = SqliteLog::new(db.clone(), "default".into(), "default".into())
+            .with_purge_cutoff_time_seconds(0);
         log.update_legacy_embeddings_queue_config(LegacyEmbeddingsQueueConfig {
             automatically_purge: true,
             kind: "EmbeddingsQueueConfigurationInternal".into(),
@@ -221,11 +223,10 @@ impl Fixture {
         self.compactor_joined = false;
         self.manager = manager.clone();
         self.handle = self.system.start_component(LocalCompactionManager {
-            log: Log::Sqlite(SqliteLog::new(
-                self.db.clone(),
-                "default".into(),
-                "default".into(),
-            )),
+            log: Log::Sqlite(
+                SqliteLog::new(self.db.clone(), "default".into(), "default".into())
+                    .with_purge_cutoff_time_seconds(0),
+            ),
             sqlite_db: self.db.clone(),
             hnsw_segment_manager: manager.clone(),
             metrics: LocalCompactionMetrics::default(),
@@ -1558,11 +1559,10 @@ async fn replaced_spann_versions_are_forgotten_after_the_grace() {
     .await
     .unwrap();
     let mut compactor = LocalCompactionManager {
-        log: Log::Sqlite(SqliteLog::new(
-            db.clone(),
-            "default".into(),
-            "default".into(),
-        )),
+        log: Log::Sqlite(
+            SqliteLog::new(db.clone(), "default".into(), "default".into())
+                .with_purge_cutoff_time_seconds(0),
+        ),
         sqlite_db: db.clone(),
         hnsw_segment_manager: manager,
         metrics: LocalCompactionMetrics::default(),
