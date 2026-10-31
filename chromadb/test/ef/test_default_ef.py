@@ -1,17 +1,23 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 import hashlib
 import io
 import shutil
 import os
 import tarfile
+import threading
+import warnings
 from pathlib import Path
-from typing import List, Hashable
+from typing import List, Hashable, Type, cast
 
 import hypothesis.strategies as st
+import numpy as np
 import onnxruntime
 import pytest
 from hypothesis import given, settings
 from onnxruntime.datasets import get_example
 
+import chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 as onnx_mini_lm_l6_v2
+from chromadb.api.types import DefaultEmbeddingFunction, Documents, Embeddings
 from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import (
     ONNXMiniLM_L6_V2,
 )
@@ -146,3 +152,113 @@ def test_partial_download(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
         assert os.path.exists(
             os.path.join(ef.DOWNLOAD_PATH, ef.EXTRACTED_FOLDER_NAME, filename)
         )
+
+
+class _CountingModel:
+    """Stands for ONNXMiniLM_L6_V2 without a model: notes each instance and each call."""
+
+    built: List["_CountingModel"] = []
+
+    def __init__(self) -> None:
+        _CountingModel.built.append(self)
+        self.calls: List[int] = []
+
+    def __call__(self, input: Documents) -> Embeddings:
+        self.calls.append(len(input))
+        return [np.array([float(len(d))], dtype=np.float32) for d in input]
+
+
+@pytest.fixture
+def counting_model(monkeypatch: pytest.MonkeyPatch) -> Type[_CountingModel]:
+    monkeypatch.setattr(onnx_mini_lm_l6_v2, "ONNXMiniLM_L6_V2", _CountingModel)
+    monkeypatch.setattr(DefaultEmbeddingFunction, "models", {}, raising=False)
+    monkeypatch.setattr(_CountingModel, "built", [])
+    return _CountingModel
+
+
+def _called(model: Type[_CountingModel]) -> List[_CountingModel]:
+    return [m for m in model.built if m.calls]
+
+
+def test_default_ef_keeps_one_model_across_calls_and_instances(
+    counting_model: Type[_CountingModel],
+) -> None:
+    first, second = DefaultEmbeddingFunction(), DefaultEmbeddingFunction()
+    # Nothing is loaded before the first call.
+    assert counting_model.built == []
+    first(["a"])
+    first(["bb", "cc"])
+    second(["ddd"])
+    called = _called(counting_model)
+    assert len(called) == 1
+    assert called[0].calls == [1, 2, 1]
+
+
+def test_default_ef_shares_its_model_between_threads(
+    counting_model: Type[_CountingModel],
+) -> None:
+    ef = DefaultEmbeddingFunction()
+    start = threading.Barrier(8)
+    results: List[Embeddings] = []
+
+    def call() -> None:
+        start.wait()
+        results.append(ef(["thread"]))
+
+    threads = [threading.Thread(target=call) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    called = _called(counting_model)
+    assert len(called) == 1
+    assert len(called[0].calls) == 8
+    assert len(results) == 8
+    assert all(np.array_equal(r[0], results[0][0]) for r in results)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_default_ef_builds_its_own_model_after_fork(
+    counting_model: Type[_CountingModel],
+) -> None:
+    ef = DefaultEmbeddingFunction()
+    ef(["parent"])
+    parent_model = DefaultEmbeddingFunction.models[os.getpid()]
+    with warnings.catch_warnings():
+        # Python 3.12 warns about fork() in a process with threads.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        pid = os.fork()
+    if pid == 0:
+        code = 2
+        try:
+            ef(["child"])
+            child_model = DefaultEmbeddingFunction.models[os.getpid()]
+            code = 0 if child_model is not parent_model else 1
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert cast(_CountingModel, parent_model).calls == [1]
+
+
+def test_default_ef_gives_the_vectors_of_onnx_mini_lm_l6_v2() -> None:
+    documents = [
+        "the bike will not come out of the dock",
+        "E17",
+        "a longer document " * 20,
+    ]
+    expected = ONNXMiniLM_L6_V2()(documents)
+    ef = DefaultEmbeddingFunction()
+    # The first call builds the model of the process, the second one uses it again.
+    for _ in range(2):
+        got = ef(documents)
+        assert len(got) == len(expected)
+        assert all(np.array_equal(g, e) for g, e in zip(got, expected))
+
+
+def test_onnx_session_has_no_cpu_memory_arena() -> None:
+    ef = ONNXMiniLM_L6_V2()
+    ef(["test"])
+    # A kept instance would otherwise hold the arena of its largest batch.
+    assert ef.model.get_session_options().enable_cpu_mem_arena is False

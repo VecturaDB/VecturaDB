@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 import hashlib
 import importlib
 import logging
@@ -240,6 +241,9 @@ class ONNXMiniLM_L6_V2(EmbeddingFunction[Documents]):
         so = self.ort.SessionOptions()
         so.log_severity_level = 3
         so.graph_optimization_level = self.ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # No CPU memory arena: an instance that is kept, as DefaultEmbeddingFunction keeps
+        # one per process, would hold the arena of its largest batch for as long as it lives.
+        so.enable_cpu_mem_arena = False
 
         if (
             self._preferred_providers
