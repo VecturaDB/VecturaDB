@@ -905,6 +905,7 @@ mod tests {
                 url: new_test_db_persist_path(),
                 migration_mode: chroma_sqlite::config::MigrationMode::Apply,
                 hash_type: chroma_sqlite::config::MigrationHash::SHA256,
+                ..Default::default()
             },
             &Registry::new(),
         )

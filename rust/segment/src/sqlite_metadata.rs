@@ -3262,6 +3262,7 @@ mod tests {
                 url: None,
                 hash_type: MigrationHash::MD5,
                 migration_mode: MigrationMode::Apply,
+                ..Default::default()
             },
             &Registry::new(),
         )
@@ -3513,9 +3514,9 @@ mod tests {
         }
     }
 
-    // Every query of a get runs in one read transaction: stopped after its first query, the get still holds SQLite, so that
-    // a write from another connection cannot commit before the get ends (with no busy timeout it fails at once), and the
-    // get answers the records of the moment it started, its sparse vectors included.
+    // Every query of a get runs in one read transaction: stopped after its first query, the get answers the records of
+    // the moment it started, its sparse vectors included, though a write from another connection commits meanwhile
+    // (in WAL a write does not wait for a read).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_runs_its_queries_in_one_read_transaction() {
         let mut log = sparse_log(1, "r0", Operation::Add, Some(sparse_value(1.0)));
@@ -3547,9 +3548,11 @@ mod tests {
             .await;
         let _ = go_on.send(());
         let records = get.await.unwrap().unwrap().result.records;
+        // In WAL the write commits while the get is stopped in its read transaction; the get still answers the record
+        // as its transaction saw it before the write.
         assert!(
-            write.is_err(),
-            "a write committed while the get was stopped: {write:?}"
+            write.is_ok(),
+            "a write did not commit while the get was stopped: {write:?}"
         );
         let metadata = records[0].metadata.as_ref().unwrap();
         assert_eq!(metadata.get("i"), Some(&MetadataValue::Int(0)));

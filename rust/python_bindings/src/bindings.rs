@@ -1532,6 +1532,7 @@ mod tests {
             url: Some(sqlite_url),
             hash_type: MigrationHash::MD5,
             migration_mode: MigrationMode::Apply,
+            ..Default::default()
         };
         let bindings = Bindings::py_new(true, sqlite_db_config, 16, Some(persist_path))
             .expect("persistent bindings");

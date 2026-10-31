@@ -91,6 +91,12 @@ iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercon
 
 The scripts install the newest release, previews included. Every binary is also in the [releases](https://github.com/VecturaDB/VecturaDB/releases). The binary keeps the name `chroma`.
 
+## The SQLite database of the data path
+
+The database is in WAL mode: a read does not wait for a write. A normal stop writes the log of the writes back into `chroma.sqlite3`, which is then the only file of SQLite. After a stop that is not normal, such as a kill, the log stays in `chroma.sqlite3-wal`: a copy of the data path needs it too, or start and stop the server once before the copy. Chroma 1.5.9 and VecturaDB 1.0.0-preview.4 open the data path as it is.
+
+SQLite keeps WAL to the processes of one machine. For a data path on a network filesystem (SMB, NFS), set `sqlitedb: journal_mode: delete`, the mode of Chroma; with Docker, `-e CHROMA_SQLITEDB__JOURNAL_MODE=delete`. In our tests, on an SMB share mounted by Docker with `vers=3.0`, Chroma 1.5.9, VecturaDB 1.0.0-preview.4 and VecturaDB in WAL and in delete did not start without the mount option `nobrl`, and all of them worked with it.
+
 ## Moving data out of Chroma Cloud
 
 The CLI copies collections from Chroma Cloud into a running VecturaDB:

@@ -2,8 +2,8 @@
 use crate::config::{MigrationHash, MigrationMode, SqliteDBConfig};
 use crate::migrations::{GetSourceMigrationsError, Migration, MigrationDir, MIGRATION_DIRS};
 use chroma_error::{ChromaError, ErrorCodes};
-use sqlx::sqlite::SqlitePool;
-use sqlx::{Executor, Row};
+use sqlx::sqlite::{SqliteConnection, SqlitePool};
+use sqlx::{Connection, Executor, Row};
 use thiserror::Error;
 use tokio::io;
 
@@ -34,8 +34,39 @@ impl SqliteDb {
         &self.conn
     }
 
+    /// Closes the connections. In WAL the log of the writes goes back into the database first and is emptied, and the
+    /// last connection removes its files, so that a stopped database is one file, as with a rollback journal; with a
+    /// rollback journal the checkpoint does nothing. The close ends once the pool has no connection: sqlx closes the
+    /// idle ones, and those still taken when they come back, but its own wait can end before them, as it gives back a
+    /// permit for each idle connection it closes, which held none (PoolInner::close of sqlx-core 0.8.6; sqlx 0.9.0
+    /// closes them all before it returns). Then a connection alone to the file, which reads and closes: SQLite removes
+    /// the log and its index at the close of the last connection, and the connections of the pool did not always leave
+    /// them so (on a file opened again, in 3 runs of 3 after a count).
     pub async fn close(&self) {
+        if let Err(err) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.conn)
+            .await
+        {
+            tracing::warn!("Checkpoint of SQLite at close failed: {err}");
+        }
         self.conn.close().await;
+        // The size of the pool goes down once a connection is closed in SQLite.
+        while self.conn.size() > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let options = self.conn.connect_options();
+        let wal = format!("{}-wal", options.get_filename().display());
+        if std::path::Path::new(&wal).exists() {
+            match SqliteConnection::connect_with(&options).await {
+                Ok(mut alone) => {
+                    let _ = sqlx::query("SELECT COUNT(*) FROM sqlite_master")
+                        .fetch_all(&mut alone)
+                        .await;
+                    let _ = alone.close().await;
+                }
+                Err(err) => tracing::warn!("Last connection of SQLite at close failed: {err}"),
+            }
+        }
     }
 
     pub async fn reset(&self) -> Result<(), SqliteMigrationError> {
@@ -343,6 +374,7 @@ pub mod test_utils {
             url: new_test_db_persist_path(),
             hash_type: MigrationHash::MD5,
             migration_mode: MigrationMode::Apply,
+            ..Default::default()
         };
         let registry = Registry::new();
         SqliteDb::try_from_config(&config, &registry)
@@ -369,6 +401,7 @@ mod tests {
             url: new_test_db_persist_path(),
             hash_type: MigrationHash::MD5,
             migration_mode: MigrationMode::Apply,
+            ..Default::default()
         };
         let registry = Registry::new();
         let db = SqliteDb::try_from_config(&config, &registry)
@@ -428,6 +461,7 @@ mod tests {
             url: new_test_db_persist_path(),
             hash_type: MigrationHash::MD5,
             migration_mode: MigrationMode::Apply,
+            ..Default::default()
         };
         let registry = Registry::new();
         let db = SqliteDb::try_from_config(&config, &registry)
@@ -453,6 +487,7 @@ mod tests {
             url: test_db_path.clone(),
             hash_type: MigrationHash::MD5,
             migration_mode: MigrationMode::Apply,
+            ..Default::default()
         };
         let registry = Registry::new();
         let db = SqliteDb::try_from_config(&config, &registry)
@@ -475,6 +510,7 @@ mod tests {
             url: test_db_path,
             hash_type: MigrationHash::MD5,
             migration_mode: MigrationMode::Validate,
+            ..Default::default()
         };
         let registry = Registry::new();
         let _ = SqliteDb::try_from_config(&config, &registry)
@@ -489,6 +525,7 @@ mod tests {
             url: test_db_path.clone(),
             hash_type: MigrationHash::MD5,
             migration_mode: MigrationMode::Apply,
+            ..Default::default()
         };
         let registry = Registry::new();
         let db = SqliteDb::try_from_config(&config, &registry)
@@ -519,6 +556,7 @@ mod tests {
             url: test_db_path,
             hash_type: MigrationHash::MD5,
             migration_mode: MigrationMode::Validate,
+            ..Default::default()
         };
 
         let result = SqliteDb::try_from_config(&config, &registry).await;
@@ -537,6 +575,7 @@ mod tests {
             url: test_db_path.clone(),
             hash_type: MigrationHash::MD5,
             migration_mode: MigrationMode::Apply,
+            ..Default::default()
         };
         let db = SqliteDb::try_from_config(&config, &Registry::new())
             .await
@@ -568,6 +607,7 @@ mod tests {
             url: test_db_path,
             hash_type: MigrationHash::MD5,
             migration_mode: MigrationMode::Validate,
+            ..Default::default()
         };
 
         let result = SqliteDb::try_from_config(&config, &Registry::new()).await;
@@ -586,6 +626,7 @@ mod tests {
             url: test_db_path.clone(),
             hash_type: MigrationHash::MD5,
             migration_mode: MigrationMode::Apply,
+            ..Default::default()
         };
         let db = SqliteDb::try_from_config(&config, &Registry::new())
             .await

@@ -21,6 +21,7 @@ pub use frontend_core::{ac, auth, traced_json};
 
 use chroma_config::{registry::Registry, Configurable};
 use chroma_error::ChromaError;
+use chroma_sqlite::db::SqliteDb;
 use chroma_system::System;
 use config::FrontendServerConfig;
 use get_collection_with_segments_provider::*;
@@ -116,6 +117,16 @@ pub async fn frontend_service_entrypoint_with_config_system_registry(
     )
     .run(None)
     .await;
+    // A normal stop closes the database: in WAL its log goes back into the database file, which is then the only one
+    // left, as with a rollback journal. Within 5 s, so that a connection still held does not keep the server up.
+    if let Ok(db) = registry.get::<SqliteDb>() {
+        if tokio::time::timeout(std::time::Duration::from_secs(5), db.close())
+            .await
+            .is_err()
+        {
+            tracing::warn!("SQLite did not close within 5 s at the stop of the server");
+        }
+    }
 }
 
 pub fn init_frontend_otel_tracing(config: &FrontendServerConfig) {
