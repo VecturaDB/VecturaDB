@@ -1450,6 +1450,37 @@ async fn a_spann_flush_keeps_its_index_of_the_centers_out_of_the_cache_of_the_re
     assert!(!cached(manager.spann_provider().unwrap()).await);
 }
 
+// As the log position of distributed Chroma, which its compaction moves: a SPANN collection answers 0 before its first
+// flush and, after it, the records that every segment applied.
+#[test]
+fn a_spann_collection_answers_the_log_position_of_its_last_flush() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_spann_collection_answers_the_log_position_of_its_last_flush_impl,
+    )
+}
+
+async fn a_spann_collection_answers_the_log_position_of_its_last_flush_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let collection_id = empty_spann_collection(&mut frontend, "log_position").await;
+    add_numbers(&mut frontend, collection_id, 0..20).await;
+    let log_position = |frontend: &mut ServiceBasedFrontend| {
+        let mut sysdb = frontend.sysdb_client.clone();
+        async move {
+            sysdb
+                .get_collection_with_segments(None, collection_id)
+                .await
+                .unwrap()
+                .collection
+                .log_position
+        }
+    };
+    assert_eq!(log_position(&mut frontend).await, 0);
+    flush_spann(&frontend, collection_id).await;
+    assert_eq!(log_position(&mut frontend).await, 20);
+}
+
 // The flushes write the blocks of a SPANN collection through the block cache of the readers: with the files of the
 // blocks gone from the data path after a flush, a get and a query still answer, from the blocks in memory.
 #[test]
