@@ -313,8 +313,17 @@ impl Configurable<LocalSegmentManagerConfig> for LocalSegmentManager {
             Some(persist_path) => Some(local_spann_provider(persist_path, registry).await?),
             None => None,
         };
+        // The compactor forks the HNSW index of the centers with a provider of its own, so that a reader does not find
+        // the fork in its cache; the blocks it reads and writes go through the block cache of the readers, as one more
+        // copy of every block in memory held twice as much as 1.0.0-preview.4.
         let compaction_spann_provider = match &config.persist_path {
-            Some(persist_path) => Some(local_spann_provider(persist_path, registry).await?),
+            Some(persist_path) => {
+                let mut provider = local_spann_provider(persist_path, registry).await?;
+                if let Some(readers) = &spann_provider {
+                    provider.blockfile_provider = readers.blockfile_provider.clone();
+                }
+                Some(provider)
+            }
             None => None,
         };
         let mut res = Self {

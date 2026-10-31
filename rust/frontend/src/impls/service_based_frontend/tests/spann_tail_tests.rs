@@ -1450,6 +1450,49 @@ async fn a_spann_flush_keeps_its_index_of_the_centers_out_of_the_cache_of_the_re
     assert!(!cached(manager.spann_provider().unwrap()).await);
 }
 
+// The flushes write the blocks of a SPANN collection through the block cache of the readers: with the files of the
+// blocks gone from the data path after a flush, a get and a query still answer, from the blocks in memory.
+#[test]
+fn a_spann_flush_writes_its_blocks_through_the_cache_of_the_readers() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_spann_flush_writes_its_blocks_through_the_cache_of_the_readers_impl,
+    )
+}
+
+async fn a_spann_flush_writes_its_blocks_through_the_cache_of_the_readers_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let collection_id = empty_spann_collection(&mut frontend, "blocks_of_a_flush").await;
+    add_numbers(&mut frontend, collection_id, 0..20).await;
+    flush_spann(&frontend, collection_id).await;
+    let mut removed = 0;
+    let mut folders = vec![root.path().to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                folders.push(path);
+            } else if path.parent().and_then(|p| p.file_name())
+                == Some(std::ffi::OsStr::new("block"))
+            {
+                std::fs::remove_file(&path).unwrap();
+                removed += 1;
+            }
+        }
+    }
+    assert!(removed > 0, "the flush wrote no block");
+    let Ok(ReadAnswer::Records(lists)) =
+        spann_read(&mut frontend, collection_id, SpannRead::Get).await
+    else {
+        panic!("a get of the collection read its blocks from the data path");
+    };
+    assert_eq!(lists.iter().map(Vec::len).sum::<usize>(), 20);
+    assert!(spann_read(&mut frontend, collection_id, SpannRead::Query)
+        .await
+        .is_ok());
+}
+
 // A frontend as frontend_with_a_stopped_flush, whose log refuses a write to a SPANN collection with at least the records
 // given in its log after its last flush, and whose flushes take at most records_per_flush records.
 async fn frontend_with_backpressure(
