@@ -103,7 +103,7 @@ jobs:
         include:
           - { target: aarch64-apple-darwin, name: arm64 }
           - { target: x86_64-apple-darwin, name: x64 }
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Machine
         shell: bash
@@ -141,8 +141,8 @@ jobs:
         include:
           - { os: linux, runner: ubuntu-24.04-arm, target: aarch64 }
           - { os: windows, runner: windows-latest, target: x64 }
-          - { os: macos, runner: macos-14, target: x86_64 }
-          - { os: macos, runner: macos-14, target: aarch64 }
+          - { os: macos, runner: macos-15, target: x86_64 }
+          - { os: macos, runner: macos-15, target: aarch64 }
     runs-on: ${{ matrix.runner }}
     steps: &wheel-steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
