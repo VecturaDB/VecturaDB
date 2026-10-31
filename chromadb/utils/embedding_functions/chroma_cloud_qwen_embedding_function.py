@@ -1,9 +1,9 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 from chromadb.api.types import Embeddings, Documents, EmbeddingFunction, Space
-from typing import List, Dict, Any, Union, Optional
+from typing import List, Dict, Any, Optional, Tuple, cast
 import os
-import numpy as np
+from chromadb.utils.embedding_functions.chroma_cloud_local import LocalQwen, QWEN_MODELS
 from chromadb.utils.embedding_functions.schemas import validate_config_schema
-from chromadb.utils.embedding_functions.utils import _get_shared_system_client, get_chroma_embed_url
 from enum import Enum
 
 
@@ -30,12 +30,22 @@ CHROMA_CLOUD_QWEN_DEFAULT_INSTRUCTIONS: ChromaCloudQwenEmbeddingInstructions = {
 
 
 class ChromaCloudQwenEmbeddingFunction(EmbeddingFunction[Documents]):
+    """chroma-cloud-qwen, computed on this machine: Qwen3-Embedding-0.6B in ONNX, with the instructions of the task, as the service
+    of Chroma Cloud computed it. The first call downloads the model from Hugging Face, 1.2 GB in float16 or 2.4 GB in float32, into
+    ~/.cache/chroma/onnx_models. No API key: api_key_env_var stays in the configuration, as Chroma Cloud stored it.
+    """
+
+    # One model for each process and precision, kept as DefaultEmbeddingFunction keeps its model: loading it takes seconds. By
+    # process id, so that a child of fork() does not use the session of its parent.
+    models: Dict[Tuple[int, str], LocalQwen] = {}
+
     def __init__(
         self,
         model: ChromaCloudQwenEmbeddingModel,
         task: Optional[str],
         instructions: ChromaCloudQwenEmbeddingInstructions = CHROMA_CLOUD_QWEN_DEFAULT_INSTRUCTIONS,
         api_key_env_var: str = "CHROMA_API_KEY",
+        precision: str = "float16",
     ):
         """
         Initialize the ChromaCloudQwenEmbeddingFunction.
@@ -46,59 +56,31 @@ class ChromaCloudQwenEmbeddingFunction(EmbeddingFunction[Documents]):
                 empty instructions will be used for both documents and queries.
             instructions (ChromaCloudQwenEmbeddingInstructions, optional): A dictionary containing
                 custom instructions to use for the specified Qwen model. Defaults to CHROMA_CLOUD_QWEN_DEFAULT_INSTRUCTIONS.
-            api_key_env_var (str, optional): Environment variable name that contains your API key.
+            api_key_env_var (str, optional): Kept in the configuration, as Chroma Cloud stored it; no key is read.
                 Defaults to "CHROMA_API_KEY".
+            precision (str, optional): "float16", the default, or "float32", which downloads twice the bytes. It is not part of
+                the configuration: a collection opened again computes in float16.
         """
-        try:
-            import httpx
-        except ImportError:
-            raise ValueError(
-                "The httpx python package is not installed. Please install it with `pip install httpx`"
-            )
-
+        if precision not in QWEN_MODELS:
+            raise ValueError(f"precision is float16 or float32, not {precision}")
         self.api_key_env_var = api_key_env_var
-        # First, try to get API key from environment variable
-        self.api_key = os.getenv(api_key_env_var)
-        # If not found in env var, try to get it from existing client instances
-        if not self.api_key:
-            SharedSystemClient = _get_shared_system_client()
-            self.api_key = SharedSystemClient.get_chroma_cloud_api_key_from_clients()
-        # Raise error if still no API key found
-        if not self.api_key:
-            raise ValueError(
-                f"API key not found in environment variable {api_key_env_var} "
-                f"or in any existing client instances"
-            )
-
         self.model = model
         self.task = task
         self.instructions = instructions
+        self.precision = precision
 
-        self._api_url = get_chroma_embed_url()
-        self._session = httpx.Client()
-        self._session.headers.update(
-            {
-                "x-chroma-token": self.api_key,
-                "x-chroma-embedding-model": self.model.value,
-            }
-        )
+    def _local(self) -> LocalQwen:
+        key = (os.getpid(), self.precision)
+        local = self.models.get(key)
+        if local is None:
+            # Two threads here at once: setdefault keeps the first one for both.
+            local = self.models.setdefault(key, LocalQwen(QWEN_MODELS[self.precision]))
+        return local
 
-    def _parse_response(self, response: Any) -> Embeddings:
-        """
-        Convert the response from the Chroma Embedding API to a list of numpy arrays.
-
-        Args:
-            response (Any): The response from the Chroma Embedding API.
-
-        Returns:
-            Embeddings: A list of numpy arrays representing the embeddings.
-        """
-        if "embeddings" not in response:
-            raise RuntimeError(response.get("error", "Unknown error"))
-
-        embeddings: List[List[float]] = response["embeddings"]
-
-        return [np.array(embedding, dtype=np.float32) for embedding in embeddings]
+    def _instruction(self, target: ChromaCloudQwenEmbeddingTarget) -> str:
+        if self.task and self.task in self.instructions:
+            return self.instructions[self.task][target]
+        return ""
 
     def __call__(self, input: Documents) -> Embeddings:
         """
@@ -112,21 +94,12 @@ class ChromaCloudQwenEmbeddingFunction(EmbeddingFunction[Documents]):
         """
         if not input:
             return []
-
-        instruction = ""
-        if self.task and self.task in self.instructions:
-            instruction = self.instructions[self.task][
-                ChromaCloudQwenEmbeddingTarget.DOCUMENTS
-            ]
-
-        payload: Dict[str, Union[str, Documents]] = {
-            "instructions": instruction,
-            "texts": input,
-        }
-
-        response = self._session.post(self._api_url, json=payload, timeout=60).json()
-
-        return self._parse_response(response)
+        return cast(
+            Embeddings,
+            self._local().embed(
+                list(input), self._instruction(ChromaCloudQwenEmbeddingTarget.DOCUMENTS)
+            ),
+        )
 
     def embed_query(self, input: Documents) -> Embeddings:
         """
@@ -134,21 +107,15 @@ class ChromaCloudQwenEmbeddingFunction(EmbeddingFunction[Documents]):
         """
         if not input:
             return []
+        return cast(
+            Embeddings,
+            self._local().embed(
+                list(input), self._instruction(ChromaCloudQwenEmbeddingTarget.QUERY)
+            ),
+        )
 
-        instruction = ""
-        if self.task and self.task in self.instructions:
-            instruction = self.instructions[self.task][
-                ChromaCloudQwenEmbeddingTarget.QUERY
-            ]
-
-        payload: Dict[str, Union[str, Documents]] = {
-            "instructions": instruction,
-            "texts": input,
-        }
-
-        response = self._session.post(self._api_url, json=payload, timeout=60).json()
-
-        return self._parse_response(response)
+    def max_tokens(self) -> int:
+        return LocalQwen.MAX_TOKENS
 
     @staticmethod
     def name() -> str:

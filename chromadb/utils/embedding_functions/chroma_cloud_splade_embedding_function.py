@@ -1,16 +1,17 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 from chromadb.api.types import (
     SparseEmbeddingFunction,
-    SparseVector,
     SparseVectors,
     Documents,
 )
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 from enum import Enum
+from chromadb.utils.embedding_functions.chroma_cloud_local import (
+    LocalSplade,
+    SPLADE_MODEL,
+)
 from chromadb.utils.embedding_functions.schemas import validate_config_schema
-from chromadb.utils.sparse_embedding_utils import normalize_sparse_vector
 import os
-from typing import Union
-from chromadb.utils.embedding_functions.utils import _get_shared_system_client, get_chroma_embed_url
 
 
 class ChromaCloudSpladeEmbeddingModel(Enum):
@@ -18,6 +19,15 @@ class ChromaCloudSpladeEmbeddingModel(Enum):
 
 
 class ChromaCloudSpladeEmbeddingFunction(SparseEmbeddingFunction[Documents]):
+    """chroma-cloud-splade, computed on this machine: SPLADE (prithivida/Splade_PP_en_v1) in ONNX, as the service of Chroma Cloud
+    computed it, truncated to 512 tokens. The first call downloads the model from Hugging Face, 533 MB, into
+    ~/.cache/chroma/onnx_models. No API key: api_key_env_var stays in the configuration, as Chroma Cloud stored it.
+    """
+
+    # One model for each process, kept as DefaultEmbeddingFunction keeps its model. By process id, so that a child of fork() does
+    # not use the session of its parent.
+    models: Dict[int, LocalSplade] = {}
+
     def __init__(
         self,
         api_key_env_var: str = "CHROMA_API_KEY",
@@ -28,53 +38,18 @@ class ChromaCloudSpladeEmbeddingFunction(SparseEmbeddingFunction[Documents]):
         Initialize the ChromaCloudSpladeEmbeddingFunction.
 
         Args:
-            api_key_env_var (str, optional): Environment variable name that contains your API key.
+            api_key_env_var (str, optional): Kept in the configuration, as Chroma Cloud stored it; no key is read.
                 Defaults to "CHROMA_API_KEY".
+            include_tokens (bool, optional): Whether each sparse vector has the token of each index in its labels.
         """
-        try:
-            import httpx
-        except ImportError:
-            raise ValueError(
-                "The httpx python package is not installed. Please install it with `pip install httpx`"
-            )
         self.api_key_env_var = api_key_env_var
-        # First, try to get API key from environment variable
-        self.api_key = os.getenv(self.api_key_env_var)
-        # If not found in env var, try to get it from existing client instances
-        if not self.api_key:
-            SharedSystemClient = _get_shared_system_client()
-            self.api_key = SharedSystemClient.get_chroma_cloud_api_key_from_clients()
-        # Raise error if still no API key found
-        if not self.api_key:
-            raise ValueError(
-                f"API key not found in environment variable {self.api_key_env_var} "
-                f"or in any existing client instances"
-            )
         self.model = model
         self.include_tokens = bool(include_tokens)
-        self._api_url = f"{get_chroma_embed_url()}/embed_sparse"
-        self._session = httpx.Client()
-        self._session.headers.update(
-            {
-                "x-chroma-token": self.api_key,
-                "x-chroma-embedding-model": self.model.value,
-            }
-        )
-
-    def __del__(self) -> None:
-        """
-        Cleanup the HTTP client session when the object is destroyed.
-        """
-        if hasattr(self, "_session"):
-            self._session.close()
 
     def close(self) -> None:
         """
-        Explicitly close the HTTP client session.
-        Call this method when you're done using the embedding function.
+        Kept for the code that called it: there is no HTTP client session to close.
         """
-        if hasattr(self, "_session"):
-            self._session.close()
 
     def __call__(self, input: Documents) -> SparseVectors:
         """
@@ -85,59 +60,11 @@ class ChromaCloudSpladeEmbeddingFunction(SparseEmbeddingFunction[Documents]):
         """
         if not input:
             return []
-
-        payload: Dict[str, Union[str, Documents]] = {
-            "texts": list(input),
-            "task": "",
-            "target": "",
-            "fetch_tokens": "true" if self.include_tokens is True else "false",
-        }
-
-        try:
-            import httpx
-
-            response = self._session.post(self._api_url, json=payload, timeout=60)
-            response.raise_for_status()
-            json_response = response.json()
-            return self._parse_response(json_response)
-        except httpx.HTTPStatusError as e:
-            raise RuntimeError(
-                f"Failed to get embeddings from Chroma Cloud API: HTTP {e.response.status_code} - {e.response.text}"
-            )
-        except httpx.TimeoutException:
-            raise RuntimeError("Request to Chroma Cloud API timed out after 60 seconds")
-        except httpx.HTTPError as e:
-            raise RuntimeError(f"Failed to get embeddings from Chroma Cloud API: {e}")
-        except Exception as e:
-            raise RuntimeError(f"Unexpected error calling Chroma Cloud API: {e}")
-
-    def _parse_response(self, response: Any) -> SparseVectors:
-        """
-        Parse the response from the Chroma Cloud Sparse Embedding API.
-        """
-        raw_embeddings = response["embeddings"]
-
-        # Normalize each sparse vector (sort indices and validate)
-        normalized_vectors: SparseVectors = []
-        for emb in raw_embeddings:
-            # Handle both dict format and SparseVector format
-            if isinstance(emb, dict):
-                indices = emb.get("indices", [])
-                values = emb.get("values", [])
-                raw_labels = emb.get("labels") if self.include_tokens else None
-                labels: Optional[List[str]] = raw_labels if raw_labels else None
-            else:
-                # Already a SparseVector, extract its data
-                assert isinstance(emb, SparseVector)
-                indices = emb.indices
-                values = emb.values
-                labels = emb.labels if self.include_tokens else None
-
-            normalized_vectors.append(
-                normalize_sparse_vector(indices=indices, values=values, labels=labels)
-            )
-
-        return normalized_vectors
+        local = self.models.get(os.getpid())
+        if local is None:
+            # Two threads here at once: setdefault keeps the first one for both.
+            local = self.models.setdefault(os.getpid(), LocalSplade(SPLADE_MODEL))
+        return local.embed(list(input), self.include_tokens)
 
     @staticmethod
     def name() -> str:
