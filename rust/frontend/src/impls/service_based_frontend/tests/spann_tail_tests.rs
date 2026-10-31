@@ -1449,3 +1449,97 @@ async fn a_spann_flush_keeps_its_index_of_the_centers_out_of_the_cache_of_the_re
     assert!(cached(manager.compaction_spann_provider().unwrap()).await);
     assert!(!cached(manager.spann_provider().unwrap()).await);
 }
+
+// A frontend as frontend_with_a_stopped_flush, whose log refuses a write to a SPANN collection with at least the records
+// given in its log after its last flush.
+async fn frontend_with_backpressure(
+    root: &std::path::Path,
+    records: u64,
+) -> (ServiceBasedFrontend, chroma_log::SpannFlushStop) {
+    let registry = Registry::new();
+    let stop = chroma_log::SpannFlushStop::default();
+    registry.register(stop.clone());
+    let system = System::new();
+    let mut config = FrontendConfig::sqlite_in_memory();
+    config.sqlitedb.as_mut().unwrap().url =
+        Some(root.join("chroma.sqlite3").to_str().unwrap().into());
+    config.segment_manager.as_mut().unwrap().persist_path = Some(root.to_str().unwrap().into());
+    config.executor = crate::executor::config::ExecutorConfig::Local(
+        crate::executor::config::LocalExecutorConfig {
+            spann: true,
+            ..Default::default()
+        },
+    );
+    config.local_compaction_manager = no_timer_flush();
+    config.log = chroma_log::config::LogConfig::Sqlite(chroma_log::config::SqliteLogConfig {
+        num_records_before_backpressure: records,
+        ..Default::default()
+    });
+    (
+        ServiceBasedFrontend::try_from_config(&(config, system), &registry)
+            .await
+            .unwrap(),
+        stop,
+    )
+}
+
+// As the log service of distributed Chroma, once a round of the compactor counts num_records_before_backpressure records
+// in the log of a SPANN collection after its last flush, a write to it is refused, with the answer of distributed Chroma
+// over HTTP: 429, the name and the message of a log too full. Its flush empties the log, and the next write is accepted.
+#[test]
+fn a_write_to_a_spann_collection_whose_log_is_too_full_waits_for_its_flush() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_write_to_a_spann_collection_whose_log_is_too_full_waits_for_its_flush_impl,
+    )
+}
+
+async fn a_write_to_a_spann_collection_whose_log_is_too_full_waits_for_its_flush_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut frontend, stop) = frontend_with_backpressure(root.path(), 30).await;
+    let collection_id = empty_spann_collection(&mut frontend, "too_full").await;
+    add_numbers(&mut frontend, collection_id, 0..30).await;
+    let round = a_round_that_stops(&frontend, &stop).await;
+    let written = frontend
+        .add(
+            AddCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                vec!["r30".to_string()],
+                vec![vec![30.0, 30f32.sin()]],
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .await;
+    let Err(refused) = written else {
+        panic!("a write to a log too full was accepted");
+    };
+    let response = axum::response::IntoResponse::into_response(frontend_core::errors::ServerError(
+        Box::new(refused),
+    ));
+    assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "error": "ChromaError",
+            "message": "log needs compaction before accepting more writes; please backoff exponentially and retry",
+        })
+    );
+    stop.go_on();
+    round.await.unwrap().unwrap();
+    add_numbers(&mut frontend, collection_id, 30..31).await;
+    assert_eq!(
+        status(&mut frontend, collection_id).await,
+        (30.0 / 31.0, 1, 30, 31)
+    );
+}

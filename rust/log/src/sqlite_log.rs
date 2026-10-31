@@ -17,7 +17,12 @@ use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, SqliteConnection};
-use std::{str::FromStr, sync::OnceLock, time::Duration};
+use std::{
+    collections::HashSet,
+    str::FromStr,
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -68,6 +73,10 @@ pub enum SqlitePushLogsError {
     Unimplemented(String),
     #[error("Sparse metadata must have valid indices and finite weights")]
     InvalidSparseMetadata,
+    // The answer of the log service of distributed Chroma to a write to a collection whose log is too full; the log
+    // turns it into PushLogsError::BackoffCompaction, which the log service gets from it.
+    #[error("log needs compaction; too full")]
+    BackoffCompaction,
 }
 
 impl ChromaError for SqlitePushLogsError {
@@ -83,6 +92,7 @@ impl ChromaError for SqlitePushLogsError {
             SqlitePushLogsError::GetMaxBatchSizeError(e) => e.code(),
             SqlitePushLogsError::Unimplemented(_) => ErrorCodes::Unimplemented,
             SqlitePushLogsError::InvalidSparseMetadata => ErrorCodes::InvalidArgument,
+            SqlitePushLogsError::BackoffCompaction => ErrorCodes::ResourceExhausted,
         }
     }
 }
@@ -161,6 +171,10 @@ pub struct SqliteLog {
     topic_namespace: String,
     compactor_handle: OnceLock<ComponentHandle<LocalCompactionManager>>,
     max_batch_size: OnceLock<u32>,
+    num_records_before_backpressure: u64,
+    // The SPANN collections whose log was too full at the last round of the compactor, shared by every copy of the log,
+    // as the set of the collections under backpressure of the log service of distributed Chroma.
+    backpressure: Arc<Mutex<Arc<HashSet<CollectionUuid>>>>,
 }
 
 impl SqliteLog {
@@ -171,7 +185,54 @@ impl SqliteLog {
             topic_namespace,
             compactor_handle: OnceLock::new(),
             max_batch_size: OnceLock::new(),
+            num_records_before_backpressure:
+                SqliteLogConfig::default_num_records_before_backpressure(),
+            backpressure: Arc::default(),
         }
+    }
+
+    pub fn with_num_records_before_backpressure(mut self, records: u64) -> Self {
+        self.num_records_before_backpressure = records;
+        self
+    }
+
+    fn set_backpressure(&self, to_pressure: HashSet<CollectionUuid>) {
+        *self.backpressure.lock().unwrap() = Arc::new(to_pressure);
+    }
+
+    // As check_for_backpressure of the log service of distributed Chroma: a write to a collection that the last round
+    // found too full counts its log again, and is refused only if the log is still too full. The set stays as the round
+    // left it.
+    async fn check_for_backpressure(
+        &self,
+        collection_id: CollectionUuid,
+    ) -> Result<(), SqlitePushLogsError> {
+        let backpressure = Arc::clone(&self.backpressure.lock().unwrap());
+        if !backpressure.contains(&collection_id) {
+            return Ok(());
+        }
+        let records: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM segments
+            INNER JOIN embeddings_queue   ON embeddings_queue.topic = CONCAT('persistent://', ?, '/', ?, '/', segments.collection)
+            LEFT JOIN max_seq_id          ON max_seq_id.segment_id  = segments.id
+            WHERE segments.type = ?
+            AND segments.collection = ?
+            AND embeddings_queue.seq_id > COALESCE(CAST(max_seq_id.seq_id AS INTEGER), 0)
+            "#,
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.topic_namespace)
+        .bind(String::from(SegmentType::Spann))
+        .bind(collection_id.0.to_string())
+        .fetch_one(self.db.get_conn())
+        .await
+        .map_err(WrappedSqlxError)?;
+        if records as u64 >= self.num_records_before_backpressure {
+            return Err(SqlitePushLogsError::BackoffCompaction);
+        }
+        Ok(())
     }
 
     #[allow(clippy::result_large_err)]
@@ -343,6 +404,7 @@ impl SqliteLog {
         if records.is_empty() {
             return Ok(());
         }
+        self.check_for_backpressure(collection_id).await?;
 
         let topic =
             get_embeddings_queue_topic_name(&self.tenant_id, &self.topic_namespace, collection_id);
@@ -474,6 +536,8 @@ impl SqliteLog {
     /// The third rule of the log service, a log marked dirty again reinsert_threshold times, has no counterpart here:
     /// it counts how often wal3 marks the log of a collection dirty again, which this log does not record, and since
     /// every write carries at least one record, its default of 10 marks means at least 10 records anyway.
+    /// From the same counts, as the log service sets its backpressure from the summaries of the logs it compacts, the
+    /// collections whose log holds at least num_records_before_backpressure records become those under backpressure.
     pub async fn get_spann_collections_to_compact(
         &mut self,
         min_compaction_size: u64,
@@ -482,7 +546,9 @@ impl SqliteLog {
         let mut results = sqlx::query(
             r#"
             SELECT
-                segments.collection AS collection_id
+                segments.collection AS collection_id,
+                COUNT(*) >= ? OR MIN(embeddings_queue.created_at) <= datetime('now', ?) AS to_compact,
+                COUNT(*) >= ? AS too_full
             FROM segments
             INNER JOIN embeddings_queue   ON embeddings_queue.topic = CONCAT('persistent://', ?, '/', ?, '/', segments.collection)
             LEFT JOIN max_seq_id          ON max_seq_id.segment_id  = segments.id
@@ -491,24 +557,31 @@ impl SqliteLog {
             GROUP BY
                 segments.collection
             HAVING
-                COUNT(*) >= ?
-                OR MIN(embeddings_queue.created_at) <= datetime('now', ?)
+                to_compact
+                OR too_full
             ORDER BY MIN(embeddings_queue.created_at) ASC
             "#,
         )
+        .bind(min_compaction_size as i64) // (SQLite doesn't support u64)
+        .bind(format!("-{} seconds", timeout.as_secs()))
+        .bind(self.num_records_before_backpressure as i64)
         .bind(&self.tenant_id)
         .bind(&self.topic_namespace)
         .bind(String::from(SegmentType::Spann))
-        .bind(min_compaction_size as i64) // (SQLite doesn't support u64)
-        .bind(format!("-{} seconds", timeout.as_secs()))
         .fetch(self.db.get_conn());
 
         let mut collections = Vec::new();
+        let mut too_full = HashSet::new();
         while let Some(row) = results.try_next().await.map_err(WrappedSqlxError)? {
-            collections.push(CollectionUuid::from_str(
-                row.get::<&str, _>("collection_id"),
-            )?);
+            let collection_id = CollectionUuid::from_str(row.get::<&str, _>("collection_id"))?;
+            if row.get::<bool, _>("too_full") {
+                too_full.insert(collection_id);
+            }
+            if row.get::<bool, _>("to_compact") {
+                collections.push(collection_id);
+            }
         }
+        self.set_backpressure(too_full);
 
         Ok(collections)
     }
@@ -804,7 +877,8 @@ impl Configurable<SqliteLogConfig> for SqliteLog {
             sqlite_db,
             config.tenant_id.clone(),
             config.topic_namespace.clone(),
-        );
+        )
+        .with_num_records_before_backpressure(config.num_records_before_backpressure);
 
         // This populates the legacy config if not present (when upgrading from an old version)
         log.get_legacy_embeddings_queue_config()

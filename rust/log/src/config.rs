@@ -83,6 +83,17 @@ impl Default for GrpcLogConfig {
 pub struct SqliteLogConfig {
     pub tenant_id: String,
     pub topic_namespace: String,
+    /// The records of the log of a SPANN collection after its last flush from which a write to it is refused, until a
+    /// flush takes them, as num_records_before_backpressure of the log service of distributed Chroma, with the value of
+    /// rust/worker/chroma_config.yaml.
+    #[serde(default = "SqliteLogConfig::default_num_records_before_backpressure")]
+    pub num_records_before_backpressure: u64,
+}
+
+impl SqliteLogConfig {
+    pub fn default_num_records_before_backpressure() -> u64 {
+        100_000
+    }
 }
 
 impl Default for SqliteLogConfig {
@@ -90,6 +101,8 @@ impl Default for SqliteLogConfig {
         SqliteLogConfig {
             tenant_id: "default".to_string(),
             topic_namespace: "default".to_string(),
+            num_records_before_backpressure:
+                SqliteLogConfig::default_num_records_before_backpressure(),
         }
     }
 }

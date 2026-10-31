@@ -1,6 +1,6 @@
 use crate::grpc_log::{GrpcLog, GrpcPushLogsError, GrpcSealLogError, ScoutLogFragmentsResponse};
 use crate::in_memory_log::InMemoryLog;
-use crate::sqlite_log::SqliteLog;
+use crate::sqlite_log::{SqliteLog, SqlitePushLogsError};
 use crate::types::CollectionInfo;
 use chroma_api_types::CONDITIONAL_WRITE_CONFLICT_MESSAGE;
 use chroma_error::{ChromaError, ErrorCodes};
@@ -246,9 +246,13 @@ impl Log {
                 if condition.is_some() {
                     return Err(PushLogsError::ConditionalWritesUnsupported("sqlite"));
                 }
+                // A log too full answers as the log service of distributed Chroma, through the frontend.
                 log.push_logs(collection_id, records)
                     .await
-                    .map_err(|e| PushLogsError::Other(Box::new(e)))?;
+                    .map_err(|e| match e {
+                        SqlitePushLogsError::BackoffCompaction => PushLogsError::BackoffCompaction,
+                        other => PushLogsError::Other(Box::new(other)),
+                    })?;
                 Ok(PushLogsResult {
                     record_count,
                     first_inserted_record_offset: None,
