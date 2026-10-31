@@ -4588,7 +4588,7 @@ dependencies = [
 [[package]]
 name = "hnswlib"
 version = "0.8.2"
-source = "git+https://github.com/chroma-core/hnswlib.git?rev=e6db8c2#e6db8c26cc320af4f4cb8c7e5f0a402c5959ca66"
+source = "git+https://github.com/VecturaDB/hnswlib.git?rev=276b6a0#276b6a0eabc1a08cc9cb00fb00673d2928ac720e"
 dependencies = [
  "cc",
  "thiserror 1.0.69",
