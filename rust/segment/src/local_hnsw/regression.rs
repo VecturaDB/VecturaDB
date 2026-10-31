@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use super::*;
 use chroma_sqlite::db::test_utils::get_new_sqlite_db;
 use chroma_types::{

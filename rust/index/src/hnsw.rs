@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use super::{IndexConfig, IndexUuid};
 use chroma_distance::DistanceFunction;
 use chroma_error::{ChromaError, ErrorCodes};
