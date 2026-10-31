@@ -304,7 +304,7 @@ jobs:
         run: >-
           python -m pytest -x -v --color=yes --durations 10
           chromadb/test/api chromadb/test/test_api.py chromadb/test/test_client.py
-          chromadb/test/test_local_sparse_search.py
+          chromadb/test/test_local_sparse_search.py chromadb/test/ef/test_default_ef.py
           chromadb/test/property --ignore-glob chromadb/test/property/test_cross_version_persist.py
           --ignore chromadb/test/property/test_add_mcmr.py
       - name: Smoke test with the CLI server
