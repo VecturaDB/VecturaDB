@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -77,7 +78,7 @@ fn error_name(err: &(dyn ChromaError + 'static)) -> &'static str {
             Some(ConditionalCommitError::Backoff)
         ) || matches!(
             source.downcast_ref::<PushLogsError>(),
-            Some(PushLogsError::Backoff | PushLogsError::BackoffCompaction)
+            Some(PushLogsError::Backoff | PushLogsError::BackoffCompaction { .. })
         )
     }) {
         return BACKOFF_ERROR_NAME;
@@ -93,7 +94,15 @@ impl IntoResponse for ServerError {
             error: error_name(self.0.as_ref()).to_string(),
             message: self.0.to_string(),
         };
+        let retry_after = self.0.retry_after();
 
-        (status_code, Json(error)).into_response()
+        let mut response = (status_code, Json(error)).into_response();
+        // A write refused by the log of the single node says when to send it again; distributed Chroma does not.
+        if let Some(seconds) = retry_after {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, seconds.into());
+        }
+        response
     }
 }

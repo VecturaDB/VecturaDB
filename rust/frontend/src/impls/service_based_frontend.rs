@@ -2370,7 +2370,7 @@ impl ServiceBasedFrontend {
 
                 Ok(push_result.first_inserted_record_offset)
             }
-            Err(PushLogsError::Backoff | PushLogsError::BackoffCompaction) => {
+            Err(PushLogsError::Backoff | PushLogsError::BackoffCompaction { .. }) => {
                 Err(ConditionalCommitError::Backoff)
             }
             Err(other) => Err(ConditionalCommitError::Other(Box::new(other))),

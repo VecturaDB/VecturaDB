@@ -610,6 +610,10 @@ impl Handler<ScheduledCompactMessage> for LocalCompactionManager {
         _message: ScheduledCompactMessage,
         ctx: &ComponentContext<LocalCompactionManager>,
     ) -> Self::Result {
+        // The rounds tell the log when a write it refuses may be sent again.
+        if let Log::Sqlite(log) = &self.log {
+            log.spann_round_started(self.compaction_interval, self.max_compaction_size as u64);
+        }
         let collections = match self.spann_collections_to_compact().await {
             Ok(collections) => collections,
             Err(err) => {
@@ -642,6 +646,9 @@ impl Handler<SpannRoundDone> for LocalCompactionManager {
         message: SpannRoundDone,
         ctx: &ComponentContext<LocalCompactionManager>,
     ) {
+        if let Log::Sqlite(log) = &self.log {
+            log.spann_round_ended();
+        }
         // As distributed Chroma: the next compaction once this one is done.
         ctx.scheduler.schedule(
             ScheduledCompactMessage {},

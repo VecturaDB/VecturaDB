@@ -21,7 +21,7 @@ use std::{
     collections::HashSet,
     str::FromStr,
     sync::{Arc, Mutex, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 
@@ -74,9 +74,10 @@ pub enum SqlitePushLogsError {
     #[error("Sparse metadata must have valid indices and finite weights")]
     InvalidSparseMetadata,
     // The answer of the log service of distributed Chroma to a write to a collection whose log is too full; the log
-    // turns it into PushLogsError::BackoffCompaction, which the log service gets from it.
+    // turns it into PushLogsError::BackoffCompaction, which the log service gets from it, with the seconds after which
+    // the flushes should have taken the log under the limit, which distributed Chroma does not give.
     #[error("log needs compaction; too full")]
-    BackoffCompaction,
+    BackoffCompaction { retry_after: u64 },
 }
 
 impl ChromaError for SqlitePushLogsError {
@@ -92,7 +93,7 @@ impl ChromaError for SqlitePushLogsError {
             SqlitePushLogsError::GetMaxBatchSizeError(e) => e.code(),
             SqlitePushLogsError::Unimplemented(_) => ErrorCodes::Unimplemented,
             SqlitePushLogsError::InvalidSparseMetadata => ErrorCodes::InvalidArgument,
-            SqlitePushLogsError::BackoffCompaction => ErrorCodes::ResourceExhausted,
+            SqlitePushLogsError::BackoffCompaction { .. } => ErrorCodes::ResourceExhausted,
         }
     }
 }
@@ -175,6 +176,40 @@ pub struct SqliteLog {
     // The SPANN collections whose log was too full at the last round of the compactor, shared by every copy of the log,
     // as the set of the collections under backpressure of the log service of distributed Chroma.
     backpressure: Arc<Mutex<Arc<HashSet<CollectionUuid>>>>,
+    // The rounds of the local compactor, for the seconds after which a refused write may be sent again.
+    compaction_rounds: Arc<Mutex<Option<CompactionRounds>>>,
+}
+
+// The rounds of the local compactor: the next one starts compaction_interval after the end of the one before, as in
+// distributed Chroma, and flushes at most records_per_flush records of a collection.
+#[derive(Clone, Copy, Debug)]
+struct CompactionRounds {
+    // The start of the last round.
+    started: Instant,
+    // The end of the last round that ended, and how long it took.
+    ended: Option<Instant>,
+    length: Duration,
+    compaction_interval: Duration,
+    records_per_flush: u64,
+}
+
+impl CompactionRounds {
+    // The time until the end of the flushes that take the given records of a log after its last flush under the limit:
+    // the end of the round that runs, or of the next one, then one interval and one round for each further flush.
+    fn until_under(&self, records: u64, limit: u64) -> Duration {
+        let flushes = (records + 1)
+            .saturating_sub(limit)
+            .div_ceil(self.records_per_flush.max(1));
+        let first = match self.ended {
+            Some(ended) if ended >= self.started => {
+                self.compaction_interval.saturating_sub(ended.elapsed()) + self.length
+            }
+            _ => self.length.saturating_sub(self.started.elapsed()),
+        };
+        first
+            + (self.compaction_interval + self.length)
+                .saturating_mul(u32::try_from(flushes.saturating_sub(1)).unwrap_or(u32::MAX))
+    }
 }
 
 impl SqliteLog {
@@ -188,6 +223,33 @@ impl SqliteLog {
             num_records_before_backpressure:
                 SqliteLogConfig::default_num_records_before_backpressure(),
             backpressure: Arc::default(),
+            compaction_rounds: Arc::default(),
+        }
+    }
+
+    /// The start of a round of the local compactor, which runs compaction_interval after the end of the one before and
+    /// flushes at most records_per_flush records of a collection.
+    pub fn spann_round_started(&self, compaction_interval: Duration, records_per_flush: u64) {
+        let mut rounds = self.compaction_rounds.lock().unwrap();
+        let (ended, length) = match *rounds {
+            Some(last) => (last.ended, last.length),
+            None => (None, Duration::ZERO),
+        };
+        *rounds = Some(CompactionRounds {
+            started: Instant::now(),
+            ended,
+            length,
+            compaction_interval,
+            records_per_flush,
+        });
+    }
+
+    /// The end of a round of the local compactor.
+    pub fn spann_round_ended(&self) {
+        if let Some(rounds) = self.compaction_rounds.lock().unwrap().as_mut() {
+            let now = Instant::now();
+            rounds.length = now.duration_since(rounds.started);
+            rounds.ended = Some(now);
         }
     }
 
@@ -202,7 +264,8 @@ impl SqliteLog {
 
     // As check_for_backpressure of the log service of distributed Chroma: a write to a collection that the last round
     // found too full counts its log again, and is refused only if the log is still too full. The set stays as the round
-    // left it.
+    // left it. The refusal says after how many seconds, at least 1, the flushes should have taken the log under the
+    // limit, from the rounds of the compactor.
     async fn check_for_backpressure(
         &self,
         collection_id: CollectionUuid,
@@ -230,7 +293,15 @@ impl SqliteLog {
         .await
         .map_err(WrappedSqlxError)?;
         if records as u64 >= self.num_records_before_backpressure {
-            return Err(SqlitePushLogsError::BackoffCompaction);
+            let until_under = match *self.compaction_rounds.lock().unwrap() {
+                Some(rounds) => {
+                    rounds.until_under(records as u64, self.num_records_before_backpressure)
+                }
+                None => Duration::ZERO,
+            };
+            return Err(SqlitePushLogsError::BackoffCompaction {
+                retry_after: (until_under.as_secs_f64().ceil() as u64).max(1),
+            });
         }
         Ok(())
     }

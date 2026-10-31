@@ -1451,10 +1451,11 @@ async fn a_spann_flush_keeps_its_index_of_the_centers_out_of_the_cache_of_the_re
 }
 
 // A frontend as frontend_with_a_stopped_flush, whose log refuses a write to a SPANN collection with at least the records
-// given in its log after its last flush.
+// given in its log after its last flush, and whose flushes take at most records_per_flush records.
 async fn frontend_with_backpressure(
     root: &std::path::Path,
     records: u64,
+    records_per_flush: usize,
 ) -> (ServiceBasedFrontend, chroma_log::SpannFlushStop) {
     let registry = Registry::new();
     let stop = chroma_log::SpannFlushStop::default();
@@ -1470,7 +1471,10 @@ async fn frontend_with_backpressure(
             ..Default::default()
         },
     );
-    config.local_compaction_manager = no_timer_flush();
+    config.local_compaction_manager = chroma_log::LocalCompactionManagerConfig {
+        max_compaction_size: records_per_flush,
+        ..no_timer_flush()
+    };
     config.log = chroma_log::config::LogConfig::Sqlite(chroma_log::config::SqliteLogConfig {
         num_records_before_backpressure: records,
         ..Default::default()
@@ -1496,7 +1500,7 @@ fn a_write_to_a_spann_collection_whose_log_is_too_full_waits_for_its_flush() {
 
 async fn a_write_to_a_spann_collection_whose_log_is_too_full_waits_for_its_flush_impl() {
     let root = tempfile::tempdir().unwrap();
-    let (mut frontend, stop) = frontend_with_backpressure(root.path(), 30).await;
+    let (mut frontend, stop) = frontend_with_backpressure(root.path(), 30, 10_000).await;
     let collection_id = empty_spann_collection(&mut frontend, "too_full").await;
     add_numbers(&mut frontend, collection_id, 0..30).await;
     let round = a_round_that_stops(&frontend, &stop).await;
@@ -1522,6 +1526,11 @@ async fn a_write_to_a_spann_collection_whose_log_is_too_full_waits_for_its_flush
         Box::new(refused),
     ));
     assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    // One flush, in the round that runs: at least 1 s.
+    assert_eq!(
+        response.headers().get(axum::http::header::RETRY_AFTER),
+        Some(&axum::http::HeaderValue::from(1u64))
+    );
     let body: serde_json::Value = serde_json::from_slice(
         &axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1541,5 +1550,133 @@ async fn a_write_to_a_spann_collection_whose_log_is_too_full_waits_for_its_flush
     assert_eq!(
         status(&mut frontend, collection_id).await,
         (30.0 / 31.0, 1, 30, 31)
+    );
+}
+
+// The seconds of the header Retry-After of the answer 429 of a write refused by a log too full, which distributed Chroma
+// does not send.
+fn retry_after_of(refused: impl ChromaError + 'static) -> u64 {
+    let response = axum::response::IntoResponse::into_response(frontend_core::errors::ServerError(
+        Box::new(refused),
+    ));
+    assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    response
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .expect("a write refused by a log too full has no header Retry-After")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+// A write refused by a log too full says when to send it again: the seconds, at least 1, until the end of the flushes
+// that take its log under the limit, from the rounds of the compactor, each compaction_interval_sec after the end of the
+// one before and flushing at most max_compaction_size records. With 60 records, a limit of 30, flushes of 10 records
+// and rounds every 3600 s: while the first round holds its flush, four flushes are needed, the end of this round and
+// three rounds more, 10800 s, for an add, an update, an upsert and a delete; after it, three flushes, the rest of the
+// interval, then the length of a round and two rounds more.
+#[test]
+fn a_write_refused_by_a_log_too_full_says_when_to_send_it_again() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_write_refused_by_a_log_too_full_says_when_to_send_it_again_impl,
+    )
+}
+
+async fn a_write_refused_by_a_log_too_full_says_when_to_send_it_again_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut frontend, stop) = frontend_with_backpressure(root.path(), 30, 10).await;
+    let collection_id = empty_spann_collection(&mut frontend, "too_full").await;
+    add_numbers(&mut frontend, collection_id, 0..60).await;
+    let started = std::time::Instant::now();
+    let round = a_round_that_stops(&frontend, &stop).await;
+    let add = || {
+        AddCollectionRecordsRequest::try_new(
+            TENANT.to_string(),
+            DATABASE.to_string(),
+            collection_id,
+            vec!["r60".to_string()],
+            vec![vec![60.0, 60f32.sin()]],
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    };
+    let Err(refused) = frontend.add(add()).await else {
+        panic!("an add was accepted");
+    };
+    assert_eq!(retry_after_of(refused), 10800);
+    let Err(refused) = frontend
+        .update(
+            UpdateCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                vec!["r0".to_string()],
+                Some(vec![Some(vec![0.5, 0.5])]),
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+    else {
+        panic!("an update was accepted");
+    };
+    assert_eq!(retry_after_of(refused), 10800);
+    let Err(refused) = frontend
+        .upsert(
+            UpsertCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                vec!["r1".to_string()],
+                vec![vec![1.5, 1.5]],
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+    else {
+        panic!("an upsert was accepted");
+    };
+    assert_eq!(retry_after_of(refused), 10800);
+    let Err(refused) = frontend
+        .delete(
+            DeleteCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                Some(vec!["r2".to_string()]),
+                None,
+                None,
+            )
+            .unwrap(),
+            String::new(),
+        )
+        .await
+    else {
+        panic!("a delete was accepted");
+    };
+    assert_eq!(retry_after_of(refused), 10800);
+    stop.go_on();
+    round.await.unwrap().unwrap();
+    // The round took at most this long, and ended at most this long before the next refusal.
+    let length = started.elapsed();
+    let Err(refused) = frontend.add(add()).await else {
+        panic!("an add was accepted");
+    };
+    let since_the_start = started.elapsed();
+    let seconds = retry_after_of(refused);
+    let lowest = (10800.0 - since_the_start.as_secs_f64()).floor() as u64;
+    let highest = (10800.0 + 3.0 * length.as_secs_f64()).ceil() as u64;
+    assert!(
+        (lowest..=highest).contains(&seconds),
+        "Retry-After {seconds} s after the round, not in {lowest}..={highest}"
     );
 }

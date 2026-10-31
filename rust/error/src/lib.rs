@@ -1,3 +1,4 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 // Defines 17 standard error codes based on the error codes defined in the
 // gRPC spec. https://grpc.github.io/grpc/core/md_doc_statuscodes.html
 // Custom errors can use these codes in order to allow for generic handling
@@ -147,6 +148,10 @@ pub trait ChromaError: Error + Send {
     fn should_trace_error(&self) -> bool {
         true
     }
+    /// The seconds after which a request refused for now may be sent again, for the header Retry-After of its answer.
+    fn retry_after(&self) -> Option<u64> {
+        None
+    }
 }
 
 impl Error for Box<dyn ChromaError> {}
@@ -154,6 +159,9 @@ impl Error for Box<dyn ChromaError> {}
 impl ChromaError for Box<dyn ChromaError> {
     fn code(&self) -> ErrorCodes {
         self.as_ref().code()
+    }
+    fn retry_after(&self) -> Option<u64> {
+        self.as_ref().retry_after()
     }
 }
 
