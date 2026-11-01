@@ -74,9 +74,7 @@ impl Fixture {
                 file_path: Default::default(),
             });
         }
-        // These tests purge what the compactor applied at once: no cutoff (purge_cutoff_time_seconds 0).
-        let log = SqliteLog::new(db.clone(), "default".into(), "default".into())
-            .with_purge_cutoff_time_seconds(0);
+        let log = SqliteLog::new(db.clone(), "default".into(), "default".into());
         log.update_legacy_embeddings_queue_config(LegacyEmbeddingsQueueConfig {
             automatically_purge: true,
             kind: "EmbeddingsQueueConfigurationInternal".into(),
@@ -91,6 +89,8 @@ impl Fixture {
             metrics: LocalCompactionMetrics::default(),
             sysdb: SysDb::Test(sysdb.clone()),
             purged: HashSet::new(),
+            purges: PurgeSchedule::new(Duration::ZERO),
+            purging: false,
             spann_versions: HashMap::new(),
             spann_version_grace: SpannVersionGrace::default().0,
             compaction_interval: Duration::from_secs(10),
@@ -208,7 +208,19 @@ impl Fixture {
     }
 
     async fn restart_compactor(&mut self) {
+        let log = SqliteLog::new(self.db.clone(), "default".into(), "default".into());
+        self.restart_compactor_with(log, PurgeSchedule::new(Duration::ZERO))
+            .await;
+    }
+
+    // The compactor again, with the log and the timer of its purges given: the tracker of its work out of the actor.
+    async fn restart_compactor_with(
+        &mut self,
+        log: SqliteLog,
+        purges: PurgeSchedule,
+    ) -> tokio_util::task::TaskTracker {
         self.stop_compactor().await;
+        let background = tokio_util::task::TaskTracker::new();
         let registry = Registry::new();
         registry.register(self.db.clone());
         let manager = LocalSegmentManager::try_from_config(
@@ -223,15 +235,14 @@ impl Fixture {
         self.compactor_joined = false;
         self.manager = manager.clone();
         self.handle = self.system.start_component(LocalCompactionManager {
-            log: Log::Sqlite(
-                SqliteLog::new(self.db.clone(), "default".into(), "default".into())
-                    .with_purge_cutoff_time_seconds(0),
-            ),
+            log: Log::Sqlite(log),
             sqlite_db: self.db.clone(),
             hnsw_segment_manager: manager.clone(),
             metrics: LocalCompactionMetrics::default(),
             sysdb: SysDb::Test(self.sysdb.clone()),
             purged: HashSet::new(),
+            purges,
+            purging: false,
             spann_versions: HashMap::new(),
             spann_version_grace: SpannVersionGrace::default().0,
             compaction_interval: Duration::from_secs(10),
@@ -242,9 +253,42 @@ impl Fixture {
             compaction_timeout: Duration::from_secs(86_400),
             spann_flushes: SpannFlushes::default(),
             spann_flush_stop: None,
-            background: tokio_util::task::TaskTracker::new(),
+            background: background.clone(),
             shutdown_grace: Duration::from_secs(30),
         });
+        background
+    }
+
+    // The end of a round of the timer of the flushes, which starts the purges that are due.
+    async fn round_done(&self) {
+        let (round, _) = oneshot::channel();
+        self.handle
+            .request(SpannRoundDone { round }, None)
+            .await
+            .unwrap();
+    }
+
+    // The compactor again with the interval of its purges given, for a collection in use by conditional transactions, with
+    // no cutoff: what it applied goes at the purge of the timer.
+    async fn in_use_with_a_timer_of(&mut self, interval: Duration) -> tokio_util::task::TaskTracker {
+        self.log
+            .note_conditional_use(self.collection.collection_id)
+            .await
+            .unwrap();
+        let log = self.log.clone().with_purge_cutoff_time_seconds(0);
+        self.restart_compactor_with(log, PurgeSchedule::new(interval))
+            .await
+    }
+
+    // Waits for the records of the log to be the ones given, as a purge out of the actor ends on its own.
+    async fn wait_for_records(&mut self, expected: Vec<LogRecord>) {
+        for _ in 0..200 {
+            if self.records().await.len() == expected.len() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_records(self.records().await, expected);
     }
 
     async fn stop(mut self) {
@@ -408,6 +452,153 @@ async fn failed_purge_is_checked_again_by_the_next_request() {
         f.records().await,
         original.into_iter().filter(|r| r.log_offset >= 3).collect(),
     );
+    f.stop().await;
+}
+
+// A purge of the timer runs out of the actor, as the garbage collector of distributed Chroma runs apart from the log:
+// while its DELETE waits for the lock of SQLite, held here by another connection, the compactor still answers.
+#[tokio::test]
+async fn a_purge_of_the_timer_does_not_hold_up_the_compactor() {
+    let mut f = Fixture::new().await;
+    let original = f.seed().await;
+    f.checkpoint().await;
+    f.watermark(f.metadata, 3).await;
+    f.watermark(f.vector, 3).await;
+    let background = f.in_use_with_a_timer_of(Duration::from_millis(1)).await;
+    f.purge().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut writer = f.db.get_conn().acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let answered = tokio::time::timeout(Duration::from_secs(5), async {
+        f.round_done().await;
+        f.purge().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        f.round_done().await;
+    })
+    .await;
+    // Only one purge runs at a time: the request of the second round waits for its end.
+    let running = background.len();
+    // A stop waits for a purge that runs, as for the flushes.
+    background.close();
+    let stop_went_on = tokio::time::timeout(Duration::from_millis(200), background.wait())
+        .await
+        .is_ok();
+    sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
+    drop(writer);
+    assert!(answered.is_ok(), "the compactor waited for the purge");
+    assert_eq!(running, 1);
+    assert!(!stop_went_on, "the stop did not wait for the purge");
+    tokio::time::timeout(Duration::from_secs(10), background.wait())
+        .await
+        .unwrap();
+    f.wait_for_records(original.into_iter().filter(|r| r.log_offset >= 3).collect())
+        .await;
+    f.stop().await;
+}
+
+// In a collection that conditional transactions use, a request of a purge only marks the collection: nothing goes before
+// the timer.
+#[tokio::test]
+async fn a_purge_request_waits_for_the_timer() {
+    let mut f = Fixture::new().await;
+    let original = f.seed().await;
+    f.checkpoint().await;
+    f.watermark(f.metadata, 3).await;
+    f.watermark(f.vector, 3).await;
+    f.in_use_with_a_timer_of(Duration::from_secs(3_600)).await;
+    f.purge().await.unwrap();
+    f.round_done().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_records(f.records().await, original);
+    f.stop().await;
+}
+
+// A purge of the timer that succeeded holds until a backfill moves the watermarks, as a purge at once does; the one after
+// it runs, once the first has ended.
+#[tokio::test]
+async fn a_purge_of_the_timer_holds_until_a_backfill() {
+    let mut f = Fixture::new().await;
+    let original = f.seed().await;
+    f.checkpoint().await;
+    f.watermark(f.metadata, 2).await;
+    f.watermark(f.vector, 2).await;
+    f.in_use_with_a_timer_of(Duration::from_millis(1)).await;
+    f.purge().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    f.round_done().await;
+    let after_two: Vec<_> = original
+        .iter()
+        .filter(|r| r.log_offset >= 2)
+        .cloned()
+        .collect();
+    f.wait_for_records(after_two.clone()).await;
+    // The watermarks move without a backfill: the purge that succeeded still holds.
+    f.watermark(f.metadata, 3).await;
+    f.watermark(f.vector, 3).await;
+    f.purge().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    f.round_done().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_records(f.records().await, after_two);
+    // A backfill forgets it and applies the rest of the log: a later round purges up to there, as many rounds as the end
+    // of the first purge needs.
+    f.handle
+        .request(
+            BackfillMessage {
+                collection_id: f.collection.collection_id,
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let after_backfill: Vec<_> = original.into_iter().filter(|r| r.log_offset >= 5).collect();
+    for _ in 0..100 {
+        f.purge().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        f.round_done().await;
+        if f.records().await.len() == after_backfill.len() {
+            break;
+        }
+    }
+    f.wait_for_records(after_backfill).await;
+    f.stop().await;
+}
+
+// A purge of the timer that failed is not marked as done: the next request asks for it again.
+#[tokio::test]
+async fn a_failed_purge_of_the_timer_is_asked_again() {
+    let mut f = Fixture::new().await;
+    let original = f.seed().await;
+    f.checkpoint().await;
+    f.watermark(f.metadata, 3).await;
+    f.watermark(f.vector, 3).await;
+    let background = f.in_use_with_a_timer_of(Duration::from_millis(1)).await;
+    hide_purge_tables(&f.db, true).await;
+    f.purge().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    f.round_done().await;
+    for _ in 0..100 {
+        if background.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    hide_purge_tables(&f.db, false).await;
+    assert_records(f.records().await, original.clone());
+    let expected: Vec<_> = original.into_iter().filter(|r| r.log_offset >= 3).collect();
+    for _ in 0..100 {
+        f.purge().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        f.round_done().await;
+        if f.records().await.len() == expected.len() {
+            break;
+        }
+    }
+    f.wait_for_records(expected).await;
     f.stop().await;
 }
 
@@ -1568,6 +1759,8 @@ async fn replaced_spann_versions_are_forgotten_after_the_grace() {
         metrics: LocalCompactionMetrics::default(),
         sysdb: SysDb::Test(TestSysDb::new()),
         purged: HashSet::new(),
+        purges: PurgeSchedule::new(Duration::ZERO),
+        purging: false,
         spann_versions: HashMap::new(),
         spann_version_grace: Duration::ZERO,
         compaction_interval: Duration::from_secs(10),

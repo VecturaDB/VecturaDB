@@ -128,11 +128,11 @@ impl Fixture {
         sysdb.add_segment(metadata_segment.clone());
         sysdb.add_segment(vector_segment.clone());
         registry.register(SysDb::Test(sysdb.clone()));
-        // These tests purge what the compactor applied at once: no cutoff (purge_cutoff_time_seconds 0).
-        registry.register(Log::Sqlite(
-            SqliteLog::new(db.clone(), "default".into(), "default".into())
-                .with_purge_cutoff_time_seconds(0),
-        ));
+        registry.register(Log::Sqlite(SqliteLog::new(
+            db.clone(),
+            "default".into(),
+            "default".into(),
+        )));
         // Purging requires both durable progress and the usable files written above.
         for segment in [&metadata_segment, &vector_segment] {
             sqlx::query("INSERT OR REPLACE INTO max_seq_id (segment_id, seq_id) VALUES (?, 3)")
@@ -603,10 +603,11 @@ async fn repeated_reads_skip_replay_and_inspection_but_eviction_replays_tail() {
         .execute(f.db.get_conn())
         .await
         .unwrap();
-    let mut log = Log::Sqlite(
-        SqliteLog::new(f.db.clone(), "default".into(), "default".into())
-            .with_purge_cutoff_time_seconds(0),
-    );
+    let mut log = Log::Sqlite(SqliteLog::new(
+        f.db.clone(),
+        "default".into(),
+        "default".into(),
+    ));
     log.push_logs(
         &f.segments.collection.tenant,
         chroma_types::DatabaseName::new(f.segments.collection.database.clone()).unwrap(),
