@@ -59,6 +59,21 @@ docker run -p 127.0.0.1:8000:8000 -v ./data:/data ghcr.io/vecturadb/vecturadb:pr
 
 Images for amd64 and arm64. `preview` is the newest preview; every release also has a tag with its version. The data lives in `/data`. `-p 127.0.0.1:8000:8000` publishes the port on this machine only.
 
+On Windows with Docker Desktop, keep the data in a Docker volume rather than in a folder of Windows mounted into the container: in our tests the index of a collection in a mounted folder broke after a few abrupt stops of the server, in Chroma 1.5.9 too; in a volume it held far longer.
+
+```bash
+docker run -p 127.0.0.1:8000:8000 -v vecturadb-data:/data ghcr.io/vecturadb/vecturadb:preview
+```
+
+The files of a volume are not in a folder of Windows, and removing the volume removes the data. To back it up, with the server stopped, into vecturadb-data.tar.gz in the current folder, and to restore it, in PowerShell:
+
+```powershell
+docker run --rm -v vecturadb-data:/data -v "${PWD}:/backup" alpine tar czf /backup/vecturadb-data.tar.gz -C /data .
+docker run --rm -v vecturadb-data:/data -v "${PWD}:/backup" alpine tar xzf /backup/vecturadb-data.tar.gz -C /data
+```
+
+In cmd, `"%cd%":/backup` in place of `"${PWD}:/backup"`.
+
 ## CLI
 
 Linux (x86_64 and arm64) and macOS (x64 and arm64):
