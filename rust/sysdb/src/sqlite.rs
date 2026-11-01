@@ -1342,6 +1342,93 @@ impl SqliteSysDb {
         Ok(created)
     }
 
+    // AddAttachedFunctionInput of the coordinator, with insertAttachedFunctionForInputCollection: one more input
+    // collection of an asynchronous attached function, a row of the same id; the row of the same id already there is
+    // the same input, created while it is not ready.
+    pub(crate) async fn add_attached_function_input(
+        &self,
+        attached_function_id: AttachedFunctionUuid,
+        input_collection_id: CollectionUuid,
+    ) -> Result<(AttachedFunctionUuid, bool), tonic::Status> {
+        let id = attached_function_id.0.to_string();
+        let input = input_collection_id.to_string();
+        let mut tx = self.db.get_conn().begin().await.map_err(internal)?;
+        self.db.begin_immediate(&mut *tx).await.map_err(internal)?;
+
+        let rows = attached_function_rows(&mut tx, AttachedFunctionFilter::id(&id), false).await?;
+        let Some(base) = rows.first() else {
+            return Err(tonic::Status::not_found(ERR_ATTACHED_FUNCTION_NOT_FOUND));
+        };
+        let functions = functions_by_id(&mut tx, std::slice::from_ref(base)).await?;
+        let function = functions
+            .get(&base.function_id)
+            .ok_or_else(|| tonic::Status::not_found(ERR_FUNCTION_NOT_FOUND))?;
+        if !function.is_async {
+            return Err(tonic::Status::invalid_argument(
+                "multiple input collections are only supported for async attached functions",
+            ));
+        }
+        let database_name: Option<String> =
+            sqlx::query_scalar("SELECT name FROM databases WHERE id = $1")
+                .bind(&base.database_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(internal)?;
+        let database_name =
+            database_name.ok_or_else(|| tonic::Status::unknown(ERR_DATABASE_NOT_FOUND))?;
+
+        let existing =
+            attached_function_rows(&mut tx, AttachedFunctionFilter::input(&input), false).await?;
+        let existing_functions = functions_by_id(&mut tx, &existing).await?;
+        for attached_function in &existing {
+            if attached_function.id == base.id {
+                return Ok((attached_function_id, !attached_function.is_ready));
+            }
+            let existing_function = existing_functions
+                .get(&attached_function.function_id)
+                .ok_or_else(|| tonic::Status::not_found(ERR_FUNCTION_NOT_FOUND))?;
+            if existing_function.is_async == function.is_async {
+                return Err(tonic::Status::already_exists(format!(
+                    "collection already has an attached function with the same execution mode (post-lock validation): name={}, function={}, output_collection={}",
+                    attached_function.name, existing_function.name, attached_function.output_collection_name
+                )));
+            }
+        }
+        let collections = collection_ids_by_name(&mut tx, &base.tenant_id, &database_name).await?;
+        if !collections.values().any(|id| id == &input) {
+            return Err(tonic::Status::unknown(ERR_COLLECTION_NOT_FOUND));
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO attached_functions
+                (id, name, tenant_id, database_id, input_collection_id, output_collection_name, function_id,
+                 function_params, min_records_for_invocation, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, strftime('%Y-%m-%d %H:%M:%f', 'now'),
+                    strftime('%Y-%m-%d %H:%M:%f', 'now'))
+            "#,
+        )
+        .bind(&id)
+        .bind(&base.name)
+        .bind(&base.tenant_id)
+        .bind(&base.database_id)
+        .bind(&input)
+        .bind(&base.output_collection_name)
+        .bind(base.function_id.to_string())
+        .bind(&base.function_params)
+        .bind(base.min_records_for_invocation)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(e) if e.kind() == ErrorKind::UniqueViolation => {
+                tonic::Status::already_exists(ERR_ATTACHED_FUNCTION_ALREADY_EXISTS)
+            }
+            e => internal(e),
+        })?;
+        tx.commit().await.map_err(internal)?;
+        Ok((attached_function_id, true))
+    }
+
     // GetAttachedFunctions of the coordinator, with the attached functions as the gRPC sysdb reads them.
     pub(crate) async fn get_attached_functions(
         &self,
@@ -3668,7 +3755,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_built_in_functions_are_the_synchronous_ones_of_distributed_chroma() {
+    async fn the_built_in_functions_are_those_of_distributed_chroma() {
         let sysdb = SqliteSysDb::new(
             get_new_sqlite_db().await,
             "default".into(),
@@ -3676,19 +3763,41 @@ mod tests {
         );
         let mut functions = sysdb.get_all_functions().await.unwrap();
         functions.sort();
-        assert_eq!(
-            functions,
-            vec![
-                (
-                    chroma_types::FUNCTION_RECORD_COUNTER_NAME.to_string(),
-                    chroma_types::FUNCTION_RECORD_COUNTER_ID
-                ),
-                (
-                    chroma_types::FUNCTION_STATISTICS_NAME.to_string(),
-                    chroma_types::FUNCTION_STATISTICS_ID
-                ),
-            ]
-        );
+        let mut expected = vec![
+            (
+                chroma_types::FUNCTION_RECORD_COUNTER_NAME,
+                chroma_types::FUNCTION_RECORD_COUNTER_ID,
+            ),
+            (
+                chroma_types::FUNCTION_STATISTICS_NAME,
+                chroma_types::FUNCTION_STATISTICS_ID,
+            ),
+            (
+                chroma_types::FUNCTION_DUMMY_ASYNC_NAME,
+                chroma_types::FUNCTION_DUMMY_ASYNC_ID,
+            ),
+            (
+                chroma_types::FUNCTION_HTTP_GENERATE_NAME,
+                chroma_types::FUNCTION_HTTP_GENERATE_ID,
+            ),
+            (
+                chroma_types::FUNCTION_HTTP_CURRENTS_NAME,
+                chroma_types::FUNCTION_HTTP_CURRENTS_ID,
+            ),
+            (
+                chroma_types::FUNCTION_REVISION_HISTORY_NAME,
+                chroma_types::FUNCTION_REVISION_HISTORY_ID,
+            ),
+            (
+                chroma_types::FUNCTION_COUNT_TO_FILE_ASYNC_NAME,
+                chroma_types::FUNCTION_COUNT_TO_FILE_ASYNC_ID,
+            ),
+        ]
+        .into_iter()
+        .map(|(name, id)| (name.to_string(), id))
+        .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(functions, expected);
     }
 
     #[tokio::test]

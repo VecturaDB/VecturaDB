@@ -3021,11 +3021,10 @@ impl SysDb {
                 grpc.add_attached_function_input(attached_function_id, input_collection_id)
                     .await
             }
-            SysDb::Sqlite(_) => Err(AttachFunctionError::InternalError(
-                tonic::Status::unimplemented(
-                    "add_attached_function_input is not supported in SqliteSysDb",
-                ),
-            )),
+            SysDb::Sqlite(sqlite) => sqlite
+                .add_attached_function_input(attached_function_id, input_collection_id)
+                .await
+                .map_err(attach_function_error_from_status),
             SysDb::Test(test) => {
                 test.add_attached_function_input(attached_function_id, input_collection_id)
             }

@@ -49,8 +49,8 @@ CREATE TABLE global_functions (
     CONSTRAINT unique_global_function_per_tenant_db UNIQUE (tenant_id, database_id, name)
 );
 
--- The built-in functions that the single node runs, with the ids and the values of distributed Chroma
--- (20251023154800 and 20251029223300): its asynchronous ones come with their execution.
+-- The built-in functions of distributed Chroma, with its ids and values (20251023154800, 20251029223300,
+-- 20260501105846, 20260512120000, 20260525150000, 20260604123000 and 20260617150000).
 INSERT INTO functions (id, name, is_incremental, return_type) VALUES (
     'ccf2e3ba-633e-43ba-9394-46b0c54c61e3',
     'record_counter',
@@ -62,4 +62,39 @@ INSERT INTO functions (id, name, is_incremental, return_type) VALUES (
     'statistics',
     FALSE,
     '{"type": "object", "properties": {"key": {"type": "string", "description": "Metadata key"}, "type": {"type": "string", "description": "Value type"}, "value": {"type": "string", "description": "Value"}, "count": {"type": "integer", "description": "Frequency count"}}}'
+);
+INSERT INTO functions (id, name, is_incremental, return_type, is_async) VALUES (
+    '1db3d179-37a7-4c44-a301-687c1da69d7b',
+    'dummy_async',
+    TRUE,
+    '{}',
+    TRUE
+);
+INSERT INTO functions (id, name, is_incremental, return_type, is_async) VALUES (
+    '9e3c7540-4ddd-40a2-bbff-ad9cb3f06efc',
+    'http_generate',
+    TRUE,
+    '{}',
+    TRUE
+);
+INSERT INTO functions (id, name, is_incremental, return_type, is_async) VALUES (
+    '2df4342c-5b5a-49aa-8345-c46503e85509',
+    'revision_history',
+    TRUE,
+    '{}',
+    FALSE
+);
+INSERT INTO functions (id, name, is_incremental, return_type, is_async) VALUES (
+    'eb125f49-1e8b-45d9-bb20-e84f2eae4e92',
+    'count_to_file_async',
+    TRUE,
+    '{}',
+    TRUE
+);
+INSERT INTO functions (id, name, is_incremental, return_type, is_async) VALUES (
+    '63fdf220-eefb-4ad9-a686-9f719655aeb3',
+    'http_currents',
+    TRUE,
+    '{}',
+    TRUE
 );
