@@ -480,6 +480,116 @@ async fn interrupted_checkpoints_replay_add_update_and_delete() {
     }
 }
 
+// A save cut by a kill after its native files and before its pickle: the journal, with the ID map of the save in it, is
+// written and synced, the four files written, the pickle still that of the save before.
+async fn save_native_files_only(writer: &LocalHnswSegmentWriter) {
+    let mut guard = writer.index.inner.write().await;
+    guard.id_map.checkpoint_seq_id = Some(guard.last_seen_seq_id);
+    let mut id_map = Vec::new();
+    serde_pickle::to_writer(&mut id_map, &guard.id_map, SerOptions::new()).unwrap();
+    let _permit = acquire_hnsw_files().await;
+    let files = HnswFiles(&guard.index);
+    files.0.open_fd().unwrap();
+    files
+        .0
+        .write_persist_journal_file(METADATA_FILE, &id_map)
+        .unwrap();
+    files.0.save().unwrap();
+}
+
+// After a save cut between its native files and its pickle, the replay of the log puts the records where they were:
+// the index does not keep a deleted slot for each record written after the last pickle.
+#[tokio::test]
+async fn a_save_cut_before_its_pickle_leaves_no_deleted_slots() {
+    let (root, sqlite, collection, segment, mut writer) = fixture().await;
+    writer.index.inner.write().await.sync_threshold = 1;
+    writer
+        .apply_log_chunk(Chunk::new(vec![record(1, 1, 0), record(2, 2, 0)].into()))
+        .await
+        .unwrap();
+    writer.index.inner.write().await.sync_threshold = 1000;
+    let tail = vec![record(3, 3, 0), record(4, 4, 0), record(5, 5, 0)];
+    writer
+        .apply_log_chunk(Chunk::new(tail.clone().into()))
+        .await
+        .unwrap();
+    save_native_files_only(&writer).await;
+    writer.index.close().await;
+    drop(writer);
+    let persist_path = Some(root.path().to_str().unwrap().to_string());
+    let mut reopened = LocalHnswSegmentWriter::from_segment(
+        &collection,
+        &segment,
+        3,
+        persist_path,
+        sqlite.clone(),
+    )
+    .await
+    .unwrap();
+    reopened
+        .apply_log_chunk(Chunk::new(tail.into()))
+        .await
+        .unwrap();
+    let guard = reopened.index.inner.read().await;
+    assert_eq!(guard.index.len(), 5);
+    assert_eq!(
+        guard.index.len_with_deleted(),
+        5,
+        "deleted slots left by the replay"
+    );
+}
+
+// A record deleted and added again after the last pickle, in a save cut before its pickle: the replay adds it again,
+// A record deleted after the last pickle, in a save cut before its pickle, and added again after the save: the replay
+// adds it again, though the native files hold its old label as deleted and the pickle still maps the record to it.
+#[tokio::test]
+async fn a_record_deleted_in_a_save_cut_before_its_pickle_and_added_again_replays() {
+    let (root, sqlite, collection, segment, mut writer) = fixture().await;
+    writer.index.inner.write().await.sync_threshold = 1;
+    writer
+        .apply_log_chunk(Chunk::new(vec![record(1, 1, 0), record(2, 2, 0)].into()))
+        .await
+        .unwrap();
+    writer.index.inner.write().await.sync_threshold = 1000;
+    writer
+        .apply_log_chunk(Chunk::new(vec![record(3, 1, 3)].into()))
+        .await
+        .unwrap();
+    save_native_files_only(&writer).await;
+    let tail = vec![record(3, 1, 3), record(4, 1, 0)];
+    writer.index.close().await;
+    drop(writer);
+    let persist_path = Some(root.path().to_str().unwrap().to_string());
+    let mut reopened = LocalHnswSegmentWriter::from_segment(
+        &collection,
+        &segment,
+        3,
+        persist_path.clone(),
+        sqlite.clone(),
+    )
+    .await
+    .unwrap();
+    // The tail is not in the log of SQLite, which a reader would replay: the replay is saved, so the reader finds it.
+    reopened.index.set_sync_threshold(1).await;
+    reopened
+        .apply_log_chunk(Chunk::new(tail.into()))
+        .await
+        .expect("the replay of a record deleted and added again");
+    reopened.index.close().await;
+    drop(reopened);
+    let reader =
+        LocalHnswSegmentReader::from_segment(&collection, &segment, 3, persist_path, sqlite)
+            .await
+            .unwrap();
+    assert_eq!(
+        reader
+            .get_embedding_by_user_id(&"1".to_string())
+            .await
+            .unwrap(),
+        vec![4.0; 3]
+    );
+}
+
 #[tokio::test]
 async fn updates_keep_one_slot_and_survive_reload() {
     let (root, sqlite, collection, segment, mut writer) = fixture().await;

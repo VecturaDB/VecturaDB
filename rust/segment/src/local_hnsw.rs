@@ -13,7 +13,6 @@ pub use persistence::{
 
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
-    io::Write,
     mem::size_of,
     path::Path,
     sync::Arc,
@@ -1376,6 +1375,11 @@ async fn persist(
                 .is_ok_and(|current| current == previous.fingerprint)
         });
         let path = path.as_str();
+        // The ID map goes in the journal of the save of the native files, as the compaction of distributed Chroma
+        // publishes its files whole or not at all: a kill between the files and the map left the files of one save
+        // with the map of the save before, ids on labels the files had deleted and labels no id had.
+        let mut id_map = Vec::new();
+        serde_pickle::to_writer(&mut id_map, &guard.id_map, SerOptions::new())?;
         let _permit = acquire_hnsw_files().await;
         {
             // Queries and mutations use memory. Only checkpointing needs open
@@ -1387,36 +1391,10 @@ async fn persist(
                 .map_err(|_| LocalHnswSegmentWriterError::HnswIndexPersistError)?;
             files
                 .0
-                .save_with_journal()
+                .save_with_journal_file(METADATA_FILE, &id_map)
                 .map_err(|_| LocalHnswSegmentWriterError::HnswIndexPersistError)?;
         }
-        // Persist id map.
-        let metadata_file_path = Path::new(path).join(METADATA_FILE);
-
-        // Sync native files before publishing the matching ID map and SQLite
-        // watermark. Replacing the pickle avoids truncating the last good copy.
-        for filename in HNSW_INDEX_FILES {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(Path::new(path).join(filename))?
-                .sync_all()?;
-        }
-        let mut file = tempfile::NamedTempFile::new_in(path)?;
-        {
-            let mut buffered_file = std::io::BufWriter::new(file.as_file_mut());
-            serde_pickle::to_writer(&mut buffered_file, &guard.id_map, SerOptions::new())?;
-            buffered_file.flush()?;
-        }
-        file.as_file().sync_all()?;
-        // std::fs::rename, unlike persist of tempfile, takes long paths on Windows: the ID map then reaches the data
-        // paths that hnswlib reaches.
-        let temp_path = file.into_temp_path();
-        std::fs::rename(&temp_path, &metadata_file_path)?;
-        let _ = temp_path.keep();
-        sync_dir(Path::new(path))?;
-        if let Some(parent) = Path::new(path).parent() {
-            sync_dir(parent)?;
-        }
+        // No sync of the folder: a save syncs nothing, as in Chroma 1.5.9 (the fork of hnswlib, persistDirtyWithJournal).
         if verified {
             guard.verified_checkpoint = Some(VerifiedCheckpoint {
                 fingerprint: CheckpointFingerprint::read(Path::new(path))?,
@@ -1425,17 +1403,6 @@ async fn persist(
         }
     }
     Ok(guard)
-}
-
-/// Make renames and new files in `dir` durable. Windows cannot open a
-/// directory with `File::open` and has no directory fsync, so this is a no-op
-/// there.
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    std::fs::File::open(dir)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = dir;
-    Ok(())
 }
 
 #[cfg(test)]
