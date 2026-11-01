@@ -1330,9 +1330,23 @@ impl LocalCompactionManager {
             &collection_segments.vector_segment.id,
         )
         .await?;
+        // As the garbage collector of distributed Chroma keeps the log that its attached functions have not run on
+        // (fetch_min_attached_function_completion_offset.rs): no record after the lowest completion offset of the
+        // functions of the collection goes, as GetMinCompletionOffsetForCollection of the coordinator reads it.
+        let min_completion_offset: Option<i64> = sqlx::query_scalar(
+            "SELECT MIN(completion_offset) FROM attached_functions WHERE input_collection_id = $1              AND is_deleted = FALSE",
+        )
+        .bind(collection_id.to_string())
+        .fetch_one(self.sqlite_db.get_conn())
+        .await
+        .map_err(|_| CompactionManagerError::PurgeLogsFailure)?;
+        let purge_seq_id = match min_completion_offset {
+            Some(offset) => max_seq_id.min(offset.max(0) as u64 + 1),
+            None => max_seq_id,
+        };
         if let Log::Sqlite(log) = &mut self.log {
             if !log
-                .has_purge_work(collection_id, max_seq_id)
+                .has_purge_work(collection_id, purge_seq_id)
                 .await
                 .map_err(|_| CompactionManagerError::PurgeLogsFailure)?
             {
@@ -1361,7 +1375,7 @@ impl LocalCompactionManager {
             }
         }
         self.log
-            .purge_logs(collection_id, max_seq_id)
+            .purge_logs(collection_id, purge_seq_id)
             .await
             .map_err(|_| CompactionManagerError::PurgeLogsFailure)
     }
