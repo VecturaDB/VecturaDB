@@ -5854,6 +5854,27 @@ mod tests {
             collection_version(&mut frontend, &collection).await,
             applied + 1
         );
+        // A write of deletes only is one more version too, as a compaction of deletes in distributed Chroma.
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    Some(vec!["id2".to_string()]),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count_records(&mut frontend, &collection).await, 1);
+        assert_eq!(
+            collection_version(&mut frontend, &collection).await,
+            applied + 2
+        );
     }
 
     fn index_folders(root: &std::path::Path) -> Vec<std::path::PathBuf> {
