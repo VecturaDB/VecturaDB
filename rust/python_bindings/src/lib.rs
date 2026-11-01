@@ -26,6 +26,7 @@ fn chromadb_rust_bindings(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Sqlite config classes
     m.add_class::<SqliteDBConfig>()?;
+    m.add_class::<chroma_sqlite::config::JournalMode>()?;
     m.add_class::<MigrationMode>()?;
     m.add_class::<MigrationHash>()?;
 
