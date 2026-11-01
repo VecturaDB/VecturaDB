@@ -206,6 +206,9 @@ impl PurgeSchedule {
 // collection, so that the windows of its applies run in their order; and, by collection, whether it has a ready
 // synchronous function when last read, so that a write of a collection without functions reads no catalog. An attach
 // writes records BackfillFn to the log of its input collection, and the apply that sees them reads the catalog again.
+// How long the queue of a collection waits for a window before it goes.
+const QUEUE_IDLE: Duration = Duration::from_secs(600);
+
 #[derive(Clone, Default)]
 struct FunctionRuns {
     queues: Arc<
@@ -223,9 +226,25 @@ impl FunctionRuns {
         let queue = queues.entry(collection_id).or_insert_with(|| {
             let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<FunctionWindow>();
             let runner = runner.clone();
+            let queues = Arc::clone(&self.queues);
             tokio::spawn(
                 async move {
-                    while let Some(window) = receiver.recv().await {
+                    loop {
+                        let window = match tokio::time::timeout(QUEUE_IDLE, receiver.recv()).await {
+                            Ok(Some(window)) => window,
+                            Ok(None) => break,
+                            // An idle queue goes, as after a delete of its collection or a detach of its functions:
+                            // under the lock that the sends take, so that no window comes to it after, and only
+                            // while empty, so that the next queue of the collection runs after it.
+                            Err(_) => {
+                                let mut queues = queues.lock().unwrap_or_else(|e| e.into_inner());
+                                if receiver.is_empty() {
+                                    queues.remove(&collection_id);
+                                    break;
+                                }
+                                continue;
+                            }
+                        };
                         // A window that fails leaves the completion offset behind: the next window of the collection
                         // runs its function as the backfill of distributed Chroma.
                         if let Err(err) = runner.run(window).await {
@@ -709,12 +728,15 @@ impl LocalCompactionManager {
                 }
                 Some(has) => *has,
                 None => {
-                    let has = !self
-                        .function_runner()
-                        .ready_sync_functions(message.collection_id)
-                        .await
-                        .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?
-                        .is_empty();
+                    // Any attached function not deleted, ready or not yet: a write that comes between the records of an
+                    // attach and its ready must not mark the collection without functions.
+                    let has: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM attached_functions WHERE input_collection_id = $1                          AND is_deleted = FALSE)",
+                    )
+                    .bind(message.collection_id.to_string())
+                    .fetch_one(self.sqlite_db.get_conn())
+                    .await
+                    .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
                     self.function_runs
                         .has_functions
                         .insert(message.collection_id, has);
@@ -1332,9 +1354,10 @@ impl LocalCompactionManager {
         .await?;
         // As the garbage collector of distributed Chroma keeps the log that its attached functions have not run on
         // (fetch_min_attached_function_completion_offset.rs): no record after the lowest completion offset of the
-        // functions of the collection goes, as GetMinCompletionOffsetForCollection of the coordinator reads it.
+        // functions of the collection goes, as GetMinCompletionOffsetForCollection of the coordinator reads it. A
+        // function that keeps failing holds back the purge of its input collection, as in distributed Chroma.
         let min_completion_offset: Option<i64> = sqlx::query_scalar(
-            "SELECT MIN(completion_offset) FROM attached_functions WHERE input_collection_id = $1              AND is_deleted = FALSE",
+            "SELECT MIN(completion_offset) FROM attached_functions WHERE input_collection_id = $1 AND is_deleted = FALSE",
         )
         .bind(collection_id.to_string())
         .fetch_one(self.sqlite_db.get_conn())

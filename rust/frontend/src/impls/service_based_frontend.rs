@@ -5984,6 +5984,51 @@ mod tests {
         assert_eq!(wait_for_total_count(&mut frontend, &collection, 3).await, 3);
     }
 
+    // An attach to a collection with no record yet, then writes: they are counted.
+    #[tokio::test]
+    async fn record_counter_attached_to_an_empty_collection_counts_the_writes_after() {
+        let mut frontend = sqlite_frontend().await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "empty_input").await;
+        frontend
+            .attach_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                AttachFunctionRequest::try_new(
+                    "counter".to_string(),
+                    chroma_types::FUNCTION_RECORD_COUNTER_NAME.to_string(),
+                    "counts".to_string(),
+                    serde_json::json!({}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        for round in 1..=3 {
+            frontend
+                .add(
+                    AddCollectionRecordsRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection.collection_id,
+                        vec![format!("id{round}")],
+                        vec![vec![1.0, 2.0]],
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                wait_for_total_count(&mut frontend, &collection, round).await,
+                round
+            );
+        }
+    }
+
     fn index_folders(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut folders: Vec<_> = std::fs::read_dir(root)
             .unwrap()
