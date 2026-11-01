@@ -46,6 +46,8 @@ futures = { workspace = true }
 supports-color = "3.0.2"
 tempfile = { workspace = true }
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
 chroma-types = { workspace = true, features = ["testing"] }

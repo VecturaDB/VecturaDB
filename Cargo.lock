@@ -1722,6 +1722,7 @@ dependencies = [
  "tempfile",
  "textwrap",
  "thiserror 1.0.69",
+ "tikv-jemallocator",
  "tokio",
  "toml 0.8.23",
  "tui-input",
