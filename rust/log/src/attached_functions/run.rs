@@ -32,6 +32,7 @@ use chroma_types::{
     SegmentScope, SegmentShard, SegmentType, SegmentUuid, UpdateMetadataValue,
 };
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +51,34 @@ pub struct FunctionWindow {
     pub before: Vec<ProjectionRecord>,
     /// The log offset of the last record of the window.
     pub end: u64,
+    /// The log offset of the last record of the collection applied before the window: the log of the single node
+    /// numbers the records of every collection in one sequence, so the window of a collection starts after it, not
+    /// after the record before its first.
+    pub applied_before: u64,
+}
+
+/// The input collections of the ready synchronous functions behind the records applied to them, with the log offset of
+/// the last record applied, as the metadata segment of the collection records it.
+pub async fn behind(
+    sqlite_db: &SqliteDb,
+) -> Result<Vec<(CollectionUuid, u64)>, Box<dyn ChromaError>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT attached_functions.input_collection_id, MAX(CAST(max_seq_id.seq_id AS INTEGER))          FROM attached_functions          JOIN functions ON functions.id = attached_functions.function_id          JOIN segments ON segments.collection = attached_functions.input_collection_id AND segments.scope = 'METADATA'          JOIN max_seq_id ON max_seq_id.segment_id = segments.id          WHERE attached_functions.is_deleted = FALSE AND attached_functions.is_ready = TRUE          AND functions.is_async = FALSE AND attached_functions.completion_offset < CAST(max_seq_id.seq_id AS INTEGER)          GROUP BY attached_functions.input_collection_id",
+    )
+    .fetch_all(sqlite_db.get_conn())
+    .await
+    .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)?;
+    rows.into_iter()
+        .map(|(id, applied)| {
+            CollectionUuid::from_str(&id)
+                .map(|id| (id, applied.max(0) as u64))
+                .map_err(|e| {
+                    Box::new(chroma_error::TonicError(tonic::Status::internal(
+                        e.to_string(),
+                    ))) as Box<dyn ChromaError>
+                })
+        })
+        .collect()
 }
 
 /// The state, read before the apply, of the records of the ids of the logs given.
@@ -197,14 +226,8 @@ impl FunctionRunner {
                 .get_collection_with_segments(None, output_id)
                 .await
                 .map_err(|e| e.boxed())?;
-            let first = window
-                .logs
-                .iter()
-                .map(|(record, _)| record.log_offset as u64)
-                .min()
-                .unwrap_or(window.end);
-            // As the worker: a function that has not run on the records before the window runs as its backfill.
-            let backfill = function.completion_offset + 1 < first;
+            // As the worker: a function that has not run on every record applied before the window runs as its backfill.
+            let backfill = function.completion_offset < window.applied_before;
             let (records, end) = if backfill {
                 // The records and the log position they cover, at one moment, so that a record applied meanwhile is
                 // counted once: here, or by its own window.
@@ -282,18 +305,30 @@ impl FunctionRunner {
                 "invalid database name of an output collection",
             ))) as Box<dyn ChromaError>
         })?;
+        // The last record of its own log, which the output has just been written into: the tail that scout_logs
+        // gives is the one of the whole SQLite log, of every collection.
+        let reader = SqliteMetadataReader::new(self.sqlite_db.clone());
+        let applied = reader
+            .current_max_seq_id(&output.metadata_segment.id)
+            .await
+            .map_err(|e| e.boxed())?;
         let tail = self
             .log
             .clone()
-            .scout_logs(
+            .read(
                 &output.collection.tenant,
                 database,
                 output.collection.collection_id,
-                0,
+                applied as i64,
+                -1,
+                None,
             )
-            .await?
-            .saturating_sub(1);
-        let reader = SqliteMetadataReader::new(self.sqlite_db.clone());
+            .await
+            .map_err(|e| e.boxed())?
+            .iter()
+            .map(|record| record.log_offset.max(0) as u64)
+            .max()
+            .unwrap_or(applied);
         let deadline = tokio::time::Instant::now() + OUTPUT_APPLY_WAIT;
         while reader
             .current_max_seq_id(&output.metadata_segment.id)

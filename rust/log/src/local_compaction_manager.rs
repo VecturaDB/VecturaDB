@@ -769,6 +769,7 @@ impl LocalCompactionManager {
                     logs: window_logs,
                     before,
                     end,
+                    applied_before: mt_max_seq_id,
                 })
             } else {
                 None
@@ -903,6 +904,39 @@ impl Handler<ScheduledCompactMessage> for LocalCompactionManager {
                 ))
             },
         );
+        // A synchronous function behind the records applied to its input, as after a kill that lost the queue of its
+        // windows, runs as its backfill, as the scheduler of distributed Chroma compacts a collection whose functions
+        // are behind its log position (stale_attached_function_ids in compact.rs).
+        match attached_functions::run::behind(&self.sqlite_db).await {
+            Ok(behind) => {
+                let mut runner = self.function_runner();
+                runner.backfill = Some(ctx.receiver::<BackfillMessage>());
+                for (collection_id, applied) in behind {
+                    match self
+                        .sysdb
+                        .get_collection_with_segments(None, collection_id)
+                        .await
+                    {
+                        Ok(input) => self.function_runs.send(
+                            &runner,
+                            FunctionWindow {
+                                input,
+                                logs: Chunk::new(Arc::from(Vec::new())),
+                                before: Vec::new(),
+                                end: applied,
+                                applied_before: applied,
+                            },
+                        ),
+                        Err(err) => {
+                            tracing::warn!(collection_id = %collection_id, error = %err, "The input of an attached function behind is not found")
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "The attached functions behind could not be read")
+            }
+        }
         let collections = match self.spann_collections_to_compact().await {
             Ok(collections) => collections,
             Err(err) => {

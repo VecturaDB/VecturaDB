@@ -5982,6 +5982,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wait_for_total_count(&mut frontend, &collection, 3).await, 3);
+        // Its completion offset follows the log, so that the next write runs on its own records, not as a backfill.
+        let mut completion_offset = 0;
+        for _ in 0..100 {
+            completion_offset = frontend
+                .get_attached_function(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    collection.collection_id.to_string(),
+                    "counter".to_string(),
+                )
+                .await
+                .unwrap()
+                .completion_offset;
+            if completion_offset > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            completion_offset > 0,
+            "completion offset {completion_offset}"
+        );
     }
 
     // An attach to a collection with no record yet, then writes: they are counted.
