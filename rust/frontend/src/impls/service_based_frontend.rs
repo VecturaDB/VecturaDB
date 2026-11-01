@@ -5805,6 +5805,57 @@ mod tests {
             .unwrap()
     }
 
+    async fn collection_version(
+        frontend: &mut ServiceBasedFrontend,
+        collection: &Collection,
+    ) -> i32 {
+        frontend
+            .sysdb_client
+            .get_collections(GetCollectionsOptions {
+                collection_id: Some(collection.collection_id),
+                ..Default::default()
+            })
+            .await
+            .unwrap()[0]
+            .version
+    }
+
+    // As a compaction of distributed Chroma, each apply of records to an HNSW collection is one more version, and a read
+    // that applies nothing again leaves it.
+    #[tokio::test]
+    async fn an_hnsw_collection_has_one_more_version_for_each_apply_of_records() {
+        let (mut frontend, collection) = seeded_collection().await;
+        assert_eq!(count_records(&mut frontend, &collection).await, 1);
+        let applied = collection_version(&mut frontend, &collection).await;
+        assert!(applied >= 1, "version {applied} after the first apply");
+        assert_eq!(count_records(&mut frontend, &collection).await, 1);
+        assert_eq!(
+            collection_version(&mut frontend, &collection).await,
+            applied
+        );
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    vec!["id2".to_string()],
+                    vec![vec![3.0, 4.0]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count_records(&mut frontend, &collection).await, 2);
+        assert_eq!(
+            collection_version(&mut frontend, &collection).await,
+            applied + 1
+        );
+    }
+
     fn index_folders(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut folders: Vec<_> = std::fs::read_dir(root)
             .unwrap()

@@ -45,6 +45,7 @@ pub enum Collections {
     DatabaseId,
     ConfigJsonStr,
     SchemaStr,
+    Version,
 }
 
 #[derive(Iden)]

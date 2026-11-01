@@ -643,6 +643,7 @@ impl LocalCompactionManager {
                 hnsw_visibility[index] = false;
             }
         }
+        let applies_records = mt_visibility.iter().any(|visible| *visible);
         mt_data_chunk.set_visibility(mt_visibility);
         hnsw_data_chunk.set_visibility(hnsw_visibility);
         // Apply the records to the metadata writer.
@@ -675,6 +676,15 @@ impl LocalCompactionManager {
                     .await
                     .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
             }
+        }
+        // As a compaction of distributed Chroma, an apply of records is one more version of the collection; a SPANN
+        // collection counts its flushes instead (flush_compaction_in), and a replay that applies nothing does not count.
+        if applies_records && !spann {
+            sqlx::query("UPDATE collections SET version = version + 1 WHERE id = $1")
+                .bind(message.collection_id.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
         }
         tx.commit()
             .await

@@ -1570,6 +1570,7 @@ impl SqliteSysDb {
             .column((table::Collections::Table, table::Collections::Dimension))
             .column((table::Collections::Table, table::Collections::DatabaseId))
             .column((table::Collections::Table, table::Collections::SchemaStr))
+            .column((table::Collections::Table, table::Collections::Version))
             .inner_join(
                 table::Databases::Table,
                 sea_query::Expr::col((table::Databases::Table, table::Databases::Id))
@@ -1642,6 +1643,8 @@ impl SqliteSysDb {
                 ),
                 sea_query::Alias::new("log_position"),
             )
+            // As the version of distributed Chroma, which each flush moves (00016).
+            .column((table::Collections::Table, table::Collections::Version))
             .build_sqlx(sea_query::SqliteQueryBuilder);
 
         let mut rows = sqlx::query_with(&sql, values).fetch(conn);
@@ -1707,7 +1710,7 @@ impl SqliteSysDb {
                     schema,
                     metadata,
                     total_records_post_compaction: 0,
-                    version: 0,
+                    version: first_row.get::<i32, _>("version"),
                     log_position: first_row.get("log_position"),
                     dimension: first_row.get(3),
                     name: first_row.get(1),
@@ -2071,7 +2074,7 @@ pub async fn flush_compaction_in(
     conn: &mut sqlx::SqliteConnection,
     collection_id: CollectionUuid,
     log_position: i64,
-    collection_version: i32,
+    _collection_version: i32,
     segment_flush_info: &[SegmentFlushInfo],
     schema: Option<Schema>,
 ) -> Result<FlushCompactionResponse, FlushCompactionError> {
@@ -2082,17 +2085,16 @@ pub async fn flush_compaction_in(
         .map(|schema| serde_json::to_string(&schema))
         .transpose()
         .map_err(|e| internal(e.to_string()))?;
-    let found =
-        sqlx::query("UPDATE collections SET schema_str = COALESCE($1, schema_str) WHERE id = $2")
-            .bind(schema_str)
-            .bind(collection_id.to_string())
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| internal(e.to_string()))?
-            .rows_affected();
-    if found == 0 {
-        return Err(FlushCompactionError::CollectionNotFound);
-    }
+    // As a flush of distributed Chroma, one more version of the collection.
+    let collection_version: i32 = sqlx::query_scalar(
+        "UPDATE collections SET schema_str = COALESCE($1, schema_str), version = version + 1 WHERE id = $2          RETURNING version",
+    )
+    .bind(schema_str)
+    .bind(collection_id.to_string())
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| internal(e.to_string()))?
+    .ok_or(FlushCompactionError::CollectionNotFound)?;
     for info in segment_flush_info.iter() {
         // As the version check of distributed Chroma: a flush older than the last one of the segment would put back
         // files without the records after it, so the whole flush fails.
@@ -2951,6 +2953,7 @@ mod tests {
             .unwrap();
         assert_eq!(created.record_segment.id, record.id);
         assert!(created.vector_segment.file_path.is_empty());
+        assert_eq!(created.collection.version, 0);
 
         let files = |name: &str| {
             HashMap::from([(name.to_string(), vec![format!("{name}/{}", Uuid::new_v4())])])
@@ -2975,11 +2978,13 @@ mod tests {
                 None,
             )
         };
-        flush(vector.id, 7).await.unwrap();
+        // As a flush of distributed Chroma, one more version of the collection.
+        assert_eq!(flush(vector.id, 7).await.unwrap().collection_version, 1);
         let flushed = sysdb
             .get_collection_with_segments(collection_id)
             .await
             .unwrap();
+        assert_eq!(flushed.collection.version, 1);
         assert_eq!(flushed.record_segment.file_path, record_files);
         assert_eq!(flushed.vector_segment.file_path, vector_files);
         let seq_id = |segment_id: SegmentUuid| {
