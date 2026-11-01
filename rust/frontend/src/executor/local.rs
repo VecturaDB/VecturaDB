@@ -262,8 +262,9 @@ impl LocalExecutor {
         &mut self,
         collection_and_segment: &CollectionAndSegments,
     ) -> Result<Option<LocalHnswSegmentReader>, ExecutorError> {
-        // Capture pinning and replay failures so both paths still attempt purge.
+        // Capture pinning and replay failures so a backfill that failed part way still attempts purge.
         let spann = collection_and_segment.vector_segment.r#type == SegmentType::Spann;
+        let mut backfilled = false;
         let backfill_result = async {
             let reader = if spann {
                 None
@@ -286,6 +287,7 @@ impl LocalExecutor {
                 None => false,
             };
             if !replay_complete {
+                backfilled = true;
                 let backfill_msg = BackfillMessage {
                     collection_id: collection_and_segment.collection.collection_id,
                 };
@@ -298,17 +300,22 @@ impl LocalExecutor {
             Ok::<_, ExecutorError>(reader)
         }
         .await;
-        // Even a fully replayed instance may have a failed purge to retry. The
-        // compactor checks for eligible rows before inspecting the checkpoint.
-        let purge_log_msg = PurgeLogsMessage {
-            collection_id: collection_and_segment.collection.collection_id,
+        // Only a read that backfilled, or could not pin or replay its instance, asks for a purge, as in Chroma 1.5.9, where
+        // a read after the first one does not reach the compactor: every write asks for one after its push (sqlite_log.rs), and a failed purge is asked
+        // again by the next write. A read of a replayed instance waits for no work of the compactor, which takes longer
+        // as the log grows and queues behind the backfills of the writes.
+        let purge_result = if backfilled || backfill_result.is_err() {
+            let purge_log_msg = PurgeLogsMessage {
+                collection_id: collection_and_segment.collection.collection_id,
+            };
+            self.compactor_handle
+                .request(purge_log_msg, None)
+                .await
+                .map_err(|err| ExecutorError::BackfillError(Box::new(err)))
+                .and_then(|result| result.map_err(|err| ExecutorError::BackfillError(Box::new(err))))
+        } else {
+            Ok(())
         };
-        let purge_result = self
-            .compactor_handle
-            .request(purge_log_msg, None)
-            .await
-            .map_err(|err| ExecutorError::BackfillError(Box::new(err)))
-            .and_then(|result| result.map_err(|err| ExecutorError::BackfillError(Box::new(err))));
         // Preserve purge failures even when the backfill error takes precedence.
         if let Err(err) = &purge_result {
             tracing::error!(
