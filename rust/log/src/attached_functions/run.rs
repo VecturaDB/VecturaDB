@@ -39,6 +39,9 @@ use std::time::Duration;
 // How long the window of an attach waits for its function to be ready.
 const ATTACH_WAIT_SECONDS: u32 = 30;
 
+// How long a run waits for its output to be applied to the segments of its output collection.
+const OUTPUT_APPLY_WAIT: Duration = Duration::from_secs(60);
+
 /// The records of one apply of the log of a collection with ready synchronous functions: the records applied, and the
 /// records of the same ids as they were before the apply.
 pub struct FunctionWindow {
@@ -70,30 +73,35 @@ async fn get_records(
     ids: Option<Vec<String>>,
 ) -> Result<Vec<ProjectionRecord>, Box<dyn ChromaError>> {
     let result = SqliteMetadataReader::new(sqlite_db.clone())
-        .get(Get {
-            scan: Scan {
-                collection_and_segments: collection.clone(),
-                shard_index: 0,
-                num_shards: 1,
-                log_upper_bound_offset: 0,
-            },
-            filter: Filter {
-                query_ids: ids,
-                where_clause: None,
-            },
-            limit: Limit {
-                offset: 0,
-                limit: None,
-            },
-            proj: Projection {
-                document: true,
-                embedding: false,
-                metadata: true,
-            },
-        })
+        .get(records_plan(collection, ids))
         .await
         .map_err(|e| e.boxed())?;
     Ok(result.result.records)
+}
+
+// A get of the records of the ids given, or of every record without ids, with their documents and metadata.
+fn records_plan(collection: &CollectionAndSegments, ids: Option<Vec<String>>) -> Get {
+    Get {
+        scan: Scan {
+            collection_and_segments: collection.clone(),
+            shard_index: 0,
+            num_shards: 1,
+            log_upper_bound_offset: 0,
+        },
+        filter: Filter {
+            query_ids: ids,
+            where_clause: None,
+        },
+        limit: Limit {
+            offset: 0,
+            limit: None,
+        },
+        proj: Projection {
+            document: true,
+            embedding: false,
+            metadata: true,
+        },
+    }
 }
 
 // The output collection as the executors read it, from its SQLite metadata.
@@ -198,14 +206,12 @@ impl FunctionRunner {
             // As the worker: a function that has not run on the records before the window runs as its backfill.
             let backfill = function.completion_offset + 1 < first;
             let (records, end) = if backfill {
-                let current = get_records(&self.sqlite_db, &window.input, None).await?;
+                // The records and the log position they cover, at one moment, so that a record applied meanwhile is
+                // counted once: here, or by its own window.
+                let (current, end) = self.current_records(&window.input).await?;
                 let records = self
                     .execute_backfill(&window.input, current, &*executor)
                     .await?;
-                let end = SqliteMetadataReader::new(self.sqlite_db.clone())
-                    .current_max_seq_id(&window.input.metadata_segment.id)
-                    .await
-                    .map_err(|e| e.boxed())?;
                 (records, end.max(window.end))
             } else {
                 let reader = SqliteOutputRecords {
@@ -230,6 +236,8 @@ impl FunctionRunner {
                     )
                     .await
                     .map_err(|e| e.boxed())?;
+                // The next run of the function reads this output: it waits for its apply.
+                self.wait_for_apply(&output).await?;
             }
             self.sysdb
                 .clone()
@@ -242,6 +250,65 @@ impl FunctionRunner {
                 )
                 .await
                 .map_err(|e| e.boxed())?;
+        }
+        Ok(())
+    }
+
+    async fn current_records(
+        &self,
+        input: &CollectionAndSegments,
+    ) -> Result<(Vec<ProjectionRecord>, u64), Box<dyn ChromaError>> {
+        let reader = SqliteMetadataReader::new(self.sqlite_db.clone());
+        let mut snapshot = reader.snapshot().await.map_err(|e| e.boxed())?;
+        let result = reader
+            .get_at(&mut snapshot, records_plan(input, None))
+            .await
+            .map_err(|e| e.boxed())?;
+        let end = snapshot
+            .max_seq_id(&input.metadata_segment.id)
+            .await
+            .map_err(|e| e.boxed())?;
+        snapshot.close().await.map_err(|e| e.boxed())?;
+        Ok((result.result.records, end))
+    }
+
+    // The output collection has applied its log up to its tail, within OUTPUT_APPLY_WAIT.
+    async fn wait_for_apply(
+        &self,
+        output: &CollectionAndSegments,
+    ) -> Result<(), Box<dyn ChromaError>> {
+        let database = DatabaseName::new(output.collection.database.clone()).ok_or_else(|| {
+            Box::new(chroma_error::TonicError(tonic::Status::internal(
+                "invalid database name of an output collection",
+            ))) as Box<dyn ChromaError>
+        })?;
+        let tail = self
+            .log
+            .clone()
+            .scout_logs(
+                &output.collection.tenant,
+                database,
+                output.collection.collection_id,
+                0,
+            )
+            .await?
+            .saturating_sub(1);
+        let reader = SqliteMetadataReader::new(self.sqlite_db.clone());
+        let deadline = tokio::time::Instant::now() + OUTPUT_APPLY_WAIT;
+        while reader
+            .current_max_seq_id(&output.metadata_segment.id)
+            .await
+            .map_err(|e| e.boxed())?
+            < tail
+        {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Box::new(chroma_error::TonicError(
+                    tonic::Status::deadline_exceeded(
+                        "the output of an attached function was not applied",
+                    ),
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
         Ok(())
     }
