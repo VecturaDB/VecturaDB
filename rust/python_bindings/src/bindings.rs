@@ -47,6 +47,8 @@ pub(crate) struct Bindings {
     system: System,
     sqlite_db: SqliteDb,
     compactor_handle: ComponentHandle<LocalCompactionManager>,
+    // The manager as the registry keeps it, whose work out of the actor a close waits for.
+    compactor: LocalCompactionManager,
     frontend: Frontend,
     closed: bool,
 }
@@ -521,12 +523,14 @@ impl Bindings {
         })?;
         let sqlite_db = registry.get::<SqliteDb>()?;
         let compactor_handle = registry.get::<ComponentHandle<LocalCompactionManager>>()?;
+        let compactor = registry.get::<LocalCompactionManager>()?;
 
         Ok(Bindings {
             runtime,
             system,
             sqlite_db,
             compactor_handle,
+            compactor,
             frontend,
             closed: false,
         })
@@ -1495,11 +1499,19 @@ impl Bindings {
         self.closed = true;
         self.compactor_handle.stop();
 
+        // A graceful stop: the actor stops taking work, then the work out of it ends within the grace, and the database
+        // closes within what is left of it; past it the database closes anyway, as SqliteDb::close_within says.
+        let grace = self.compactor.shutdown_grace();
         self.runtime.block_on(async {
+            let started = std::time::Instant::now();
             let _ = self.compactor_handle.join().await;
+            // Past the grace the flushes still running are left: the database closes anyway below.
+            let _ = self.compactor.drain(grace).await;
             self.system.stop().await;
             self.system.join().await;
-            self.sqlite_db.close().await;
+            self.sqlite_db
+                .close_within(grace.saturating_sub(started.elapsed()))
+                .await;
         });
     }
 }

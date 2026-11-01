@@ -1754,3 +1754,54 @@ async fn a_write_refused_by_a_log_too_full_says_when_to_send_it_again_impl() {
         "Retry-After {seconds} s after the round, not in {lowest}..={highest}"
     );
 }
+
+// A stop during a flush of a SPANN collection out of the actor waits for it, within the grace of the stop, before the
+// database closes, so that no flush holds a connection of SQLite at the close; the data path opened again has every
+// record, the flushed ones in the files.
+#[test]
+fn a_stop_during_a_flush_waits_for_it_and_leaves_the_data_right() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_stop_during_a_flush_waits_for_it_and_leaves_the_data_right_impl,
+    )
+}
+
+async fn a_stop_during_a_flush_waits_for_it_and_leaves_the_data_right_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = Registry::new();
+    let stop = chroma_log::SpannFlushStop::default();
+    registry.register(stop.clone());
+    let mut frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+    let collection_id = empty_spann_collection(&mut frontend, "stopped").await;
+    add_numbers(&mut frontend, collection_id, 0..12).await;
+    let round = a_round_that_stops(&frontend, &stop).await;
+    let compactor = registry
+        .get::<chroma_log::LocalCompactionManager>()
+        .unwrap();
+    let draining =
+        tokio::spawn(async move { compactor.drain(std::time::Duration::from_secs(30)).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !draining.is_finished(),
+        "the stop did not wait for the flush"
+    );
+    stop.go_on();
+    assert!(
+        draining.await.unwrap(),
+        "the flush did not end within the grace"
+    );
+    round.await.unwrap().unwrap();
+    let db = registry.get::<chroma_sqlite::db::SqliteDb>().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), db.close())
+        .await
+        .expect("the close waited past its grace");
+    drop(frontend);
+    let mut reopened = frontend_with_spann_registry(root.path(), true, &Registry::new()).await;
+    assert_eq!(
+        get_ids(&mut reopened, collection_id, None, None, 0)
+            .await
+            .len(),
+        12
+    );
+    assert_eq!(status(&mut reopened, collection_id).await.2, 12);
+}

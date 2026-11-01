@@ -306,8 +306,9 @@ mod tests {
     }
 
     // A connection still taken when the database closes does not keep the writes in the log: the close writes them
-    // back into the database file and empties the log first, then waits for the connection. With two idle connections
-    // besides it, one for the checkpoint and one that sqlx closes, the wait of sqlx alone would end before it.
+    // back into the database file and empties the log first, then waits for the connection within its grace. With two
+    // idle connections besides it, one for the checkpoint and one that sqlx closes, the wait of sqlx alone would end
+    // before it.
     #[tokio::test]
     async fn a_close_writes_the_log_back_while_a_connection_is_taken() {
         let (dir, path, db) = database_file(JournalMode::default()).await;
@@ -340,7 +341,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), &mut closing)
                 .await
                 .is_err(),
-            "the close ended while a connection was taken"
+            "the close ended while a connection was taken, within its grace"
         );
         drop(held);
         closing.await.unwrap();
@@ -348,6 +349,32 @@ mod tests {
         let copy = dir.path().join("copy.sqlite3");
         std::fs::copy(&path, &copy).unwrap();
         let reader = sqlx::SqlitePool::connect(&format!("sqlite://{}", copy.to_str().unwrap()))
+            .await
+            .unwrap();
+        let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM written")
+            .fetch_one(&reader)
+            .await
+            .unwrap();
+        assert_eq!(written, 3);
+    }
+
+    // A connection kept past the grace of the close, as by a task that never gives it back, does not keep the close
+    // waiting: it ends after its grace, and the writes are in the database, the log written back first.
+    #[tokio::test]
+    async fn a_close_ends_while_a_connection_is_kept() {
+        let (_dir, path, db) = database_file(JournalMode::default()).await;
+        let kept = db.get_conn().acquire().await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                db.close_within(Duration::from_secs(1))
+            )
+            .await
+            .is_ok(),
+            "the close waited for a connection that never came back"
+        );
+        drop(kept);
+        let reader = sqlx::SqlitePool::connect(&format!("sqlite://{}", path.to_str().unwrap()))
             .await
             .unwrap();
         let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM written")

@@ -118,14 +118,25 @@ pub async fn frontend_service_entrypoint_with_config_system_registry(
     .run(None)
     .await;
     // A normal stop closes the database: in WAL its log goes back into the database file, which is then the only one
-    // left, as with a rollback journal. Within 5 s, so that a connection still held does not keep the server up.
+    // left, as with a rollback journal. A graceful stop: the work of the compaction manager out of its actor ends within
+    // the grace, then the database closes within what is left of it, and anyway after it (SqliteDb::close_within).
     if let Ok(db) = registry.get::<SqliteDb>() {
-        if tokio::time::timeout(std::time::Duration::from_secs(5), db.close())
-            .await
-            .is_err()
-        {
-            tracing::warn!("SQLite did not close within 5 s at the stop of the server");
-        }
+        let started = std::time::Instant::now();
+        let grace = match registry.get::<chroma_log::LocalCompactionManager>() {
+            Ok(compactor) => {
+                let grace = compactor.shutdown_grace();
+                if !compactor.drain(grace).await {
+                    tracing::warn!(
+                        "Work of the compaction manager still running {} s after the stop",
+                        grace.as_secs()
+                    );
+                }
+                grace
+            }
+            Err(_) => std::time::Duration::from_secs(30),
+        };
+        db.close_within(grace.saturating_sub(started.elapsed()))
+            .await;
     }
 }
 

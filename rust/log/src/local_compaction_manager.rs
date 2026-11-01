@@ -55,6 +55,12 @@ pub struct LocalCompactionManagerConfig {
     /// fewer records than min_compaction_size.
     #[serde(default = "LocalCompactionManagerConfig::default_timeout_us")]
     pub timeout_us: u64,
+    /// How long a stop waits for the work that runs out of the actor, the SPANN flushes, and then for the connections of
+    /// SQLite, before it closes the database anyway: 30 s, the default terminationGracePeriodSeconds of Kubernetes, which
+    /// is what bounds the stop of the components of distributed Chroma, as neither Chroma nor distributed Chroma has a
+    /// setting of its own.
+    #[serde(default = "LocalCompactionManagerConfig::default_shutdown_grace_sec")]
+    pub shutdown_grace_sec: u64,
 }
 
 impl LocalCompactionManagerConfig {
@@ -73,6 +79,10 @@ impl LocalCompactionManagerConfig {
     fn default_timeout_us() -> u64 {
         86_400_000_000
     }
+
+    fn default_shutdown_grace_sec() -> u64 {
+        30
+    }
 }
 
 impl Default for LocalCompactionManagerConfig {
@@ -82,6 +92,7 @@ impl Default for LocalCompactionManagerConfig {
             min_compaction_size: Self::default_min_compaction_size(),
             max_compaction_size: Self::default_max_compaction_size(),
             timeout_us: Self::default_timeout_us(),
+            shutdown_grace_sec: Self::default_shutdown_grace_sec(),
         }
     }
 }
@@ -109,6 +120,10 @@ pub struct LocalCompactionManager {
     // The flushes of SPANN collections that run out of the actor, with the one-off flushes that wait for them.
     spann_flushes: SpannFlushes,
     spann_flush_stop: Option<SpannFlushStop>,
+    // The work out of the actor, the flushes of SPANN collections, which a stop waits for (LocalCompactionManager::drain),
+    // shared by the clones of the manager, as the one the registry keeps.
+    background: tokio_util::task::TaskTracker,
+    shutdown_grace: Duration,
 }
 
 // A request of a one-off flush, answered at the end of its flush.
@@ -267,6 +282,8 @@ impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
             compaction_timeout: Duration::from_micros(config.timeout_us),
             spann_flushes: SpannFlushes::default(),
             spann_flush_stop: registry.get::<SpannFlushStop>().ok(),
+            background: tokio_util::task::TaskTracker::new(),
+            shutdown_grace: Duration::from_secs(config.shutdown_grace_sec),
         };
         registry.register(res.clone());
         Ok(res)
@@ -777,6 +794,21 @@ impl LocalCompactionManager {
         .map_err(|_| CompactionManagerError::PullLogsFailure)
     }
 
+    /// How long a stop waits, for the work out of the actor and then for the connections of SQLite.
+    pub fn shutdown_grace(&self) -> Duration {
+        self.shutdown_grace
+    }
+
+    /// The first step of a stop, once the actor has stopped: no new work out of the actor, and the work that runs waited
+    /// for within the grace given, so that no flush holds a connection of SQLite when the database closes. True if it
+    /// all ended in time.
+    pub async fn drain(&self, grace: Duration) -> bool {
+        self.background.close();
+        tokio::time::timeout(grace, self.background.wait())
+            .await
+            .is_ok()
+    }
+
     // What a flush needs, out of the actor.
     fn spann_flusher(&self) -> SpannFlusher {
         SpannFlusher {
@@ -832,7 +864,8 @@ impl LocalCompactionManager {
                 }
             }
         };
-        tokio::spawn(flushes.instrument(tracing::info_span!(parent: None, "SPANN flushes")));
+        self.background
+            .spawn(flushes.instrument(tracing::info_span!(parent: None, "SPANN flushes")));
     }
 
     // The end of a flush, in the actor: the flush moves the watermark that bounds a purge of the log, the files of the
