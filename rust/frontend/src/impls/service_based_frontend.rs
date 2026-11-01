@@ -5877,6 +5877,113 @@ mod tests {
         );
     }
 
+    // The total of record_counter in the output collection of an attached function, once it reaches the one expected.
+    async fn wait_for_total_count(
+        frontend: &mut ServiceBasedFrontend,
+        input: &Collection,
+        expected: i64,
+    ) -> i64 {
+        let attached_function = frontend
+            .get_attached_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                input.collection_id.to_string(),
+                "counter".to_string(),
+            )
+            .await
+            .unwrap();
+        let output = attached_function.output_collection_id.unwrap();
+        let mut total = -1;
+        for _ in 0..100 {
+            let got = frontend
+                .get(
+                    GetRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        output,
+                        Some(vec!["function_output".to_string()]),
+                        None,
+                        None,
+                        0,
+                        chroma_types::IncludeList(vec![chroma_types::Include::Metadata]),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            total = got
+                .metadatas
+                .and_then(|metadatas| metadatas.into_iter().next().flatten())
+                .and_then(|metadata| match metadata.get("total_count") {
+                    Some(MetadataValue::Int(total)) => Some(*total),
+                    _ => None,
+                })
+                .unwrap_or(-1);
+            if total == expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        total
+    }
+
+    // A synchronous attached function runs on the single node as in distributed Chroma: attached to a collection that
+    // has records, it counts them (its backfill); then each write is counted against the records as they were before it,
+    // so that adding an id again does not count it twice, and a delete takes it off.
+    #[tokio::test]
+    async fn record_counter_counts_the_records_of_its_input_collection() {
+        let (mut frontend, collection) = seeded_collection().await;
+        let add = |ids: &[&str]| {
+            AddCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection.collection_id,
+                ids.iter().map(|id| id.to_string()).collect(),
+                ids.iter().map(|_| vec![1.0, 2.0]).collect(),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        frontend.add(add(&["id2", "id3"])).await.unwrap();
+        frontend
+            .attach_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                AttachFunctionRequest::try_new(
+                    "counter".to_string(),
+                    chroma_types::FUNCTION_RECORD_COUNTER_NAME.to_string(),
+                    "counts".to_string(),
+                    serde_json::json!({}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 3).await, 3);
+
+        frontend.add(add(&["id4", "id2"])).await.unwrap();
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 4).await, 4);
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    Some(vec!["id3".to_string()]),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 3).await, 3);
+    }
+
     fn index_folders(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut folders: Vec<_> = std::fs::read_dir(root)
             .unwrap()

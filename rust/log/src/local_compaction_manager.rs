@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
+use crate::attached_functions::{
+    self,
+    run::{FunctionRunner, FunctionWindow},
+};
 use crate::Log;
 use async_trait::async_trait;
 use chroma_config::registry::{Injectable, Registry};
@@ -164,6 +168,8 @@ pub struct LocalCompactionManager {
     // shared by the clones of the manager, as the one the registry keeps.
     background: tokio_util::task::TaskTracker,
     shutdown_grace: Duration,
+    // The synchronous attached functions: see FunctionRuns.
+    function_runs: FunctionRuns,
 }
 
 // The purges asked, run together once the interval has passed since the last ones.
@@ -193,6 +199,47 @@ impl PurgeSchedule {
         }
         self.last = now;
         self.pending.drain().collect()
+    }
+}
+
+// The runs of the synchronous attached functions out of the actor (attached_functions::run), one queue for each input
+// collection, so that the windows of its applies run in their order; and, by collection, whether it has a ready
+// synchronous function when last read, so that a write of a collection without functions reads no catalog. An attach
+// writes records BackfillFn to the log of its input collection, and the apply that sees them reads the catalog again.
+#[derive(Clone, Default)]
+struct FunctionRuns {
+    queues: Arc<
+        std::sync::Mutex<
+            HashMap<CollectionUuid, tokio::sync::mpsc::UnboundedSender<FunctionWindow>>,
+        >,
+    >,
+    has_functions: HashMap<CollectionUuid, bool>,
+}
+
+impl FunctionRuns {
+    fn send(&self, runner: &FunctionRunner, window: FunctionWindow) {
+        let collection_id = window.input.collection.collection_id;
+        let mut queues = self.queues.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = queues.entry(collection_id).or_insert_with(|| {
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<FunctionWindow>();
+            let runner = runner.clone();
+            tokio::spawn(
+                async move {
+                    while let Some(window) = receiver.recv().await {
+                        // A window that fails leaves the completion offset behind: the next window of the collection
+                        // runs its function as the backfill of distributed Chroma.
+                        if let Err(err) = runner.run(window).await {
+                            tracing::warn!(collection_id = %collection_id, error = %err, "An attached function failed");
+                        }
+                    }
+                }
+                .instrument(tracing::info_span!(parent: None, "Attached functions")),
+            );
+            sender
+        });
+        if queue.send(window).is_err() {
+            tracing::error!(collection_id = %collection_id, "The queue of the attached functions is closed");
+        }
     }
 }
 
@@ -358,6 +405,7 @@ impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
             spann_flush_stop: registry.get::<SpannFlushStop>().ok(),
             background: tokio_util::task::TaskTracker::new(),
             shutdown_grace: Duration::from_secs(config.shutdown_grace_sec),
+            function_runs: FunctionRuns::default(),
         };
         registry.register(res.clone());
         Ok(res)
@@ -514,7 +562,7 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
     async fn handle(
         &mut self,
         message: BackfillMessage,
-        _: &ComponentContext<LocalCompactionManager>,
+        ctx: &ComponentContext<LocalCompactionManager>,
     ) -> Self::Result {
         // A backfill that fails leaves the loaded instance not replayed, so that the next read asks for a backfill
         // again; one that succeeds, or runs, leaves it as it is (see below).
@@ -644,6 +692,68 @@ impl LocalCompactionManager {
             }
         }
         let applies_records = mt_visibility.iter().any(|visible| *visible);
+        // The synchronous attached functions run on the records of this apply, materialized against their state before
+        // it, read here, in the same call of the actor and right before the apply.
+        let function_window = if applies_records {
+            let attaches = data_chunk
+                .iter()
+                .any(|(record, _)| record.record.operation == chroma_types::Operation::BackfillFn);
+            let has_functions = match self.function_runs.has_functions.get(&message.collection_id) {
+                // The records of an attach come before its function is ready (create_attached_function_with_backfill
+                // writes them, then finishes the creation): their window waits for it in its run.
+                _ if attaches => {
+                    self.function_runs
+                        .has_functions
+                        .remove(&message.collection_id);
+                    true
+                }
+                Some(has) => *has,
+                None => {
+                    let has = !self
+                        .function_runner()
+                        .ready_sync_functions(message.collection_id)
+                        .await
+                        .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?
+                        .is_empty();
+                    self.function_runs
+                        .has_functions
+                        .insert(message.collection_id, has);
+                    has
+                }
+            };
+            if has_functions {
+                let mut window_logs = data_chunk.clone();
+                window_logs.set_visibility(mt_visibility.clone());
+                let window_logs = Chunk::new(Arc::from(
+                    window_logs
+                        .iter()
+                        .map(|(record, _)| record.clone())
+                        .collect::<Vec<_>>(),
+                ));
+                let before = attached_functions::run::read_before(
+                    &self.sqlite_db,
+                    &collection_and_segments,
+                    &window_logs,
+                )
+                .await
+                .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
+                let end = window_logs
+                    .iter()
+                    .map(|(record, _)| record.log_offset as u64)
+                    .max()
+                    .unwrap_or_default();
+                Some(FunctionWindow {
+                    input: collection_and_segments.clone(),
+                    logs: window_logs,
+                    before,
+                    end,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         mt_data_chunk.set_visibility(mt_visibility);
         hnsw_data_chunk.set_visibility(hnsw_visibility);
         // Apply the records to the metadata writer.
@@ -689,6 +799,11 @@ impl LocalCompactionManager {
         tx.commit()
             .await
             .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
+        if let Some(window) = function_window {
+            let mut runner = self.function_runner();
+            runner.backfill = Some(ctx.receiver::<BackfillMessage>());
+            self.function_runs.send(&runner, window);
+        }
         if spann {
             self.hnsw_segment_manager
                 .set_spann_applied(message.collection_id, true);
@@ -986,6 +1101,15 @@ impl LocalCompactionManager {
     }
 
     // What a flush needs, out of the actor.
+    fn function_runner(&self) -> FunctionRunner {
+        FunctionRunner {
+            log: self.log.clone(),
+            sysdb: self.sysdb.clone(),
+            sqlite_db: self.sqlite_db.clone(),
+            backfill: None,
+        }
+    }
+
     fn spann_flusher(&self) -> SpannFlusher {
         SpannFlusher {
             log: self.log.clone(),

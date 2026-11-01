@@ -10,6 +10,7 @@
 //! through OutputRecords, which that reader implements as the worker reads it, and the single node with its SQLite.
 
 mod revision_history;
+pub mod run;
 mod statistics;
 
 pub use revision_history::RevisionHistoryExecutor;

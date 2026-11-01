@@ -103,6 +103,7 @@ impl Fixture {
             spann_flush_stop: None,
             background: tokio_util::task::TaskTracker::new(),
             shutdown_grace: Duration::from_secs(30),
+            function_runs: Default::default(),
         });
         Self {
             db,
@@ -255,6 +256,7 @@ impl Fixture {
             spann_flush_stop: None,
             background: background.clone(),
             shutdown_grace: Duration::from_secs(30),
+            function_runs: Default::default(),
         });
         background
     }
@@ -1773,6 +1775,7 @@ async fn replaced_spann_versions_are_forgotten_after_the_grace() {
         spann_flush_stop: None,
         background: tokio_util::task::TaskTracker::new(),
         shutdown_grace: Duration::from_secs(30),
+        function_runs: Default::default(),
     };
     let collection = Collection::test_collection(3);
     for _ in 0..100 {
