@@ -91,6 +91,14 @@ impl Fixture {
             purged: HashSet::new(),
             spann_versions: HashMap::new(),
             spann_version_grace: SpannVersionGrace::default().0,
+            compaction_interval: Duration::from_secs(10),
+            min_compaction_size: 10,
+            max_compaction_size: 10_000,
+            compaction_timeout: Duration::from_secs(86_400),
+            spann_flushes: SpannFlushes::default(),
+            spann_flush_stop: None,
+            background: tokio_util::task::TaskTracker::new(),
+            shutdown_grace: Duration::from_secs(30),
         });
         Self {
             db,
@@ -223,6 +231,14 @@ impl Fixture {
             purged: HashSet::new(),
             spann_versions: HashMap::new(),
             spann_version_grace: SpannVersionGrace::default().0,
+            compaction_interval: Duration::from_secs(10),
+            min_compaction_size: 10,
+            max_compaction_size: 10_000,
+            compaction_timeout: Duration::from_secs(86_400),
+            spann_flushes: SpannFlushes::default(),
+            spann_flush_stop: None,
+            background: tokio_util::task::TaskTracker::new(),
+            shutdown_grace: Duration::from_secs(30),
         });
     }
 
@@ -1550,6 +1566,14 @@ async fn replaced_spann_versions_are_forgotten_after_the_grace() {
         purged: HashSet::new(),
         spann_versions: HashMap::new(),
         spann_version_grace: Duration::ZERO,
+        compaction_interval: Duration::from_secs(10),
+        min_compaction_size: 10,
+        max_compaction_size: 10_000,
+        compaction_timeout: Duration::from_secs(86_400),
+        spann_flushes: SpannFlushes::default(),
+        spann_flush_stop: None,
+        background: tokio_util::task::TaskTracker::new(),
+        shutdown_grace: Duration::from_secs(30),
     };
     let collection = Collection::test_collection(3);
     for _ in 0..100 {

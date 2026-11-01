@@ -137,13 +137,22 @@ class MigrationHash(Enum):
     SHA256 = 0
     MD5 = 1
 
+class JournalMode(Enum):
+    Wal = 0
+    Delete = 1
+
 class SqliteDBConfig:
     url: str
     hash_type: MigrationHash
     migration_mode: MigrationMode
+    journal_mode: JournalMode
 
     def __init__(
-        self, url: str, hash_type: MigrationHash, migration_mode: MigrationMode
+        self,
+        url: str,
+        hash_type: MigrationHash,
+        migration_mode: MigrationMode,
+        journal_mode: Optional[JournalMode] = None,
     ) -> None: ...
 
 class Bindings:

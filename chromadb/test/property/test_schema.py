@@ -14,6 +14,7 @@ from chromadb.test.property import strategies
 from chromadb.test.property.invariants import check_metadata
 from chromadb.test.conftest import (
     is_spann_disabled_mode,
+    spann_honored,
     multi_region_test,
     reset,
 )
@@ -649,6 +650,25 @@ def _assert_schema_indexes(
 
 
 @multi_region_test
+
+def _asks_for_spann(configuration: Any, schema: Any) -> bool:
+    """Whether a new collection asks for SPANN where the single node gives it: in its schema. A SPANN configuration
+    gets HNSW on the single node, as on single-node Chroma (InternalCollectionConfiguration::try_from_config with HNSW
+    as the default); distributed Chroma gives it SPANN."""
+
+    def has_spann(value: Any) -> bool:
+        if isinstance(value, dict):
+            return any(
+                (key == "spann" and item is not None) or has_spann(item)
+                for key, item in value.items()
+            )
+        if isinstance(value, list):
+            return any(has_spann(item) for item in value)
+        return False
+
+    return schema is not None and has_spann(schema.serialize_to_json())
+
+
 @given(
     name=strategies.collection_name(),
     optional_fields=strategies.metadata_configuration_schema_strategy(),
@@ -676,7 +696,9 @@ def test_vector_index_configuration_create_collection(
         check_metadata(metadata, collection.metadata)
 
     coll_config = collection.configuration
-    spann_active = not is_spann_disabled_mode
+    spann_active = not is_spann_disabled_mode or (
+        spann_honored(client) and _asks_for_spann(configuration, schema)
+    )
     active_key = "spann" if spann_active else "hnsw"
     inactive_key = "hnsw" if spann_active else "spann"
 

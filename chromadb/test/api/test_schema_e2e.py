@@ -19,6 +19,7 @@ from chromadb.execution.expression.operator import Key
 from chromadb.test.conftest import (
     ClientFactories,
     is_spann_disabled_mode,
+    spann_honored,
     skip_if_not_cluster,
     skip_reason_spann_disabled,
     skip_reason_spann_enabled,
@@ -201,7 +202,7 @@ def test_schema_vector_config_persistence_with_ef(
     assert vector_index.config.space is not None
     assert vector_index.config.space == "cosine"
 
-    if not is_spann_disabled_mode:
+    if spann_honored(client):
         assert vector_index.config.spann is not None
         spann_config = vector_index.config.spann
         assert spann_config.search_nprobe == 16
@@ -223,7 +224,7 @@ def test_schema_vector_config_persistence_with_ef(
     assert ef.get_config() == {"dim": 6}
 
     persisted_json = persisted_schema.serialize_to_json()
-    if not is_spann_disabled_mode:
+    if spann_honored(client):
         spann_json = persisted_json["keys"]["#embedding"]["float_list"]["vector_index"][
             "config"
         ]["spann"]
@@ -251,7 +252,7 @@ def test_schema_vector_config_persistence_with_ef(
     assert reloaded_vector_index.config is not None
     assert reloaded_vector_index.config.space is not None
     assert reloaded_vector_index.config.space == "cosine"
-    if not is_spann_disabled_mode:
+    if spann_honored(client):
         assert reloaded_vector_index.config.spann is not None
         assert reloaded_vector_index.config.spann.search_nprobe == 16
         assert reloaded_vector_index.config.spann.write_nprobe == 32

@@ -1,6 +1,10 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Formatter};
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::Log;
@@ -27,11 +31,71 @@ use chroma_types::{
     GetCollectionWithSegmentsError, LogRecord, Schema, SchemaError, Segment, SegmentFlushInfo,
     SegmentShard, SegmentType, SegmentUuid,
 };
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::{oneshot, Notify};
+use tracing::Instrument;
 
+/// When the SPANN collections of the single node flush the records of their log to their files, with the names and the
+/// defaults of distributed Chroma: of its compactor (rust/worker/src/compactor/config.rs) and of its log service, which
+/// picks the collections to compact (timeout_us, rust/log-service/src/lib.rs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocalCompactionManagerConfig {}
+pub struct LocalCompactionManagerConfig {
+    /// How often the flushes run.
+    #[serde(default = "LocalCompactionManagerConfig::default_compaction_interval_sec")]
+    pub compaction_interval_sec: u64,
+    /// The records of the log after its last flush from which a collection flushes.
+    #[serde(default = "LocalCompactionManagerConfig::default_min_compaction_size")]
+    pub min_compaction_size: usize,
+    /// The records of the log that one flush writes at most.
+    #[serde(default = "LocalCompactionManagerConfig::default_max_compaction_size")]
+    pub max_compaction_size: usize,
+    /// How long the oldest record of the log after the last flush waits, at most, before its collection flushes with
+    /// fewer records than min_compaction_size.
+    #[serde(default = "LocalCompactionManagerConfig::default_timeout_us")]
+    pub timeout_us: u64,
+    /// How long a stop waits for the work that runs out of the actor, the SPANN flushes, and then for the connections of
+    /// SQLite, before it closes the database anyway: 30 s, the default terminationGracePeriodSeconds of Kubernetes, which
+    /// is what bounds the stop of the components of distributed Chroma, as neither Chroma nor distributed Chroma has a
+    /// setting of its own.
+    #[serde(default = "LocalCompactionManagerConfig::default_shutdown_grace_sec")]
+    pub shutdown_grace_sec: u64,
+}
+
+impl LocalCompactionManagerConfig {
+    fn default_compaction_interval_sec() -> u64 {
+        10
+    }
+
+    fn default_min_compaction_size() -> usize {
+        10
+    }
+
+    fn default_max_compaction_size() -> usize {
+        10_000
+    }
+
+    fn default_timeout_us() -> u64 {
+        86_400_000_000
+    }
+
+    fn default_shutdown_grace_sec() -> u64 {
+        30
+    }
+}
+
+impl Default for LocalCompactionManagerConfig {
+    fn default() -> Self {
+        Self {
+            compaction_interval_sec: Self::default_compaction_interval_sec(),
+            min_compaction_size: Self::default_min_compaction_size(),
+            max_compaction_size: Self::default_max_compaction_size(),
+            timeout_us: Self::default_timeout_us(),
+            shutdown_grace_sec: Self::default_shutdown_grace_sec(),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct LocalCompactionManager {
@@ -48,6 +112,38 @@ pub struct LocalCompactionManager {
     // The versions that the flushes of SPANN collections replaced within the grace, by segment.
     spann_versions: HashMap<SegmentUuid, ReplacedVersions>,
     spann_version_grace: Duration,
+    // When SPANN collections flush: see LocalCompactionManagerConfig.
+    compaction_interval: Duration,
+    min_compaction_size: usize,
+    max_compaction_size: usize,
+    compaction_timeout: Duration,
+    // The flushes of SPANN collections that run out of the actor, with the one-off flushes that wait for them.
+    spann_flushes: SpannFlushes,
+    spann_flush_stop: Option<SpannFlushStop>,
+    // The work out of the actor, the flushes of SPANN collections, which a stop waits for (LocalCompactionManager::drain),
+    // shared by the clones of the manager, as the one the registry keeps.
+    background: tokio_util::task::TaskTracker,
+    shutdown_grace: Duration,
+}
+
+// A request of a one-off flush, answered at the end of its flush.
+type FlushRequest = oneshot::Sender<Result<(), CompactionManagerError>>;
+
+// The collections whose flush runs out of the actor, each with the requests of one-off flushes that its end answers, and
+// the requests of one-off flushes of those collections asked while it runs, which wait for it to end and then get a
+// flush of their own, as the scheduler of distributed Chroma keeps a one-off collection whose compaction is in progress
+// for a later round (oneoff_collections in rust/worker/src/compactor/scheduler.rs).
+#[derive(Debug, Default)]
+struct SpannFlushes {
+    running: HashMap<CollectionUuid, Vec<FlushRequest>>,
+    queued: HashMap<CollectionUuid, Vec<FlushRequest>>,
+}
+
+// The requests belong to the actor that runs: a clone of the manager, as the one the registry keeps, has none.
+impl Clone for SpannFlushes {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -80,6 +176,47 @@ impl Default for SpannVersionGrace {
 }
 
 impl Injectable for SpannVersionGrace {}
+
+/// For tests: the first flush of a SPANN collection out of the actor stops with its log read and before it writes its
+/// files, until the test lets it go on, so that the test writes, deletes or resets meanwhile. Only that flush: the later
+/// ones go on. Injectable, as SpannVersionGrace; none by default.
+#[derive(Clone, Debug)]
+pub struct SpannFlushStop {
+    armed: Arc<AtomicBool>,
+    reached: Arc<Notify>,
+    go_on: Arc<Notify>,
+}
+
+impl Default for SpannFlushStop {
+    fn default() -> Self {
+        Self {
+            armed: Arc::new(AtomicBool::new(true)),
+            reached: Arc::default(),
+            go_on: Arc::default(),
+        }
+    }
+}
+
+impl SpannFlushStop {
+    /// Waits until a flush stops.
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Lets the flush that stopped go on.
+    pub fn go_on(&self) {
+        self.go_on.notify_one();
+    }
+
+    async fn stop(&self) {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.reached.notify_one();
+            self.go_on.notified().await;
+        }
+    }
+}
+
+impl Injectable for SpannFlushStop {}
 
 // Forgetting a collection costs one more check, so the set is emptied instead of growing with every collection
 // a long-running server has read.
@@ -121,7 +258,7 @@ impl Injectable for LocalCompactionManager {}
 #[async_trait]
 impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
     async fn try_from_config(
-        _config: &LocalCompactionManagerConfig,
+        config: &LocalCompactionManagerConfig,
         registry: &Registry,
     ) -> Result<Self, Box<dyn ChromaError>> {
         let log = registry.get::<Log>().map_err(|e| e.boxed())?;
@@ -139,6 +276,14 @@ impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
             purged: HashSet::new(),
             spann_versions: HashMap::new(),
             spann_version_grace: registry.get::<SpannVersionGrace>().unwrap_or_default().0,
+            compaction_interval: Duration::from_secs(config.compaction_interval_sec),
+            min_compaction_size: config.min_compaction_size,
+            max_compaction_size: config.max_compaction_size,
+            compaction_timeout: Duration::from_micros(config.timeout_us),
+            spann_flushes: SpannFlushes::default(),
+            spann_flush_stop: registry.get::<SpannFlushStop>().ok(),
+            background: tokio_util::task::TaskTracker::new(),
+            shutdown_grace: Duration::from_secs(config.shutdown_grace_sec),
         };
         registry.register(res.clone());
         Ok(res)
@@ -156,7 +301,22 @@ impl Component for LocalCompactionManager {
         1000
     }
 
-    async fn on_start(&mut self, _: &ComponentContext<Self>) -> () {}
+    // As the compaction manager of distributed Chroma, which schedules its first compaction when it starts
+    // (rust/worker/src/compactor/compaction_manager.rs).
+    async fn on_start(&mut self, ctx: &ComponentContext<Self>) -> () {
+        ctx.scheduler.schedule(
+            ScheduledCompactMessage {},
+            self.compaction_interval,
+            ctx,
+            || {
+                Some(tracing::span!(
+                    parent: None,
+                    tracing::Level::INFO,
+                    "Scheduled compaction"
+                ))
+            },
+        );
+    }
 }
 
 impl Debug for LocalCompactionManager {
@@ -193,6 +353,10 @@ pub enum CompactionManagerError {
     SpannUnavailable,
     #[error("Error writing the SPANN index: {0}")]
     SpannWriteError(Box<dyn ChromaError>),
+    #[error("The flush of a SPANN collection panicked")]
+    SpannFlushPanicked,
+    #[error("The flush of a SPANN collection failed: {0}")]
+    SpannFlushFailed(String),
 }
 
 impl ChromaError for CompactionManagerError {
@@ -211,6 +375,8 @@ impl ChromaError for CompactionManagerError {
             CompactionManagerError::SpannUnavailable => ErrorCodes::FailedPrecondition,
             CompactionManagerError::SpannWriteError(e) => e.code(),
             CompactionManagerError::SchemaReconcileError(e) => e.code(),
+            CompactionManagerError::SpannFlushPanicked => ErrorCodes::Internal,
+            CompactionManagerError::SpannFlushFailed(_) => ErrorCodes::Internal,
         }
     }
 }
@@ -223,6 +389,37 @@ pub struct PurgeLogsMessage {
 #[derive(Clone, Debug)]
 pub struct BackfillMessage {
     pub collection_id: CollectionUuid,
+}
+
+/// Every compaction interval, the flushes of the SPANN collections that the log picks, as the scheduled compaction of
+/// distributed Chroma (ScheduledCompactMessage, rust/worker/src/compactor/compaction_manager.rs). They run out of the
+/// actor; the answer tells when they are all done.
+#[derive(Clone, Debug)]
+pub struct ScheduledCompactMessage {}
+
+/// The flushes of the SPANN collections named, without the thresholds, as a one-off compaction of distributed Chroma
+/// (OneOffCompactMessage, rust/worker/src/compactor/types.rs), which compacts them at its next round even below
+/// min_compaction_size. Here they start at once, out of the actor, one after the other; a collection whose flush is in
+/// progress gets its own after it, as there a one-off collection whose compaction is in progress waits for a later round
+/// (rust/worker/src/compactor/scheduler.rs). The answer has one receiver for each collection, which tells the end of its
+/// flush: the tests that ask for them read the files once they are written.
+#[derive(Clone, Debug)]
+pub struct OneOffCompactMessage {
+    pub collection_ids: Vec<CollectionUuid>,
+}
+
+/// The end of a flush of a SPANN collection out of the actor: the collection with the files that the flush wrote and
+/// registered, none when its log had nothing to flush, or its failure.
+#[derive(Debug)]
+pub struct SpannFlushed {
+    collection_id: CollectionUuid,
+    result: Result<Option<(CollectionAndSegments, SpannFlush)>, CompactionManagerError>,
+}
+
+/// The end of the flushes of a round of the timer, out of the actor: the next round, and the answer to its message.
+#[derive(Debug)]
+pub struct SpannRoundDone {
+    round: oneshot::Sender<()>,
 }
 
 #[async_trait]
@@ -302,11 +499,10 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
         let mt_max_seq_id = metadata_reader
             .current_max_seq_id(&collection_and_segments.metadata_segment.id)
             .await?;
-        // A SPANN index is at the log position of its last flush, which flush_compaction records.
+        // A SPANN collection takes from the log only the records that its metadata lacks: its files take them at a later
+        // flush (SpannFlusher::flush), and a read merges those after the last flush with the files.
         let hnsw_max_seq_id = if spann {
-            metadata_reader
-                .current_max_seq_id(&collection_and_segments.vector_segment.id)
-                .await?
+            mt_max_seq_id
         } else {
             hnsw_max_seq_id
         };
@@ -342,20 +538,6 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
         }
         mt_data_chunk.set_visibility(mt_visibility);
         hnsw_data_chunk.set_visibility(hnsw_visibility);
-        // As the flush of distributed Chroma, which changes every segment of a collection at once: the files of a SPANN
-        // collection are written first, and its records go to SQLite in the transaction that records those files, so a
-        // read in one transaction sees them at the same flush.
-        let spann_flush = match spann {
-            true => {
-                self.write_spann(
-                    &collection_and_segments,
-                    dim as usize,
-                    hnsw_data_chunk.clone(),
-                )
-                .await?
-            }
-            false => None,
-        };
         // Apply the records to the metadata writer.
         let metadata_writer = SqliteMetadataWriter::new(self.sqlite_db.clone());
         let mut tx = metadata_writer
@@ -387,52 +569,10 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
                     .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
             }
         }
-        if let Some(flush) = &spann_flush {
-            chroma_sysdb::sqlite::flush_compaction_in(
-                &mut *tx,
-                collection_and_segments.collection.collection_id,
-                flush.log_position,
-                collection_and_segments.collection.version,
-                &[
-                    SegmentFlushInfo {
-                        segment_id: collection_and_segments.record_segment.id,
-                        file_paths: flush.record_files.clone(),
-                    },
-                    SegmentFlushInfo {
-                        segment_id: collection_and_segments.vector_segment.id,
-                        file_paths: flush.vector_files.clone(),
-                    },
-                ],
-                None,
-            )
-            .await
-            .map_err(|err| CompactionManagerError::SpannWriteError(err.boxed()))?;
-        }
         tx.commit()
             .await
             .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
         if spann {
-            if let Some(flush) = spann_flush {
-                let mut record_segment = collection_and_segments.record_segment.clone();
-                record_segment.file_path = flush.record_files.clone();
-                for (segment, files) in [
-                    (&collection_and_segments.record_segment, flush.record_files),
-                    (&collection_and_segments.vector_segment, flush.vector_files),
-                ] {
-                    if let Err(err) = self
-                        .remove_replaced_versions(
-                            &collection_and_segments.collection,
-                            segment,
-                            files,
-                        )
-                        .await
-                    {
-                        tracing::warn!(error = %err, "SPANN flush done; the files of older versions stay for the next flush");
-                    }
-                }
-                self.hnsw_segment_manager
-                    .spann_flushed(message.collection_id, record_segment);
-            }
             self.hnsw_segment_manager
                 .set_spann_applied(message.collection_id, true);
             return Ok(());
@@ -478,7 +618,159 @@ impl Handler<PurgeLogsMessage> for LocalCompactionManager {
     }
 }
 
+#[async_trait]
+impl Handler<ScheduledCompactMessage> for LocalCompactionManager {
+    type Result = oneshot::Receiver<()>;
+
+    async fn handle(
+        &mut self,
+        _message: ScheduledCompactMessage,
+        ctx: &ComponentContext<LocalCompactionManager>,
+    ) -> Self::Result {
+        // The rounds tell the log when a write it refuses may be sent again.
+        if let Log::Sqlite(log) = &self.log {
+            log.spann_round_started(self.compaction_interval, self.max_compaction_size as u64);
+        }
+        let collections = match self.spann_collections_to_compact().await {
+            Ok(collections) => collections,
+            Err(err) => {
+                tracing::warn!(error = %err, "Scheduled compaction of SPANN collections failed; the next one tries again");
+                Vec::new()
+            }
+        };
+        // As the scheduler of distributed Chroma: a collection whose flush is in progress waits for a later round.
+        let collections = collections
+            .into_iter()
+            .filter(|collection_id| !self.spann_flushes.running.contains_key(collection_id))
+            .collect::<Vec<_>>();
+        for collection_id in &collections {
+            self.spann_flushes
+                .running
+                .insert(*collection_id, Vec::new());
+        }
+        let (round, done) = oneshot::channel();
+        self.launch_spann_flushes(collections, Some(round), ctx);
+        done
+    }
+}
+
+#[async_trait]
+impl Handler<SpannRoundDone> for LocalCompactionManager {
+    type Result = ();
+
+    async fn handle(
+        &mut self,
+        message: SpannRoundDone,
+        ctx: &ComponentContext<LocalCompactionManager>,
+    ) {
+        if let Log::Sqlite(log) = &self.log {
+            log.spann_round_ended();
+        }
+        // As distributed Chroma: the next compaction once this one is done.
+        ctx.scheduler.schedule(
+            ScheduledCompactMessage {},
+            self.compaction_interval,
+            ctx,
+            || {
+                Some(tracing::span!(
+                    parent: None,
+                    tracing::Level::INFO,
+                    "Scheduled compaction"
+                ))
+            },
+        );
+        // The message of the round may come from no one who waits for it, as from the scheduler.
+        let _ = message.round.send(());
+    }
+}
+
+#[async_trait]
+impl Handler<OneOffCompactMessage> for LocalCompactionManager {
+    type Result = Vec<oneshot::Receiver<Result<(), CompactionManagerError>>>;
+
+    async fn handle(
+        &mut self,
+        message: OneOffCompactMessage,
+        ctx: &ComponentContext<LocalCompactionManager>,
+    ) -> Self::Result {
+        let mut answers = Vec::new();
+        let mut launch = Vec::new();
+        for collection_id in message.collection_ids {
+            let (request, answer) = oneshot::channel();
+            answers.push(answer);
+            match self.spann_flushes.running.entry(collection_id) {
+                // A flush of the collection in progress: this one gets its own after it.
+                Entry::Occupied(_) => self
+                    .spann_flushes
+                    .queued
+                    .entry(collection_id)
+                    .or_default()
+                    .push(request),
+                Entry::Vacant(running) => {
+                    running.insert(vec![request]);
+                    launch.push(collection_id);
+                }
+            }
+        }
+        if !launch.is_empty() {
+            self.launch_spann_flushes(launch, None, ctx);
+        }
+        answers
+    }
+}
+
+#[async_trait]
+impl Handler<SpannFlushed> for LocalCompactionManager {
+    type Result = ();
+
+    async fn handle(
+        &mut self,
+        message: SpannFlushed,
+        ctx: &ComponentContext<LocalCompactionManager>,
+    ) {
+        let SpannFlushed {
+            collection_id,
+            result,
+        } = message;
+        let result = self.finish_spann_flush(collection_id, result).await;
+        if let Err(err) = &result {
+            tracing::warn!(
+                collection_id = %collection_id,
+                error = %err,
+                "SPANN flush failed; its records stay in the log for the next round"
+            );
+        }
+        let requests = self
+            .spann_flushes
+            .running
+            .remove(&collection_id)
+            .unwrap_or_default();
+        answer_flush_requests(requests, result);
+        // The one-off flushes asked while this one ran get their own, now that it ended.
+        if let Some(queued) = self.spann_flushes.queued.remove(&collection_id) {
+            self.spann_flushes.running.insert(collection_id, queued);
+            self.launch_spann_flushes(vec![collection_id], None, ctx);
+        }
+    }
+}
+
+// The answer of a flush to each request that waits for it: the first one takes its failure, the others its message.
+fn answer_flush_requests(requests: Vec<FlushRequest>, result: Result<(), CompactionManagerError>) {
+    let message = result.as_ref().err().map(ToString::to_string);
+    let mut result = Some(result);
+    for request in requests {
+        let answer = result.take().unwrap_or_else(|| {
+            message.clone().map_or(Ok(()), |message| {
+                Err(CompactionManagerError::SpannFlushFailed(message))
+            })
+        });
+        // A request whose sender stopped waiting has no one to answer.
+        let _ = request.send(answer);
+    }
+}
+
 // The files of a flush of a SPANN collection, and the log position they cover.
+#[derive(Debug)]
 struct SpannFlush {
     log_position: i64,
     record_files: HashMap<String, Vec<String>>,
@@ -486,101 +778,129 @@ struct SpannFlush {
 }
 
 impl LocalCompactionManager {
-    // As the compaction of distributed Chroma: the records are materialized against the record segment, applied to it
-    // and to the SPANN index, and the new files of both written; the caller records them with the log position they
-    // cover. None when the log has nothing past the last flush.
-    async fn write_spann(
+    // The SPANN collections that the log picks for a round, as the scheduler of distributed Chroma picks the collections
+    // to compact (rust/worker/src/compactor/compaction_manager.rs).
+    async fn spann_collections_to_compact(
         &mut self,
-        collection_and_segments: &CollectionAndSegments,
-        dimensionality: usize,
-        logs: Chunk<LogRecord>,
-    ) -> Result<Option<SpannFlush>, CompactionManagerError> {
-        let Some(log_position) = logs.iter().map(|(log, _)| log.log_offset).max() else {
-            return Ok(None);
+    ) -> Result<Vec<CollectionUuid>, CompactionManagerError> {
+        let Log::Sqlite(log) = &mut self.log else {
+            return Ok(Vec::new());
         };
-        let write = |err: Box<dyn ChromaError>| CompactionManagerError::SpannWriteError(err);
-        let provider = self
-            .hnsw_segment_manager
-            .spann_provider()
-            .ok_or(CompactionManagerError::SpannUnavailable)?;
-        let collection = &collection_and_segments.collection;
-        let record_shard = SegmentShard::try_from((&collection_and_segments.record_segment, 0))
-            .map_err(|err| write(err.boxed()))?;
-        let vector_shard = SegmentShard::try_from((&collection_and_segments.vector_segment, 0))
-            .map_err(|err| write(err.boxed()))?;
-        let record_reader = match RecordSegmentReaderShard::from_segment(
-            &record_shard,
-            &provider.blockfile_provider,
-            None,
+        log.get_spann_collections_to_compact(
+            self.min_compaction_size as u64,
+            self.compaction_timeout,
         )
         .await
-        {
-            Ok(reader) => Some(reader),
-            Err(err)
-                if matches!(
-                    *err,
-                    RecordSegmentReaderShardCreationError::UninitializedSegment
-                ) =>
-            {
-                None
-            }
-            Err(err) => return Err(write(err.boxed())),
-        };
-        let materialized = materialize_logs(
-            &record_reader,
-            logs,
-            None,
-            &RecordSegmentReaderOptions::default(),
-        )
-        .await
-        .map_err(|err| write(err.boxed()))?;
-        let record_writer = RecordSegmentWriterShard::from_segment(
-            &collection.tenant,
-            &collection.database_id,
-            &record_shard,
-            &provider.blockfile_provider,
-            None,
-            None,
-        )
-        .await
-        .map_err(|err| write(err.boxed()))?;
-        record_writer
-            .apply_materialized_log_chunk(&record_reader, &materialized)
-            .await
-            .map_err(|err| write(err.boxed()))?;
-        let mut spann_writer = provider
-            .write(collection, &vector_shard, dimensionality, None)
-            .await
-            .map_err(|err| write(err.boxed()))?;
-        spann_writer
-            .apply_materialized_log_chunk(&record_reader, &materialized)
-            .await
-            .map_err(|err| write(err.boxed()))?;
-        let record_files = Box::pin(record_writer.commit())
-            .await
-            .map_err(|err| write(err.boxed()))?
-            .flush()
-            .await
-            .map_err(|err| write(err.boxed()))?;
-        // As the commit of a compaction (rust/worker/src/execution/operators/commit_segment_writer.rs).
-        spann_writer.garbage_collect().await.map_err(write)?;
-        let vector_files = Box::pin(spann_writer.commit())
-            .await
-            .map_err(write)?
-            .flush()
-            .await
-            .map_err(write)?;
-        Ok(Some(SpannFlush {
-            log_position,
-            record_files,
-            vector_files,
-        }))
+        .map_err(|_| CompactionManagerError::PullLogsFailure)
     }
 
+    /// How long a stop waits, for the work out of the actor and then for the connections of SQLite.
+    pub fn shutdown_grace(&self) -> Duration {
+        self.shutdown_grace
+    }
+
+    /// The first step of a stop, once the actor has stopped: no new work out of the actor, and the work that runs waited
+    /// for within the grace given, so that no flush holds a connection of SQLite when the database closes. True if it
+    /// all ended in time.
+    pub async fn drain(&self, grace: Duration) -> bool {
+        self.background.close();
+        tokio::time::timeout(grace, self.background.wait())
+            .await
+            .is_ok()
+    }
+
+    // What a flush needs, out of the actor.
+    fn spann_flusher(&self) -> SpannFlusher {
+        SpannFlusher {
+            log: self.log.clone(),
+            sqlite_db: self.sqlite_db.clone(),
+            hnsw_segment_manager: self.hnsw_segment_manager.clone(),
+            sysdb: self.sysdb.clone(),
+            max_compaction_size: self.max_compaction_size,
+            stop: self.spann_flush_stop.clone(),
+        }
+    }
+
+    // The flushes of the collections given, one after the other, out of the actor, as the compaction manager of
+    // distributed Chroma runs its compactions out of its own (compact_awaiter_loop in
+    // rust/worker/src/compactor/compaction_manager.rs), so that the writes and the reads do not wait behind them: the end
+    // of each comes back to the actor as a SpannFlushed, then the end of a round as a SpannRoundDone. A flush that
+    // panics ends with an error, as there. The collections are in spann_flushes.running already.
+    fn launch_spann_flushes(
+        &self,
+        collections: Vec<CollectionUuid>,
+        round: Option<oneshot::Sender<()>>,
+        ctx: &ComponentContext<LocalCompactionManager>,
+    ) {
+        let flusher = self.spann_flusher();
+        let flushed = ctx.receiver::<SpannFlushed>();
+        let done = ctx.receiver::<SpannRoundDone>();
+        let flushes = async move {
+            for collection_id in collections {
+                let result = AssertUnwindSafe(flusher.clone().flush(collection_id))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or(Err(CompactionManagerError::SpannFlushPanicked));
+                if let Err(err) = flushed
+                    .send(
+                        SpannFlushed {
+                            collection_id,
+                            result,
+                        },
+                        None,
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        collection_id = %collection_id,
+                        error = %err,
+                        "The end of a SPANN flush did not reach the compaction manager"
+                    );
+                }
+            }
+            if let Some(round) = round {
+                if let Err(err) = done.send(SpannRoundDone { round }, None).await {
+                    tracing::error!(error = %err, "The end of a round of SPANN flushes did not reach the compaction manager");
+                }
+            }
+        };
+        self.background
+            .spawn(flushes.instrument(tracing::info_span!(parent: None, "SPANN flushes")));
+    }
+
+    // The end of a flush, in the actor: the flush moves the watermark that bounds a purge of the log, the files of the
+    // versions it replaced go once the grace allows it, and the reads of the collection open its new version.
+    async fn finish_spann_flush(
+        &mut self,
+        collection_id: CollectionUuid,
+        result: Result<Option<(CollectionAndSegments, SpannFlush)>, CompactionManagerError>,
+    ) -> Result<(), CompactionManagerError> {
+        let Some((collection_and_segments, flush)) = result? else {
+            return Ok(());
+        };
+        self.purged.remove(&collection_id);
+        let mut record_segment = collection_and_segments.record_segment.clone();
+        record_segment.file_path = flush.record_files.clone();
+        for (segment, files) in [
+            (&collection_and_segments.record_segment, flush.record_files),
+            (&collection_and_segments.vector_segment, flush.vector_files),
+        ] {
+            if let Err(err) = self
+                .remove_replaced_versions(&collection_and_segments.collection, segment, files)
+                .await
+            {
+                tracing::warn!(error = %err, "SPANN flush done; the files of older versions stay for the next flush");
+            }
+        }
+        self.hnsw_segment_manager
+            .spann_flushed(collection_id, record_segment);
+        Ok(())
+    }
     // The files of the versions of a SPANN segment that a flush replaced longer than the grace ago, removed, at most
     // once a grace for each segment. The version before the current one stays, as min_versions_to_keep 2 in the garbage
-    // collector of distributed Chroma. Flushes run one at a time here, so no file of a flush to come is on disk yet;
-    // after a restart, the files of the versions replaced before it go at the first flush.
+    // collector of distributed Chroma. A collection flushes one at a time here, and its next flush starts once the end of
+    // this one reached the actor, so no file of a flush to come is on disk yet; after a restart, the files of the
+    // versions replaced before it go at the first flush.
     async fn remove_replaced_versions(
         &mut self,
         collection: &Collection,
@@ -680,6 +1000,250 @@ impl LocalCompactionManager {
             .purge_logs(collection_id, max_seq_id)
             .await
             .map_err(|_| CompactionManagerError::PurgeLogsFailure)
+    }
+}
+
+// What a flush of a SPANN collection needs, out of the actor, as the context of the compactions of distributed Chroma
+// (CompactionManagerContext in rust/worker/src/compactor/compaction_manager.rs), which each compaction takes a clone of.
+#[derive(Clone)]
+struct SpannFlusher {
+    log: Log,
+    sqlite_db: SqliteDb,
+    hnsw_segment_manager: LocalSegmentManager,
+    sysdb: SysDb,
+    max_compaction_size: usize,
+    stop: Option<SpannFlushStop>,
+}
+
+impl SpannFlusher {
+    // A flush of a SPANN collection: the records of its log after its last flush, up to the last record applied to its
+    // metadata and at most max_compaction_size of them, as the fetch of the logs of a compaction of distributed Chroma
+    // reads at most max_compaction_size (rust/worker/src/execution/orchestration/log_fetch_orchestrator.rs), written to
+    // new files (write_spann), which a transaction records with the log position they cover, as the register of a
+    // compaction (rust/worker/src/execution/orchestration/register_orchestrator.rs). The metadata holds those records
+    // already: a write applies them to SQLite before it answers.
+    async fn flush(
+        mut self,
+        collection_id: CollectionUuid,
+    ) -> Result<Option<(CollectionAndSegments, SpannFlush)>, CompactionManagerError> {
+        let mut collection_and_segments = self
+            .sysdb
+            .get_collection_with_segments(None, collection_id)
+            .await?;
+        if collection_and_segments.vector_segment.r#type != SegmentType::Spann {
+            return Ok(None);
+        }
+        if collection_and_segments.collection.schema.is_none() {
+            collection_and_segments.collection.schema = Some(
+                Schema::try_from(&collection_and_segments.collection.config)
+                    .map_err(CompactionManagerError::SchemaReconcileError)?,
+            );
+        }
+        let Some(dim) = collection_and_segments.collection.dimension else {
+            return Ok(None);
+        };
+        let metadata_reader = SqliteMetadataReader::new(self.sqlite_db.clone());
+        let applied = metadata_reader
+            .current_max_seq_id(&collection_and_segments.metadata_segment.id)
+            .await? as i64;
+        let flushed = metadata_reader
+            .current_max_seq_id(&collection_and_segments.vector_segment.id)
+            .await? as i64;
+        if applied <= flushed {
+            return Ok(None);
+        }
+        let dbname = DatabaseName::new(collection_and_segments.collection.database.clone())
+            .ok_or(CompactionManagerError::PullLogsFailure)?;
+        let mut logs = self
+            .log
+            .read(
+                &collection_and_segments.collection.tenant,
+                dbname,
+                collection_id,
+                flushed,
+                self.max_compaction_size as i32,
+                None,
+            )
+            .await
+            .map_err(|_| CompactionManagerError::PullLogsFailure)?;
+        // A write puts its records in the log, then applies them to the metadata: the records past the metadata, if any,
+        // wait for it.
+        logs.retain(|log| log.log_offset <= applied);
+        if let Some(stop) = &self.stop {
+            stop.stop().await;
+        }
+        let flush = self
+            .write_spann(
+                &collection_and_segments,
+                dim as usize,
+                Chunk::new(logs.into()),
+            )
+            .await;
+        let flush = match flush {
+            Ok(Some(flush)) => self.register(&collection_and_segments, flush).await,
+            other => other,
+        };
+        if flush.is_err() {
+            self.remove_files_of_lost_segments(&collection_and_segments)
+                .await;
+        }
+        Ok(flush?.map(|flush| (collection_and_segments, flush)))
+    }
+
+    // The files of a flush, recorded with the log position they cover in one transaction, as the register of a compaction
+    // of distributed Chroma (rust/worker/src/execution/orchestration/register_orchestrator.rs). It fails for a collection
+    // that the catalog no longer has, as after a delete or a reset during the flush, and for a flush older than the last
+    // one of the collection.
+    async fn register(
+        &self,
+        collection_and_segments: &CollectionAndSegments,
+        flush: SpannFlush,
+    ) -> Result<Option<SpannFlush>, CompactionManagerError> {
+        let collection_id = collection_and_segments.collection.collection_id;
+        let metadata_writer = SqliteMetadataWriter::new(self.sqlite_db.clone());
+        let mut tx = metadata_writer
+            .begin()
+            .await
+            .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
+        chroma_sysdb::sqlite::flush_compaction_in(
+            &mut tx,
+            collection_id,
+            flush.log_position,
+            collection_and_segments.collection.version,
+            &[
+                SegmentFlushInfo {
+                    segment_id: collection_and_segments.record_segment.id,
+                    file_paths: flush.record_files.clone(),
+                },
+                SegmentFlushInfo {
+                    segment_id: collection_and_segments.vector_segment.id,
+                    file_paths: flush.vector_files.clone(),
+                },
+            ],
+            None,
+        )
+        .await
+        .map_err(|err| CompactionManagerError::SpannWriteError(err.boxed()))?;
+        tx.commit()
+            .await
+            .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
+        Ok(Some(flush))
+    }
+
+    // After a flush that failed, the files of the segments of the collection that the catalog no longer has, as after a
+    // delete or a reset during the flush: the files that the flush wrote after the delete removed those of the segment
+    // go with them. delete_blockfile_segment_files leaves the files of a segment that the catalog has.
+    async fn remove_files_of_lost_segments(&self, collection_and_segments: &CollectionAndSegments) {
+        for segment in [
+            &collection_and_segments.record_segment,
+            &collection_and_segments.vector_segment,
+        ] {
+            if let Err(err) = self
+                .hnsw_segment_manager
+                .delete_blockfile_segment_files(
+                    collection_and_segments.collection.collection_id,
+                    segment.id,
+                )
+                .await
+            {
+                tracing::warn!(
+                    segment_id = %segment.id,
+                    error = %err,
+                    "The files of a segment that a failed SPANN flush wrote stay for the sweep of the folders"
+                );
+            }
+        }
+    }
+
+    // As the compaction of distributed Chroma: the records are materialized against the record segment, applied to it
+    // and to the SPANN index, and the new files of both written; the caller records them with the log position they
+    // cover. None when the log has nothing past the last flush.
+    async fn write_spann(
+        &self,
+        collection_and_segments: &CollectionAndSegments,
+        dimensionality: usize,
+        logs: Chunk<LogRecord>,
+    ) -> Result<Option<SpannFlush>, CompactionManagerError> {
+        let Some(log_position) = logs.iter().map(|(log, _)| log.log_offset).max() else {
+            return Ok(None);
+        };
+        let write = |err: Box<dyn ChromaError>| CompactionManagerError::SpannWriteError(err);
+        let provider = self
+            .hnsw_segment_manager
+            .compaction_spann_provider()
+            .ok_or(CompactionManagerError::SpannUnavailable)?;
+        let collection = &collection_and_segments.collection;
+        let record_shard = SegmentShard::try_from((&collection_and_segments.record_segment, 0))
+            .map_err(|err| write(err.boxed()))?;
+        let vector_shard = SegmentShard::try_from((&collection_and_segments.vector_segment, 0))
+            .map_err(|err| write(err.boxed()))?;
+        let record_reader = match RecordSegmentReaderShard::from_segment(
+            &record_shard,
+            &provider.blockfile_provider,
+            None,
+        )
+        .await
+        {
+            Ok(reader) => Some(reader),
+            Err(err)
+                if matches!(
+                    *err,
+                    RecordSegmentReaderShardCreationError::UninitializedSegment
+                ) =>
+            {
+                None
+            }
+            Err(err) => return Err(write(err.boxed())),
+        };
+        let materialized = materialize_logs(
+            &record_reader,
+            logs,
+            None,
+            &RecordSegmentReaderOptions::default(),
+        )
+        .await
+        .map_err(|err| write(err.boxed()))?;
+        let record_writer = RecordSegmentWriterShard::from_segment(
+            &collection.tenant,
+            &collection.database_id,
+            &record_shard,
+            &provider.blockfile_provider,
+            None,
+            None,
+        )
+        .await
+        .map_err(|err| write(err.boxed()))?;
+        record_writer
+            .apply_materialized_log_chunk(&record_reader, &materialized)
+            .await
+            .map_err(|err| write(err.boxed()))?;
+        let mut spann_writer = provider
+            .write(collection, &vector_shard, dimensionality, None)
+            .await
+            .map_err(|err| write(err.boxed()))?;
+        spann_writer
+            .apply_materialized_log_chunk(&record_reader, &materialized)
+            .await
+            .map_err(|err| write(err.boxed()))?;
+        let record_files = Box::pin(record_writer.commit())
+            .await
+            .map_err(|err| write(err.boxed()))?
+            .flush()
+            .await
+            .map_err(|err| write(err.boxed()))?;
+        // As the commit of a compaction (rust/worker/src/execution/operators/commit_segment_writer.rs).
+        spann_writer.garbage_collect().await.map_err(write)?;
+        let vector_files = Box::pin(spann_writer.commit())
+            .await
+            .map_err(write)?
+            .flush()
+            .await
+            .map_err(write)?;
+        Ok(Some(SpannFlush {
+            log_position,
+            record_files,
+            vector_files,
+        }))
     }
 }
 

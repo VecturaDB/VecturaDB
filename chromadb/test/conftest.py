@@ -103,6 +103,18 @@ is_spann_disabled_mode = (
     os.getenv("CHROMA_RUST_BINDINGS_TEST_ONLY") == "1"
     or os.getenv("CHROMA_INTEGRATION_TEST_ONLY") == "1"
 )
+
+
+def spann_honored(client: Any) -> bool:
+    """Whether a collection that asks for SPANN gets it. VecturaDB: the single node in process, the Rust bindings,
+    gives SPANN to it when the client has a data path, and HNSW without one."""
+    if not is_spann_disabled_mode:
+        return True
+    return os.getenv("CHROMA_RUST_BINDINGS_TEST_ONLY") == "1" and bool(
+        client.get_settings().is_persistent
+    )
+
+
 skip_reason_spann_disabled = (
     "SPANN creation/modification disallowed in Rust bindings or integration test mode"
 )

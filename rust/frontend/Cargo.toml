@@ -63,6 +63,7 @@ proptest = { workspace = true }
 proptest-state-machine = { workspace = true }
 chroma-types = { workspace = true, features = ["testing"] }
 chroma-segment = { workspace = true, features = ["test-hooks"] }
+chroma-index = { workspace = true }
 tempfile = { workspace = true }
 worker = { workspace = true }
 ndarray = { workspace = true }

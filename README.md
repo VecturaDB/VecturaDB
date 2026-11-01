@@ -91,6 +91,12 @@ iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercon
 
 The scripts install the newest release, previews included. Every binary is also in the [releases](https://github.com/VecturaDB/VecturaDB/releases). The binary keeps the name `chroma`.
 
+## The SQLite database of the data path
+
+The database is in WAL mode: a read does not wait for a write. A normal stop writes the log of the writes back into `chroma.sqlite3`, which is then the only file of SQLite. After a stop that is not normal, such as a kill, the log stays in `chroma.sqlite3-wal`: a copy of the data path needs it too, or start and stop the server once before the copy. Chroma 1.5.9 and VecturaDB 1.0.0-preview.4 open the data path as it is.
+
+SQLite keeps WAL to the processes of one machine. For a data path on a network filesystem (SMB, NFS), set `sqlitedb: journal_mode: delete`, the mode of Chroma; with Docker, `-e CHROMA_SQLITEDB__JOURNAL_MODE=delete`. In our tests, on an SMB share mounted by Docker with `vers=3.0`, Chroma 1.5.9, VecturaDB 1.0.0-preview.4 and VecturaDB in WAL and in delete did not start without the mount option `nobrl`, and all of them worked with it.
+
 ## Moving data out of Chroma Cloud
 
 The CLI copies collections from Chroma Cloud into a running VecturaDB:
@@ -108,15 +114,15 @@ What arrives: every record with its document, metadata, embedding and URI, the m
 
 ## SPANN index
 
-Chroma Cloud indexes the dense vectors of a collection with SPANN, single-node Chroma with HNSW. VecturaDB can give a collection a SPANN index on the single node too, behind the server option `spann`, off by default.
+Chroma Cloud indexes the dense vectors of a collection with SPANN, single-node Chroma with HNSW. VecturaDB gives a collection that asks for SPANN a SPANN index on the single node too, with the server option `spann`, on by default; every other collection gets HNSW, as before.
 
-With a configuration file:
+To turn it off, with a configuration file:
 
 ```yaml
 persist_path: "./data"
 executor:
   local:
-    spann: true
+    spann: false
 ```
 
 ```bash
@@ -126,14 +132,17 @@ vecturadb run config.yaml
 With Docker, the image reads its configuration file, and an environment variable sets the option:
 
 ```bash
-docker run -p 127.0.0.1:8000:8000 -v ./data:/data -e CHROMA_EXECUTOR__LOCAL__SPANN=true ghcr.io/vecturadb/vecturadb:preview
+docker run -p 127.0.0.1:8000:8000 -v ./data:/data -e CHROMA_EXECUTOR__LOCAL__SPANN=false ghcr.io/vecturadb/vecturadb:preview
 ```
 
-`run --path` reads no option, and the Python package has no SPANN in process.
+`run --path` and the Python package in process (`PersistentClient`) have the option on and read no other option. A server or a client without a persistent data path gives every collection HNSW.
 
 - With the option on, a collection created with a SPANN configuration or schema gets a SPANN index; any other collection gets HNSW, as before.
 - With the option off, a SPANN request gets HNSW, as on single-node Chroma. A SPANN collection created before still answers reads; a write to it fails with `SPANN collections need the executor option spann`.
 - A read of a SPANN collection that fails with an error that distributed Chroma retries reads again: at once after a NotFound, otherwise after the backoff of `executor: local: retry` (`factor`, `min_delay_ms`, `max_delay_ms`, `max_attempts`, `jitter`), by default that of distributed Chroma: 2.0, 100 ms, 5000 ms, 5 times, with jitter.
+- A write to a SPANN collection answers once its records are in the log and in SQLite, and reads see them at once. The server writes them to the files of the index later, as the compactor of distributed Chroma: every `compaction_interval_sec`, for the collections with at least `min_compaction_size` records after their last flush, or with one waiting at least `timeout_us`, at most `max_compaction_size` records per flush. The options are under `local_compaction_manager:`, by default those of distributed Chroma: 10 s, 10 records, 10,000 records and 86,400,000,000 µs (24 hours). With Docker, one variable per option, for example `-e CHROMA_LOCAL_COMPACTION_MANAGER__COMPACTION_INTERVAL_SEC=30`.
+- During a bulk load, the reads of a SPANN collection slow down until its records reach the files of the index: each read also goes through the records that wait for a flush, about 10 ms more for every 1,000 of them with 64 dimensions in our tests, more with larger vectors and documents. A lower `compaction_interval_sec` keeps them fewer.
+- A write to a SPANN collection whose log holds `log: sqlite: num_records_before_backpressure` records after its last flush, 100,000 by default as in distributed Chroma, is refused until a flush takes them, with the answer of distributed Chroma: 429, `log needs compaction before accepting more writes; please backoff exponentially and retry`. Unlike distributed Chroma, the answer also has the header `Retry-After`: the seconds, at least 1, until the end of the flushes that should take the log under the limit, estimated from the rounds of the compactor.
 - Chroma 1.5.9 and VecturaDB 1.0.0-preview.3.post1 open a data path with SPANN collections and serve the other collections as before. A SPANN collection answers there with an error, 500: do not write to it with them. Deleting it there works; VecturaDB removes its files at the next startup.
 
 ## Clients

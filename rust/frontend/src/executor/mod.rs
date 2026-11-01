@@ -17,6 +17,9 @@ mod distributed;
 pub mod local;
 
 //////////////////////// Main Types ////////////////////////
+// A frontend has one executor, which its clones copy: the local one, larger than the distributed one, costs the copy of
+// about a kilobyte more, less than the allocation of a Box at each clone.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum Executor {
     Distributed(DistributedExecutor),
@@ -127,6 +130,18 @@ impl Executor {
                 .await
                 .map_err(ExecutorError::Internal),
             Executor::Distributed(_) => Ok(()),
+        }
+    }
+
+    /// The operations of a SPANN collection of the single node indexed and not indexed: see
+    /// LocalExecutor::spann_indexing_status. Distributed Chroma counts them from its log.
+    pub async fn spann_indexing_status(
+        &mut self,
+        collection: &chroma_types::CollectionAndSegments,
+    ) -> Result<Option<(u64, u64)>, ExecutorError> {
+        match self {
+            Executor::Local(executor) => executor.spann_indexing_status(collection).await.map(Some),
+            Executor::Distributed(_) => Ok(None),
         }
     }
 

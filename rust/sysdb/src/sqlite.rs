@@ -1163,6 +1163,16 @@ impl SqliteSysDb {
                 table::CollectionMetadata::FloatValue,
                 table::CollectionMetadata::BoolValue,
             ])
+            // As the log position of distributed Chroma, which its compaction moves: the records that every segment of
+            // the collection has applied, the lowest max_seq_id of its segments.
+            .expr_as(
+                sea_query::Expr::cust(
+                    "(SELECT COALESCE(MIN(COALESCE(CAST(max_seq_id.seq_id AS INTEGER), 0)), 0) FROM segments \
+                     LEFT JOIN max_seq_id ON max_seq_id.segment_id = segments.id \
+                     WHERE segments.collection = collections.id)",
+                ),
+                sea_query::Alias::new("log_position"),
+            )
             .build_sqlx(sea_query::SqliteQueryBuilder);
 
         let mut rows = sqlx::query_with(&sql, values).fetch(conn);
@@ -1229,7 +1239,7 @@ impl SqliteSysDb {
                     metadata,
                     total_records_post_compaction: 0,
                     version: 0,
-                    log_position: 0,
+                    log_position: first_row.get("log_position"),
                     dimension: first_row.get(3),
                     name: first_row.get(1),
                     tenant: first_row.get(4),

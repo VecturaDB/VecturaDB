@@ -117,10 +117,13 @@ class RustBindingsAPI(ServerAPI):
             if migration_mode == "apply"
             else chromadb_rust_bindings.MigrationMode.Validate
         )
+        # In process the database keeps the rollback journal of Chroma: a client may share its folder with other
+        # processes, as a child of multiprocessing, where the WAL of the server, alone with its folder, fails.
         sqlite_config = chromadb_rust_bindings.SqliteDBConfig(
             hash_type=hash_type_bindings,
             migration_mode=migration_mode_bindings,
             url=sqlite_persist_path,
+            journal_mode=chromadb_rust_bindings.JournalMode.Delete,
         )
 
         self.bindings = chromadb_rust_bindings.Bindings(

@@ -21,6 +21,7 @@ pub use frontend_core::{ac, auth, traced_json};
 
 use chroma_config::{registry::Registry, Configurable};
 use chroma_error::ChromaError;
+use chroma_sqlite::db::SqliteDb;
 use chroma_system::System;
 use config::FrontendServerConfig;
 use get_collection_with_segments_provider::*;
@@ -116,6 +117,27 @@ pub async fn frontend_service_entrypoint_with_config_system_registry(
     )
     .run(None)
     .await;
+    // A normal stop closes the database: in WAL its log goes back into the database file, which is then the only one
+    // left, as with a rollback journal. A graceful stop: the work of the compaction manager out of its actor ends within
+    // the grace, then the database closes within what is left of it, and anyway after it (SqliteDb::close_within).
+    if let Ok(db) = registry.get::<SqliteDb>() {
+        let started = std::time::Instant::now();
+        let grace = match registry.get::<chroma_log::LocalCompactionManager>() {
+            Ok(compactor) => {
+                let grace = compactor.shutdown_grace();
+                if !compactor.drain(grace).await {
+                    tracing::warn!(
+                        "Work of the compaction manager still running {} s after the stop",
+                        grace.as_secs()
+                    );
+                }
+                grace
+            }
+            Err(_) => std::time::Duration::from_secs(30),
+        };
+        db.close_within(grace.saturating_sub(started.elapsed()))
+            .await;
+    }
 }
 
 pub fn init_frontend_otel_tracing(config: &FrontendServerConfig) {

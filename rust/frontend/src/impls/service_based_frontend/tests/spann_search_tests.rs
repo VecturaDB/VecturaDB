@@ -59,14 +59,14 @@ fn metadata_of(i: usize, numbers: &mut Numbers) -> Metadata {
             SPARSE_KEY.to_string(),
             MetadataValue::SparseVector(numbers.sparse()),
         ),
-        ("even".to_string(), MetadataValue::Bool(i % 2 == 0)),
+        ("even".to_string(), MetadataValue::Bool(i.is_multiple_of(2))),
         (
             "weight".to_string(),
             MetadataValue::Float(numbers.next() as f64),
         ),
         (
             "flags".to_string(),
-            MetadataValue::BoolArray(vec![i % 2 == 0, i % 3 == 0]),
+            MetadataValue::BoolArray(vec![i.is_multiple_of(2), i.is_multiple_of(3)]),
         ),
         (
             "counts".to_string(),
@@ -100,14 +100,17 @@ fn update_metadata_of(i: usize, numbers: &mut Numbers) -> UpdateMetadata {
             SPARSE_KEY.to_string(),
             UpdateMetadataValue::SparseVector(numbers.sparse()),
         ),
-        ("even".to_string(), UpdateMetadataValue::Bool(i % 2 == 0)),
+        (
+            "even".to_string(),
+            UpdateMetadataValue::Bool(i.is_multiple_of(2)),
+        ),
         (
             "weight".to_string(),
             UpdateMetadataValue::Float(numbers.next() as f64),
         ),
         (
             "flags".to_string(),
-            UpdateMetadataValue::BoolArray(vec![i % 2 == 0, i % 3 == 0]),
+            UpdateMetadataValue::BoolArray(vec![i.is_multiple_of(2), i.is_multiple_of(3)]),
         ),
         (
             "counts".to_string(),
@@ -127,12 +130,14 @@ fn update_metadata_of(i: usize, numbers: &mut Numbers) -> UpdateMetadata {
 }
 
 // A SPANN collection with a sparse index on SPARSE_KEY and the records given with a document and metadata, added in
-// four writes, each with its flush; then a delete and an upsert, so that the offsets of the record segment are not the
-// rows of SQLite.
+// four writes, each with its flush; then a delete and an upsert, each with its flush too, so that the offsets of the
+// record segment are not the rows of SQLite. With in_the_log, the last add, the delete and the upsert stay in the log
+// after the last flush.
 async fn collection_to_search(
     frontend: &mut ServiceBasedFrontend,
     numbers: &mut Numbers,
     records: usize,
+    in_the_log: bool,
 ) -> CollectionUuid {
     let schema = Schema::new_default(KnnIndex::Spann)
         .create_index(
@@ -162,7 +167,9 @@ async fn collection_to_search(
         .unwrap()
         .collection_id;
     let numbers_of = |range: std::ops::Range<usize>| range.collect::<Vec<_>>();
-    for chunk in numbers_of(0..records).chunks(records / 4) {
+    let chunks = numbers_of(0..records);
+    let chunks = chunks.chunks(records / 4).collect::<Vec<_>>();
+    for (at, chunk) in chunks.iter().enumerate() {
         frontend
             .add(
                 AddCollectionRecordsRequest::try_new(
@@ -189,6 +196,9 @@ async fn collection_to_search(
             )
             .await
             .unwrap();
+        if !(in_the_log && at + 1 == chunks.len()) {
+            flush_spann(frontend, collection_id).await;
+        }
     }
     frontend
         .delete(
@@ -205,6 +215,9 @@ async fn collection_to_search(
         )
         .await
         .unwrap();
+    if !in_the_log {
+        flush_spann(frontend, collection_id).await;
+    }
     frontend
         .upsert(
             UpsertCollectionRecordsRequest::try_new(
@@ -227,6 +240,9 @@ async fn collection_to_search(
         )
         .await
         .unwrap();
+    if !in_the_log {
+        flush_spann(frontend, collection_id).await;
+    }
     collection_id
 }
 
@@ -578,7 +594,7 @@ async fn a_spann_search_in_two_moments_answers_as_in_one_snapshot_impl() {
     let root = tempfile::tempdir().unwrap();
     let mut frontend = frontend_with_spann(root.path(), true).await;
     let mut numbers = Numbers(0x5eed_1234_abcd_ef01);
-    let collection_id = collection_to_search(&mut frontend, &mut numbers, RECORDS).await;
+    let collection_id = collection_to_search(&mut frontend, &mut numbers, RECORDS, false).await;
     let mut wrong = Vec::new();
     for (name, payload) in searches(&mut numbers) {
         let one_snapshot = search_with(&mut frontend, collection_id, payload.clone(), true).await;
@@ -686,7 +702,7 @@ async fn spann_search_times_in_two_moments_and_in_one_snapshot() {
     let root = tempfile::tempdir().unwrap();
     let mut frontend = frontend_with_spann(root.path(), true).await;
     let mut numbers = Numbers(0x5eed_1234_abcd_ef01);
-    let collection_id = collection_to_search(&mut frontend, &mut numbers, 2000).await;
+    let collection_id = collection_to_search(&mut frontend, &mut numbers, 2000, false).await;
     for (name, payload) in searches(&mut numbers) {
         let mut two_moments = Vec::new();
         let mut one_snapshot = Vec::new();
@@ -727,4 +743,66 @@ async fn spann_search_times_in_two_moments_and_in_one_snapshot() {
         let one = format!("in one snapshot {one:.2} ms ({one_lowest:.2}-{one_highest:.2})");
         println!("{name}: {two}, {one}, the two moments faster in {faster} of 20 rounds");
     }
+}
+
+// The same searches on a SPANN collection whose last add, delete and upsert are in the log after its last flush answer
+// the same in one snapshot as in two moments, and the same before the flush of that log as after it: the reads merge the
+// log as the files hold it once flushed. None of them answers nothing.
+#[test]
+fn a_spann_search_with_a_log_answers_as_after_its_flush() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        a_spann_search_with_a_log_answers_as_after_its_flush_impl,
+    )
+}
+
+async fn a_spann_search_with_a_log_answers_as_after_its_flush_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let mut numbers = Numbers(0x5eed_1234_abcd_ef01);
+    let collection_id = collection_to_search(&mut frontend, &mut numbers, RECORDS, true).await;
+    let payloads = searches(&mut numbers);
+    let mut wrong = Vec::new();
+    let mut with_the_log = Vec::new();
+    for (name, payload) in &payloads {
+        let one_snapshot = search_with(&mut frontend, collection_id, payload.clone(), true).await;
+        let two_moments = search_with(&mut frontend, collection_id, payload.clone(), false).await;
+        match (one_snapshot, two_moments) {
+            (Ok(one_snapshot), Ok(two_moments)) => {
+                if two_moments.ids.iter().all(|ids| ids.is_empty()) {
+                    wrong.push(format!("{name}: no records"));
+                }
+                wrong.extend(differences(
+                    &format!("{name}, with the log, in one snapshot against two moments"),
+                    &one_snapshot,
+                    &two_moments,
+                ));
+                with_the_log.push(Some(two_moments));
+            }
+            (one_snapshot, two_moments) => {
+                wrong.push(format!(
+                    "{name}, with the log: in one snapshot {:?}, in two moments {:?}",
+                    one_snapshot.err(),
+                    two_moments.err()
+                ));
+                with_the_log.push(None);
+            }
+        }
+    }
+    flush_spann(&frontend, collection_id).await;
+    for ((name, payload), before) in payloads.into_iter().zip(with_the_log) {
+        match (
+            before,
+            search_with(&mut frontend, collection_id, payload, false).await,
+        ) {
+            (Some(before), Ok(after)) => wrong.extend(differences(
+                &format!("{name}, with the log against after its flush"),
+                &before,
+                &after,
+            )),
+            (_, Err(err)) => wrong.push(format!("{name}, after the flush: {err}")),
+            (None, Ok(_)) => {}
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

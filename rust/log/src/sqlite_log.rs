@@ -10,12 +10,19 @@ use chroma_sqlite::{db::SqliteDb, helpers::get_embeddings_queue_topic_name};
 use chroma_system::{ChannelError, ComponentHandle, RequestError};
 use chroma_types::{
     CollectionUuid, LogRecord, Operation, OperationRecord, ResetError, ResetResponse,
-    ScalarEncoding, ScalarEncodingConversionError, UpdateMetadata, UpdateMetadataValue,
+    ScalarEncoding, ScalarEncodingConversionError, SegmentType, UpdateMetadata,
+    UpdateMetadataValue,
 };
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, Row};
-use std::{str::FromStr, sync::OnceLock};
+use sqlx::sqlite::SqliteRow;
+use sqlx::{QueryBuilder, Row, SqliteConnection};
+use std::{
+    collections::HashSet,
+    str::FromStr,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -66,6 +73,11 @@ pub enum SqlitePushLogsError {
     Unimplemented(String),
     #[error("Sparse metadata must have valid indices and finite weights")]
     InvalidSparseMetadata,
+    // The answer of the log service of distributed Chroma to a write to a collection whose log is too full; the log
+    // turns it into PushLogsError::BackoffCompaction, which the log service gets from it, with the seconds after which
+    // the flushes should have taken the log under the limit, which distributed Chroma does not give.
+    #[error("log needs compaction; too full")]
+    BackoffCompaction { retry_after: u64 },
 }
 
 impl ChromaError for SqlitePushLogsError {
@@ -81,6 +93,7 @@ impl ChromaError for SqlitePushLogsError {
             SqlitePushLogsError::GetMaxBatchSizeError(e) => e.code(),
             SqlitePushLogsError::Unimplemented(_) => ErrorCodes::Unimplemented,
             SqlitePushLogsError::InvalidSparseMetadata => ErrorCodes::InvalidArgument,
+            SqlitePushLogsError::BackoffCompaction { .. } => ErrorCodes::ResourceExhausted,
         }
     }
 }
@@ -159,6 +172,44 @@ pub struct SqliteLog {
     topic_namespace: String,
     compactor_handle: OnceLock<ComponentHandle<LocalCompactionManager>>,
     max_batch_size: OnceLock<u32>,
+    num_records_before_backpressure: u64,
+    // The SPANN collections whose log was too full at the last round of the compactor, shared by every copy of the log,
+    // as the set of the collections under backpressure of the log service of distributed Chroma.
+    backpressure: Arc<Mutex<Arc<HashSet<CollectionUuid>>>>,
+    // The rounds of the local compactor, for the seconds after which a refused write may be sent again.
+    compaction_rounds: Arc<Mutex<Option<CompactionRounds>>>,
+}
+
+// The rounds of the local compactor: the next one starts compaction_interval after the end of the one before, as in
+// distributed Chroma, and flushes at most records_per_flush records of a collection.
+#[derive(Clone, Copy, Debug)]
+struct CompactionRounds {
+    // The start of the last round.
+    started: Instant,
+    // The end of the last round that ended, and how long it took.
+    ended: Option<Instant>,
+    length: Duration,
+    compaction_interval: Duration,
+    records_per_flush: u64,
+}
+
+impl CompactionRounds {
+    // The time until the end of the flushes that take the given records of a log after its last flush under the limit:
+    // the end of the round that runs, or of the next one, then one interval and one round for each further flush.
+    fn until_under(&self, records: u64, limit: u64) -> Duration {
+        let flushes = (records + 1)
+            .saturating_sub(limit)
+            .div_ceil(self.records_per_flush.max(1));
+        let first = match self.ended {
+            Some(ended) if ended >= self.started => {
+                self.compaction_interval.saturating_sub(ended.elapsed()) + self.length
+            }
+            _ => self.length.saturating_sub(self.started.elapsed()),
+        };
+        first
+            + (self.compaction_interval + self.length)
+                .saturating_mul(u32::try_from(flushes.saturating_sub(1)).unwrap_or(u32::MAX))
+    }
 }
 
 impl SqliteLog {
@@ -169,7 +220,90 @@ impl SqliteLog {
             topic_namespace,
             compactor_handle: OnceLock::new(),
             max_batch_size: OnceLock::new(),
+            num_records_before_backpressure:
+                SqliteLogConfig::default_num_records_before_backpressure(),
+            backpressure: Arc::default(),
+            compaction_rounds: Arc::default(),
         }
+    }
+
+    /// The start of a round of the local compactor, which runs compaction_interval after the end of the one before and
+    /// flushes at most records_per_flush records of a collection.
+    pub fn spann_round_started(&self, compaction_interval: Duration, records_per_flush: u64) {
+        let mut rounds = self.compaction_rounds.lock().unwrap();
+        let (ended, length) = match *rounds {
+            Some(last) => (last.ended, last.length),
+            None => (None, Duration::ZERO),
+        };
+        *rounds = Some(CompactionRounds {
+            started: Instant::now(),
+            ended,
+            length,
+            compaction_interval,
+            records_per_flush,
+        });
+    }
+
+    /// The end of a round of the local compactor.
+    pub fn spann_round_ended(&self) {
+        if let Some(rounds) = self.compaction_rounds.lock().unwrap().as_mut() {
+            let now = Instant::now();
+            rounds.length = now.duration_since(rounds.started);
+            rounds.ended = Some(now);
+        }
+    }
+
+    pub fn with_num_records_before_backpressure(mut self, records: u64) -> Self {
+        self.num_records_before_backpressure = records;
+        self
+    }
+
+    fn set_backpressure(&self, to_pressure: HashSet<CollectionUuid>) {
+        *self.backpressure.lock().unwrap() = Arc::new(to_pressure);
+    }
+
+    // As check_for_backpressure of the log service of distributed Chroma: a write to a collection that the last round
+    // found too full counts its log again, and is refused only if the log is still too full. The set stays as the round
+    // left it. The refusal says after how many seconds, at least 1, the flushes should have taken the log under the
+    // limit, from the rounds of the compactor.
+    async fn check_for_backpressure(
+        &self,
+        collection_id: CollectionUuid,
+    ) -> Result<(), SqlitePushLogsError> {
+        let backpressure = Arc::clone(&self.backpressure.lock().unwrap());
+        if !backpressure.contains(&collection_id) {
+            return Ok(());
+        }
+        let records: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM segments
+            INNER JOIN embeddings_queue   ON embeddings_queue.topic = CONCAT('persistent://', ?, '/', ?, '/', segments.collection)
+            LEFT JOIN max_seq_id          ON max_seq_id.segment_id  = segments.id
+            WHERE segments.type = ?
+            AND segments.collection = ?
+            AND embeddings_queue.seq_id > COALESCE(CAST(max_seq_id.seq_id AS INTEGER), 0)
+            "#,
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.topic_namespace)
+        .bind(String::from(SegmentType::Spann))
+        .bind(collection_id.0.to_string())
+        .fetch_one(self.db.get_conn())
+        .await
+        .map_err(WrappedSqlxError)?;
+        if records as u64 >= self.num_records_before_backpressure {
+            let until_under = match *self.compaction_rounds.lock().unwrap() {
+                Some(rounds) => {
+                    rounds.until_under(records as u64, self.num_records_before_backpressure)
+                }
+                None => Duration::ZERO,
+            };
+            return Err(SqlitePushLogsError::BackoffCompaction {
+                retry_after: (until_under.as_secs_f64().ceil() as u64).max(1),
+            });
+        }
+        Ok(())
     }
 
     #[allow(clippy::result_large_err)]
@@ -260,71 +394,77 @@ impl SqliteLog {
 
         let mut records = Vec::new();
         while let Some(row) = logs.try_next().await.map_err(WrappedSqlxError)? {
-            let log_offset: i64 = row.get("seq_id");
-            let id: String = row.get("id");
-            let embedding_bytes = row.get::<Option<&[u8]>, _>("vector");
-            let encoding = row
-                .get::<Option<&str>, _>("encoding")
-                .map(ScalarEncoding::try_from)
-                .transpose()?;
-            let metadata_str = row.get::<Option<&str>, _>("metadata");
-
-            // Parse embedding
-            let embedding = embedding_bytes
-                .map(
-                    |embedding_bytes| -> Result<Option<_>, SqlitePullLogsError> {
-                        match encoding {
-                            Some(ScalarEncoding::FLOAT32) => {
-                                let slice: &[f32] = bytemuck::try_cast_slice(embedding_bytes)
-                                    .map_err(SqlitePullLogsError::InvalidEmbedding)?;
-                                Ok(Some(slice.to_vec()))
-                            }
-                            Some(ScalarEncoding::INT32) => {
-                                unimplemented!()
-                            }
-                            None => Ok(None),
-                        }
-                    },
-                )
-                .transpose()?
-                .flatten();
-
-            // Parse metadata
-            let parsed_metadata_and_document: Option<(UpdateMetadata, Option<String>)> =
-                metadata_str
-                    .map(|metadata_str| {
-                        let mut parsed: UpdateMetadata = serde_json::from_str(metadata_str)?;
-
-                        let document = match parsed.remove("chroma:document") {
-                            Some(UpdateMetadataValue::Str(document)) => Some(document),
-                            None => None,
-                            _ => panic!("Document not found in metadata"),
-                        };
-
-                        Ok::<_, SqlitePullLogsError>((parsed, document))
-                    })
-                    .transpose()?;
-            let document = parsed_metadata_and_document
-                .as_ref()
-                .and_then(|(_, document)| document.clone());
-            let metadata = parsed_metadata_and_document.map(|(metadata, _)| metadata);
-
-            let operation = operation_from_code(row.get("operation"));
-
-            records.push(LogRecord {
-                log_offset,
-                record: OperationRecord {
-                    id,
-                    embedding,
-                    encoding,
-                    metadata,
-                    document,
-                    operation,
-                },
-            });
+            records.push(log_record(&row)?);
         }
 
         Ok(records)
+    }
+
+    /// The records of the log of a collection after the position `after` and up to `up_to`, read on the connection given:
+    /// a read of the log in the snapshot of another read, which sees the log at the same moment as the rest of SQLite.
+    /// The first record read is the one after `after`, as the fetch of the log of distributed Chroma reads from the log
+    /// position of a collection plus one (rust/worker/src/execution/operators/fetch_log.rs). With a limit, at most that
+    /// many records, the first ones, as the fetch of distributed Chroma with its maximum_fetch_count: the positions of
+    /// the log of the single node are shared by every collection, so the limit counts the records of the collection.
+    pub async fn read_tail(
+        &self,
+        connection: &mut SqliteConnection,
+        collection_id: CollectionUuid,
+        after: i64,
+        up_to: i64,
+        limit: Option<u32>,
+    ) -> Result<Vec<LogRecord>, SqlitePullLogsError> {
+        let topic =
+            get_embeddings_queue_topic_name(&self.tenant_id, &self.topic_namespace, collection_id);
+        // A negative LIMIT is no limit in SQLite.
+        let mut logs = sqlx::query(
+            r#"
+            SELECT
+              seq_id,
+              id,
+              operation,
+              vector,
+              encoding,
+              metadata
+            FROM embeddings_queue
+            WHERE topic = ?
+            AND seq_id > ?
+            AND seq_id <= ?
+            ORDER BY seq_id ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(topic)
+        .bind(after)
+        .bind(up_to)
+        .bind(limit.map_or(-1, i64::from))
+        .fetch(&mut *connection);
+        let mut records = Vec::new();
+        while let Some(row) = logs.try_next().await.map_err(WrappedSqlxError)? {
+            records.push(log_record(&row)?);
+        }
+        Ok(records)
+    }
+
+    /// The number of records in the log of a collection after the position `after`, counted on the connection given, as
+    /// read_tail reads them, up to the last one written.
+    pub async fn count_tail(
+        &self,
+        connection: &mut SqliteConnection,
+        collection_id: CollectionUuid,
+        after: i64,
+    ) -> Result<u64, SqlitePullLogsError> {
+        let topic =
+            get_embeddings_queue_topic_name(&self.tenant_id, &self.topic_namespace, collection_id);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM embeddings_queue WHERE topic = ? AND seq_id > ?",
+        )
+        .bind(topic)
+        .bind(after)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(WrappedSqlxError)?;
+        Ok(count as u64)
     }
 
     pub(super) async fn push_logs(
@@ -335,6 +475,7 @@ impl SqliteLog {
         if records.is_empty() {
             return Ok(());
         }
+        self.check_for_backpressure(collection_id).await?;
 
         let topic =
             get_embeddings_queue_topic_name(&self.tenant_id, &self.topic_namespace, collection_id);
@@ -458,6 +599,62 @@ impl SqliteLog {
         }
 
         Ok(infos)
+    }
+
+    /// The SPANN collections to flush, oldest first, as the log service of distributed Chroma picks the collections to
+    /// compact (rust/log-service/src/lib.rs, should_compact_at): those whose log holds at least min_compaction_size
+    /// records after the last flush of their SPANN segment, or whose oldest such record has waited at least the timeout.
+    /// The third rule of the log service, a log marked dirty again reinsert_threshold times, has no counterpart here:
+    /// it counts how often wal3 marks the log of a collection dirty again, which this log does not record, and since
+    /// every write carries at least one record, its default of 10 marks means at least 10 records anyway.
+    /// From the same counts, as the log service sets its backpressure from the summaries of the logs it compacts, the
+    /// collections whose log holds at least num_records_before_backpressure records become those under backpressure.
+    pub async fn get_spann_collections_to_compact(
+        &mut self,
+        min_compaction_size: u64,
+        timeout: Duration,
+    ) -> Result<Vec<CollectionUuid>, SqliteGetCollectionsWithNewDataError> {
+        let mut results = sqlx::query(
+            r#"
+            SELECT
+                segments.collection AS collection_id,
+                COUNT(*) >= ? OR MIN(embeddings_queue.created_at) <= datetime('now', ?) AS to_compact,
+                COUNT(*) >= ? AS too_full
+            FROM segments
+            INNER JOIN embeddings_queue   ON embeddings_queue.topic = CONCAT('persistent://', ?, '/', ?, '/', segments.collection)
+            LEFT JOIN max_seq_id          ON max_seq_id.segment_id  = segments.id
+            WHERE segments.type = ?
+            AND embeddings_queue.seq_id > COALESCE(CAST(max_seq_id.seq_id AS INTEGER), 0)
+            GROUP BY
+                segments.collection
+            HAVING
+                to_compact
+                OR too_full
+            ORDER BY MIN(embeddings_queue.created_at) ASC
+            "#,
+        )
+        .bind(min_compaction_size as i64) // (SQLite doesn't support u64)
+        .bind(format!("-{} seconds", timeout.as_secs()))
+        .bind(self.num_records_before_backpressure as i64)
+        .bind(&self.tenant_id)
+        .bind(&self.topic_namespace)
+        .bind(String::from(SegmentType::Spann))
+        .fetch(self.db.get_conn());
+
+        let mut collections = Vec::new();
+        let mut too_full = HashSet::new();
+        while let Some(row) = results.try_next().await.map_err(WrappedSqlxError)? {
+            let collection_id = CollectionUuid::from_str(row.get::<&str, _>("collection_id"))?;
+            if row.get::<bool, _>("too_full") {
+                too_full.insert(collection_id);
+            }
+            if row.get::<bool, _>("to_compact") {
+                collections.push(collection_id);
+            }
+        }
+        self.set_backpressure(too_full);
+
+        Ok(collections)
     }
 
     pub async fn update_collection_log_offset(
@@ -653,6 +850,71 @@ impl ChromaError for SqliteGetMaxBatchSizeError {
     }
 }
 
+// A record of the log from its row of embeddings_queue.
+fn log_record(row: &SqliteRow) -> Result<LogRecord, SqlitePullLogsError> {
+    let log_offset: i64 = row.get("seq_id");
+    let id: String = row.get("id");
+    let embedding_bytes = row.get::<Option<&[u8]>, _>("vector");
+    let encoding = row
+        .get::<Option<&str>, _>("encoding")
+        .map(ScalarEncoding::try_from)
+        .transpose()?;
+    let metadata_str = row.get::<Option<&str>, _>("metadata");
+
+    // Parse embedding
+    let embedding = embedding_bytes
+        .map(
+            |embedding_bytes| -> Result<Option<_>, SqlitePullLogsError> {
+                match encoding {
+                    Some(ScalarEncoding::FLOAT32) => {
+                        let slice: &[f32] = bytemuck::try_cast_slice(embedding_bytes)
+                            .map_err(SqlitePullLogsError::InvalidEmbedding)?;
+                        Ok(Some(slice.to_vec()))
+                    }
+                    Some(ScalarEncoding::INT32) => {
+                        unimplemented!()
+                    }
+                    None => Ok(None),
+                }
+            },
+        )
+        .transpose()?
+        .flatten();
+
+    // Parse metadata
+    let parsed_metadata_and_document: Option<(UpdateMetadata, Option<String>)> = metadata_str
+        .map(|metadata_str| {
+            let mut parsed: UpdateMetadata = serde_json::from_str(metadata_str)?;
+
+            let document = match parsed.remove("chroma:document") {
+                Some(UpdateMetadataValue::Str(document)) => Some(document),
+                None => None,
+                _ => panic!("Document not found in metadata"),
+            };
+
+            Ok::<_, SqlitePullLogsError>((parsed, document))
+        })
+        .transpose()?;
+    let document = parsed_metadata_and_document
+        .as_ref()
+        .and_then(|(_, document)| document.clone());
+    let metadata = parsed_metadata_and_document.map(|(metadata, _)| metadata);
+
+    let operation = operation_from_code(row.get("operation"));
+
+    Ok(LogRecord {
+        log_offset,
+        record: OperationRecord {
+            id,
+            embedding,
+            encoding,
+            metadata,
+            document,
+            operation,
+        },
+    })
+}
+
 fn operation_from_code(code: u32) -> Operation {
     // chromadb/db/mixins/embeddings_queue.py
     match code {
@@ -686,7 +948,8 @@ impl Configurable<SqliteLogConfig> for SqliteLog {
             sqlite_db,
             config.tenant_id.clone(),
             config.topic_namespace.clone(),
-        );
+        )
+        .with_num_records_before_backpressure(config.num_records_before_backpressure);
 
         // This populates the legacy config if not present (when upgrading from an old version)
         log.get_legacy_embeddings_queue_config()
@@ -713,6 +976,7 @@ mod tests {
                 url: new_test_db_persist_path(),
                 migration_mode: chroma_sqlite::config::MigrationMode::Apply,
                 hash_type: chroma_sqlite::config::MigrationHash::SHA256,
+                ..Default::default()
             },
             &Registry::new(),
         )
@@ -908,5 +1172,132 @@ mod tests {
                 }
             });
         }
+    }
+
+    // Records to add, one for each number.
+    fn adds(numbers: std::ops::Range<usize>) -> Vec<OperationRecord> {
+        numbers
+            .map(|i| OperationRecord {
+                id: format!("r{i}"),
+                embedding: Some(vec![i as f32, 1.0]),
+                encoding: Some(ScalarEncoding::FLOAT32),
+                metadata: None,
+                document: None,
+                operation: Operation::Add,
+            })
+            .collect()
+    }
+
+    // The tail of a collection starts after the position given and ends at the last one given, both positions of the log
+    // shared by every collection; with a limit, it takes that many records of the collection, the first ones. Its count
+    // goes to the last record written. The records of the other collections stay out.
+    #[tokio::test]
+    async fn the_tail_of_a_collection_is_between_its_positions() {
+        let mut log = setup_sqlite_log().await;
+        let collection = CollectionUuid::new();
+        let other = CollectionUuid::new();
+        // Positions 1 to 3 for the collection, 4 and 5 for the other, 6 and 7 for the collection.
+        log.push_logs(collection, adds(0..3)).await.unwrap();
+        log.push_logs(other, adds(0..2)).await.unwrap();
+        log.push_logs(collection, adds(3..5)).await.unwrap();
+        let mut connection = log.db.get_conn().acquire().await.unwrap();
+        for (up_to, limit, expected) in [
+            (6, None, vec![(3, "r2"), (6, "r3")]),
+            (7, Some(2), vec![(3, "r2"), (6, "r3")]),
+            (7, Some(5), vec![(3, "r2"), (6, "r3"), (7, "r4")]),
+            (7, Some(0), vec![]),
+        ] {
+            let tail = log
+                .read_tail(&mut connection, collection, 2, up_to, limit)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|record| (record.log_offset, record.record.id))
+                .collect::<Vec<_>>();
+            let expected = expected
+                .into_iter()
+                .map(|(offset, id)| (offset, id.to_string()))
+                .collect::<Vec<_>>();
+            assert_eq!(tail, expected, "up to {up_to}, limit {limit:?}");
+        }
+        assert_eq!(
+            log.count_tail(&mut connection, collection, 2)
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            log.count_tail(&mut connection, collection, 7)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(log.count_tail(&mut connection, other, 0).await.unwrap(), 2);
+    }
+
+    // A SPANN collection is to flush with at least min_compaction_size records after its last flush, or with the oldest of
+    // them waiting at least the timeout, as should_compact_at of the log service of distributed Chroma: the records up to
+    // its last flush do not count, nor do the collections of the other types of index.
+    #[tokio::test]
+    async fn the_spann_collections_to_compact_are_over_a_threshold() {
+        let mut log = setup_sqlite_log().await;
+        let day = Duration::from_secs(86_400);
+        let spann = CollectionUuid::new();
+        let hnsw = CollectionUuid::new();
+        let spann_segment = format!("{}-vector", spann.0);
+        sqlx::query(
+            "INSERT INTO segments (id, type, scope, collection) VALUES (?, ?, 'VECTOR', ?), (?, ?, 'VECTOR', ?)",
+        )
+        .bind(&spann_segment)
+        .bind(String::from(SegmentType::Spann))
+        .bind(spann.0.to_string())
+        .bind(format!("{}-vector", hnsw.0))
+        .bind(String::from(SegmentType::HnswLocalPersisted))
+        .bind(hnsw.0.to_string())
+        .execute(log.db.get_conn())
+        .await
+        .unwrap();
+        log.push_logs(spann, adds(0..3)).await.unwrap();
+        log.push_logs(hnsw, adds(0..5)).await.unwrap();
+        assert_eq!(
+            log.get_spann_collections_to_compact(3, day).await.unwrap(),
+            vec![spann]
+        );
+        assert!(log
+            .get_spann_collections_to_compact(4, day)
+            .await
+            .unwrap()
+            .is_empty());
+        // A flush up to the second record leaves the third after it.
+        sqlx::query("INSERT INTO max_seq_id (segment_id, seq_id) VALUES (?, 2)")
+            .bind(&spann_segment)
+            .execute(log.db.get_conn())
+            .await
+            .unwrap();
+        assert!(log
+            .get_spann_collections_to_compact(2, day)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            log.get_spann_collections_to_compact(1, day).await.unwrap(),
+            vec![spann]
+        );
+        // The third record waited a day.
+        sqlx::query(
+            "UPDATE embeddings_queue SET created_at = datetime('now', '-1 day', '-1 minute')",
+        )
+        .execute(log.db.get_conn())
+        .await
+        .unwrap();
+        assert_eq!(
+            log.get_spann_collections_to_compact(10, day).await.unwrap(),
+            vec![spann]
+        );
+        assert!(log
+            .get_spann_collections_to_compact(10, day * 2)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

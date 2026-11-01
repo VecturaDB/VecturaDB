@@ -3,7 +3,7 @@ use crate::{
     executor::config::{ExecutorConfig, LocalExecutorConfig},
     CollectionsWithSegmentsProviderConfig,
 };
-use chroma_log::config::LogConfig;
+use chroma_log::{config::LogConfig, LocalCompactionManagerConfig};
 use chroma_segment::local_segment_manager::LocalSegmentManagerConfig;
 use chroma_sqlite::config::SqliteDBConfig;
 use chroma_sysdb::{GrpcSysDbConfig, SysDbConfig};
@@ -61,6 +61,9 @@ pub struct FrontendConfig {
     pub collections_with_segments_provider: CollectionsWithSegmentsProviderConfig,
     #[serde(default = "default_log_config")]
     pub log: LogConfig,
+    /// When the SPANN collections of the single node flush their log to their files.
+    #[serde(default)]
+    pub local_compaction_manager: LocalCompactionManagerConfig,
     #[serde(default = "default_executor_config")]
     pub executor: ExecutorConfig,
     #[serde(default = "default_default_knn_index")]
@@ -100,6 +103,7 @@ impl FrontendConfig {
             collections_with_segments_provider: Default::default(),
             mcmr_sysdb: None,
             log: default_log_config(),
+            local_compaction_manager: Default::default(),
             executor: default_executor_config(),
             default_knn_index: default_default_knn_index(),
             tenants_to_migrate_immediately: vec![],
@@ -297,6 +301,33 @@ mod tests {
             }
             ExecutorConfig::Local(_) => panic!("Expected distributed executor config"),
         }
+    }
+
+    // The timer of the flushes of SPANN collections reads local_compaction_manager, with the defaults of distributed
+    // Chroma for what it leaves out.
+    #[test]
+    fn local_compaction_manager_takes_the_defaults_of_distributed_chroma() {
+        use figment::providers::{Format, Yaml};
+        let read = |yaml: &str| {
+            let config = figment::Figment::from(Yaml::string(yaml))
+                .extract::<super::FrontendConfig>()
+                .unwrap()
+                .local_compaction_manager;
+            (
+                config.compaction_interval_sec,
+                config.min_compaction_size,
+                config.max_compaction_size,
+                config.timeout_us,
+            )
+        };
+        assert_eq!(
+            read("allow_reset: false\n"),
+            (10, 10, 10_000, 86_400_000_000)
+        );
+        assert_eq!(
+            read("local_compaction_manager:\n  compaction_interval_sec: 30\n  max_compaction_size: 500\n"),
+            (30, 10, 500, 86_400_000_000)
+        );
     }
 
     #[test]

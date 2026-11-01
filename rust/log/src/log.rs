@@ -1,6 +1,7 @@
+// Changed from the original Chroma file; see the git history for the changes and their authors.
 use crate::grpc_log::{GrpcLog, GrpcPushLogsError, GrpcSealLogError, ScoutLogFragmentsResponse};
 use crate::in_memory_log::InMemoryLog;
-use crate::sqlite_log::SqliteLog;
+use crate::sqlite_log::{SqliteLog, SqlitePushLogsError};
 use crate::types::CollectionInfo;
 use chroma_api_types::CONDITIONAL_WRITE_CONFLICT_MESSAGE;
 use chroma_error::{ChromaError, ErrorCodes};
@@ -50,11 +51,12 @@ pub enum PushLogsError {
     /// Backoff due to write batching pressure.
     #[error("log is under write batching pressure; please backoff exponentially and retry")]
     Backoff,
-    /// Backoff because the log needs compaction.
+    /// Backoff because the log needs compaction, with the seconds after which the log of the single node expects to take
+    /// the write; the log service of distributed Chroma gives none.
     #[error(
         "log needs compaction before accepting more writes; please backoff exponentially and retry"
     )]
-    BackoffCompaction,
+    BackoffCompaction { retry_after: Option<u64> },
     /// Conditional writes are not supported by this log implementation.
     #[error("conditional writes are not supported by {0} log")]
     ConditionalWritesUnsupported(&'static str),
@@ -73,11 +75,18 @@ impl ChromaError for PushLogsError {
     fn code(&self) -> ErrorCodes {
         match self {
             PushLogsError::Backoff => ErrorCodes::ResourceExhausted,
-            PushLogsError::BackoffCompaction => ErrorCodes::ResourceExhausted,
+            PushLogsError::BackoffCompaction { .. } => ErrorCodes::ResourceExhausted,
             PushLogsError::ConditionalWritesUnsupported(_) => ErrorCodes::Unimplemented,
             PushLogsError::ConditionalWriteConflict => ErrorCodes::AlreadyExists,
             PushLogsError::RecordCountOutOfRange(_) => ErrorCodes::InvalidArgument,
             PushLogsError::Other(e) => e.code(),
+        }
+    }
+
+    fn retry_after(&self) -> Option<u64> {
+        match self {
+            PushLogsError::BackoffCompaction { retry_after } => *retry_after,
+            _ => None,
         }
     }
 }
@@ -86,7 +95,9 @@ impl From<GrpcPushLogsError> for PushLogsError {
     fn from(err: GrpcPushLogsError) -> Self {
         match err {
             GrpcPushLogsError::Backoff => PushLogsError::Backoff,
-            GrpcPushLogsError::BackoffCompaction => PushLogsError::BackoffCompaction,
+            GrpcPushLogsError::BackoffCompaction => {
+                PushLogsError::BackoffCompaction { retry_after: None }
+            }
             GrpcPushLogsError::FailedToPushLogs(status)
                 if status.code() == tonic::Code::Aborted
                     && status.message() == CONDITIONAL_WRITE_CONFLICT_MESSAGE =>
@@ -246,9 +257,17 @@ impl Log {
                 if condition.is_some() {
                     return Err(PushLogsError::ConditionalWritesUnsupported("sqlite"));
                 }
+                // A log too full answers as the log service of distributed Chroma, through the frontend.
                 log.push_logs(collection_id, records)
                     .await
-                    .map_err(|e| PushLogsError::Other(Box::new(e)))?;
+                    .map_err(|e| match e {
+                        SqlitePushLogsError::BackoffCompaction { retry_after } => {
+                            PushLogsError::BackoffCompaction {
+                                retry_after: Some(retry_after),
+                            }
+                        }
+                        other => PushLogsError::Other(Box::new(other)),
+                    })?;
                 Ok(PushLogsResult {
                     record_count,
                     first_inserted_record_offset: None,

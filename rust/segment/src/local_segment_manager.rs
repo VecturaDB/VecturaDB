@@ -69,6 +69,8 @@ pub struct LocalSegmentManager {
     sqlite: SqliteDb,
     persist_root: Option<String>,
     spann_provider: Option<SpannProvider>,
+    // The providers of the local compactor: see compaction_spann_provider.
+    compaction_spann_provider: Option<SpannProvider>,
     // The SPANN collections whose log is applied: see spann_applied.
     spann_applied: Arc<std::sync::Mutex<HashSet<CollectionUuid>>>,
     // What runs after each flush of a SPANN collection: see on_spann_flushed.
@@ -311,6 +313,19 @@ impl Configurable<LocalSegmentManagerConfig> for LocalSegmentManager {
             Some(persist_path) => Some(local_spann_provider(persist_path, registry).await?),
             None => None,
         };
+        // The compactor forks the HNSW index of the centers with a provider of its own, so that a reader does not find
+        // the fork in its cache; the blocks it reads and writes go through the block cache of the readers, as one more
+        // copy of every block in memory held twice as much as 1.0.0-preview.4.
+        let compaction_spann_provider = match &config.persist_path {
+            Some(persist_path) => {
+                let mut provider = local_spann_provider(persist_path, registry).await?;
+                if let Some(readers) = &spann_provider {
+                    provider.blockfile_provider = readers.blockfile_provider.clone();
+                }
+                Some(provider)
+            }
+            None => None,
+        };
         let mut res = Self {
             hnsw_index_pool: hnsw_index_pool.into(),
             live_indexes: AysncPartitionedMutex::with_parallelism(16, HashMap::new()),
@@ -319,6 +334,7 @@ impl Configurable<LocalSegmentManagerConfig> for LocalSegmentManager {
             sqlite: sqldb,
             persist_root: config.persist_path.clone(),
             spann_provider,
+            compaction_spann_provider,
             spann_applied: Arc::default(),
             spann_flushed: SpannFlushListener::default(),
         };
@@ -458,9 +474,19 @@ impl LocalSegmentManager {
         self.spann_provider.as_ref()
     }
 
-    /// Whether the log of a SPANN collection is applied, as replay_complete for a local HNSW index: the compaction
-    /// clears it when it starts on the log of the collection and sets it once the records are in SQLite and in the files
-    /// of a flush. A read of a collection whose log is applied has nothing to replay. None is applied after a start.
+    /// The providers with which the local compactor writes SPANN segments: on the same data path, with caches of their
+    /// own, as the compaction service of distributed Chroma runs apart from its query service. A flush forks the HNSW
+    /// index of the centers and holds its write lock while it changes it; in the cache of the readers the fork would
+    /// sit under the key of the collection, where a reader takes its read lock before it sees that the index is
+    /// another one (HnswIndexProvider::get), and waits for the flush.
+    pub fn compaction_spann_provider(&self) -> Option<&SpannProvider> {
+        self.compaction_spann_provider.as_ref()
+    }
+
+    /// Whether the log of a SPANN collection is applied to its metadata, as replay_complete for a local HNSW index: the
+    /// compaction clears it when it starts on the log of the collection and sets it once the records are in SQLite. The
+    /// files take them at a later flush. A read of a collection whose log is applied has nothing to replay. None is
+    /// applied after a start.
     pub fn spann_applied(&self, collection_id: CollectionUuid) -> bool {
         self.spann_applied
             .lock()
@@ -1120,6 +1146,130 @@ mod tests {
                 }
             }
         }
+    }
+
+    // A flush forks the HNSW index of the centers of its collection with the providers of the compactor, and holds the
+    // write lock of the fork while it changes it. A reader that opens the collection meanwhile, with the providers of
+    // the readers, answers at once: with one provider for both it would find the fork under the key of the collection,
+    // wait on its lock, and only then see that the index is another one. The test holds the lock across the wait for the
+    // reader on purpose, as the flush holds it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_opens_a_collection_while_a_flush_holds_its_fork() {
+        use crate::{
+            blockfile_record::RecordSegmentReaderOptions,
+            distributed_spann::SpannSegmentReaderShard, types::materialize_logs,
+        };
+        use chroma_types::{
+            InternalCollectionConfiguration, InternalSpannConfiguration, SegmentShard,
+            VectorIndexConfiguration, HNSW_PATH,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        registry.register(get_new_sqlite_db().await);
+        let manager = LocalSegmentManager::try_from_config(
+            &LocalSegmentManagerConfig {
+                hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
+                persist_path: Some(root.path().to_str().unwrap().to_string()),
+            },
+            &registry,
+        )
+        .await
+        .unwrap();
+        let mut collection = Collection {
+            config: InternalCollectionConfiguration {
+                vector_index: VectorIndexConfiguration::Spann(InternalSpannConfiguration::default()),
+                embedding_function: None,
+            },
+            ..Collection::test_collection(3)
+        };
+        collection.schema = Some(Schema::try_from(&collection.config).unwrap());
+        let mut segment = Segment {
+            id: SegmentUuid::new(),
+            r#type: SegmentType::Spann,
+            scope: SegmentScope::VECTOR,
+            collection: collection.collection_id,
+            metadata: None,
+            file_path: HashMap::new(),
+        };
+        let compactor = manager.compaction_spann_provider().unwrap();
+        let writer = compactor
+            .write(
+                &collection,
+                &SegmentShard::try_from((&segment, 0)).unwrap(),
+                3,
+                None,
+            )
+            .await
+            .unwrap();
+        let logs = Chunk::new(
+            vec![LogRecord {
+                log_offset: 1,
+                record: OperationRecord {
+                    id: "a".to_string(),
+                    embedding: Some(vec![1.0, 2.0, 3.0]),
+                    encoding: None,
+                    metadata: None,
+                    document: None,
+                    operation: Operation::Add,
+                },
+            }]
+            .into(),
+        );
+        let materialized =
+            materialize_logs(&None, logs, None, &RecordSegmentReaderOptions::default())
+                .await
+                .unwrap();
+        writer
+            .apply_materialized_log_chunk(&None, &materialized)
+            .await
+            .unwrap();
+        segment.file_path = writer.commit().await.unwrap().flush().await.unwrap();
+
+        // The next flush, as SpannIndexWriter forks the index of the centers, stopped with the lock of the fork held.
+        let (prefix, id) =
+            Segment::extract_prefix_and_id(&segment.file_path.get(HNSW_PATH).unwrap()[0]).unwrap();
+        let config = collection
+            .schema
+            .as_ref()
+            .unwrap()
+            .get_internal_spann_config()
+            .unwrap();
+        let fork = compactor
+            .hnsw_provider
+            .fork(
+                &IndexUuid(id),
+                &collection.collection_id,
+                3,
+                config.space.into(),
+                config.ef_search,
+                prefix,
+            )
+            .await
+            .unwrap();
+        let held = fork.inner.write();
+
+        let readers = manager.spann_provider().unwrap().clone();
+        let (reading_collection, reading_segment) = (collection.clone(), segment.clone());
+        let reading = tokio::spawn(async move {
+            SpannSegmentReaderShard::from_segment(
+                &reading_collection,
+                &SegmentShard::try_from((&reading_segment, 0)).unwrap(),
+                &readers.blockfile_provider,
+                &readers.hnsw_provider,
+                3,
+                true,
+            )
+            .await
+            .map(|_| ())
+        });
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(5), reading).await;
+        drop(held);
+        assert!(
+            matches!(opened, Ok(Ok(Ok(())))),
+            "the reader waited for the flush: {opened:?}"
+        );
     }
 
     #[tokio::test]

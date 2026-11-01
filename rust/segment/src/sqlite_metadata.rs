@@ -33,7 +33,7 @@ use sea_query::{
     SimpleExpr, SqliteQueryBuilder, UpdateStatement,
 };
 use sea_query_binder::SqlxBinder;
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 use thiserror::Error;
 
 const SUBQ_ALIAS: &str = "filter_limit_subq";
@@ -206,6 +206,31 @@ impl MetadataSnapshot {
             );
         }
         Ok(files)
+    }
+
+    /// The position in the log of the last record applied to a segment, in the snapshot: see
+    /// SqliteMetadataReader::current_max_seq_id.
+    pub async fn max_seq_id(
+        &mut self,
+        segment_id: &SegmentUuid,
+    ) -> Result<u64, SqliteMetadataError> {
+        let (sql, values) = Query::select()
+            .column(MaxSeqId::SeqId)
+            .from(MaxSeqId::Table)
+            .and_where(Expr::col(MaxSeqId::SegmentId).eq(segment_id.to_string()))
+            .build_sqlx(SqliteQueryBuilder);
+        let row_opt = sqlx::query_with(&sql, values)
+            .fetch_optional(&mut *self.tx)
+            .await?;
+        Ok(row_opt
+            .map(|row| row.try_get::<u64, _>(0))
+            .transpose()?
+            .unwrap_or_default())
+    }
+
+    /// The connection of the snapshot, for the reads of other crates that must see the same moment, as those of the log.
+    pub fn connection(&mut self) -> &mut SqliteConnection {
+        &mut self.tx
     }
 }
 
@@ -3237,6 +3262,7 @@ mod tests {
                 url: None,
                 hash_type: MigrationHash::MD5,
                 migration_mode: MigrationMode::Apply,
+                ..Default::default()
             },
             &Registry::new(),
         )
@@ -3444,7 +3470,7 @@ mod tests {
         let logs = (0..1200)
             .map(|i| {
                 let mut log = sparse_log(
-                    i as i64 + 1,
+                    i + 1,
                     &format!("r{i}"),
                     Operation::Add,
                     Some(UpdateMetadataValue::SparseVector(
@@ -3488,9 +3514,9 @@ mod tests {
         }
     }
 
-    // Every query of a get runs in one read transaction: stopped after its first query, the get still holds SQLite, so that
-    // a write from another connection cannot commit before the get ends (with no busy timeout it fails at once), and the
-    // get answers the records of the moment it started, its sparse vectors included.
+    // Every query of a get runs in one read transaction: stopped after its first query, the get answers the records of
+    // the moment it started, its sparse vectors included, though a write from another connection commits meanwhile
+    // (in WAL a write does not wait for a read).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_runs_its_queries_in_one_read_transaction() {
         let mut log = sparse_log(1, "r0", Operation::Add, Some(sparse_value(1.0)));
@@ -3522,9 +3548,11 @@ mod tests {
             .await;
         let _ = go_on.send(());
         let records = get.await.unwrap().unwrap().result.records;
+        // In WAL the write commits while the get is stopped in its read transaction; the get still answers the record
+        // as its transaction saw it before the write.
         assert!(
-            write.is_err(),
-            "a write committed while the get was stopped: {write:?}"
+            write.is_ok(),
+            "a write did not commit while the get was stopped: {write:?}"
         );
         let metadata = records[0].metadata.as_ref().unwrap();
         assert_eq!(metadata.get("i"), Some(&MetadataValue::Int(0)));

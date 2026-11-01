@@ -47,6 +47,8 @@ pub(crate) struct Bindings {
     system: System,
     sqlite_db: SqliteDb,
     compactor_handle: ComponentHandle<LocalCompactionManager>,
+    // The manager as the registry keeps it, whose work out of the actor a close waits for.
+    compactor: LocalCompactionManager,
     frontend: Frontend,
     closed: bool,
 }
@@ -476,6 +478,8 @@ impl Bindings {
         let log_config = LogConfig::Sqlite(SqliteLogConfig {
             tenant_id: "default".to_string(),
             topic_namespace: "default".to_string(),
+            num_records_before_backpressure:
+                SqliteLogConfig::default_num_records_before_backpressure(),
         });
 
         let collection_cache_config = CollectionsWithSegmentsProviderConfig {
@@ -499,6 +503,7 @@ impl Bindings {
             mcmr_sysdb: None,
             collections_with_segments_provider: collection_cache_config,
             log: log_config,
+            local_compaction_manager: Default::default(),
             executor: executor_config,
             default_knn_index: knn_index,
             tenants_to_migrate_immediately: vec![],
@@ -518,12 +523,14 @@ impl Bindings {
         })?;
         let sqlite_db = registry.get::<SqliteDb>()?;
         let compactor_handle = registry.get::<ComponentHandle<LocalCompactionManager>>()?;
+        let compactor = registry.get::<LocalCompactionManager>()?;
 
         Ok(Bindings {
             runtime,
             system,
             sqlite_db,
             compactor_handle,
+            compactor,
             frontend,
             closed: false,
         })
@@ -1492,11 +1499,19 @@ impl Bindings {
         self.closed = true;
         self.compactor_handle.stop();
 
+        // A graceful stop: the actor stops taking work, then the work out of it ends within the grace, and the database
+        // closes within what is left of it; past it the database closes anyway, as SqliteDb::close_within says.
+        let grace = self.compactor.shutdown_grace();
         self.runtime.block_on(async {
+            let started = std::time::Instant::now();
             let _ = self.compactor_handle.join().await;
+            // Past the grace the flushes still running are left: the database closes anyway below.
+            let _ = self.compactor.drain(grace).await;
             self.system.stop().await;
             self.system.join().await;
-            self.sqlite_db.close().await;
+            self.sqlite_db
+                .close_within(grace.saturating_sub(started.elapsed()))
+                .await;
         });
     }
 }
@@ -1529,6 +1544,7 @@ mod tests {
             url: Some(sqlite_url),
             hash_type: MigrationHash::MD5,
             migration_mode: MigrationMode::Apply,
+            ..Default::default()
         };
         let bindings = Bindings::py_new(true, sqlite_db_config, 16, Some(persist_path))
             .expect("persistent bindings");

@@ -1476,6 +1476,13 @@ impl ChromaError for AddCollectionRecordsError {
             AddCollectionRecordsError::Other(err) => err.code(),
         }
     }
+
+    fn retry_after(&self) -> Option<u64> {
+        match self {
+            AddCollectionRecordsError::Other(err) => err.retry_after(),
+            _ => None,
+        }
+    }
 }
 
 ////////////////////////// UpdateCollectionRecords //////////////////////////
@@ -1569,6 +1576,13 @@ impl ChromaError for UpdateCollectionRecordsError {
             UpdateCollectionRecordsError::Backoff => ErrorCodes::ResourceExhausted,
             UpdateCollectionRecordsError::InvalidDatabaseName => ErrorCodes::InvalidArgument,
             UpdateCollectionRecordsError::Other(err) => err.code(),
+        }
+    }
+
+    fn retry_after(&self) -> Option<u64> {
+        match self {
+            UpdateCollectionRecordsError::Other(err) => err.retry_after(),
+            _ => None,
         }
     }
 }
@@ -1665,6 +1679,13 @@ impl ChromaError for UpsertCollectionRecordsError {
             UpsertCollectionRecordsError::Backoff => ErrorCodes::ResourceExhausted,
             UpsertCollectionRecordsError::InvalidDatabaseName => ErrorCodes::InvalidArgument,
             UpsertCollectionRecordsError::Other(err) => err.code(),
+        }
+    }
+
+    fn retry_after(&self) -> Option<u64> {
+        match self {
+            UpsertCollectionRecordsError::Other(err) => err.retry_after(),
+            _ => None,
         }
     }
 }
@@ -1775,6 +1796,13 @@ impl ChromaError for DeleteCollectionRecordsError {
             DeleteCollectionRecordsError::Backoff => ErrorCodes::ResourceExhausted,
             DeleteCollectionRecordsError::InvalidDatabaseName => ErrorCodes::InvalidArgument,
             DeleteCollectionRecordsError::Internal(err) => err.code(),
+        }
+    }
+
+    fn retry_after(&self) -> Option<u64> {
+        match self {
+            DeleteCollectionRecordsError::Internal(err) => err.retry_after(),
+            _ => None,
         }
     }
 }

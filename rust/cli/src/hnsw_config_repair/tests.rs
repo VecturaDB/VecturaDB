@@ -37,6 +37,13 @@ async fn stop(frontend: ServiceBasedFrontend, registry: Registry, system: System
     handle.join().await.unwrap();
     system.stop().await;
     system.join().await;
+    // As a normal stop of the server: in WAL, connections dropped without a close write the log back into the database
+    // file later, while the test reads it.
+    registry
+        .get::<chroma_sqlite::db::SqliteDb>()
+        .unwrap()
+        .close()
+        .await;
     drop(frontend);
     drop(registry);
 }
