@@ -284,18 +284,37 @@ async fn backfill_and_purge_error_matrix_logs_failures_and_retries() {
         let replay_attempts = u64::from(!pin_fails);
         assert_eq!(f.metrics.counts(), (replay_attempts, 1));
 
-        // Repair the failure and prove failed attempts remain eligible for retry.
+        // Repair the failure and prove failed attempts remain eligible for retry: the next write asks for the
+        // backfill and the purge again, as a read of a replayed instance no longer does.
         f.segments.collection.dimension = None;
         f.sysdb.add_collection(f.segments.collection.clone());
         sqlx::query("DROP TRIGGER IF EXISTS reject_purge")
             .execute(f.db.get_conn())
             .await
             .unwrap();
-        f.executor
-            .try_backfill_collection(&f.segments)
-            .await
+        let sqlite_log = SqliteLog::new(f.db.clone(), "default".into(), "default".into());
+        sqlite_log
+            .init_compactor_handle(f.executor.compactor_handle.clone())
             .unwrap();
-        assert_eq!(f.offsets().await, vec![3, 4]);
+        let mut log = Log::Sqlite(sqlite_log);
+        log.push_logs(
+            &f.segments.collection.tenant,
+            chroma_types::DatabaseName::new(f.segments.collection.database.clone()).unwrap(),
+            f.segments.collection.collection_id,
+            vec![OperationRecord {
+                id: "retry".into(),
+                embedding: Some(vec![5.0; 3]),
+                encoding: Some(chroma_types::ScalarEncoding::FLOAT32),
+                document: None,
+                metadata: None,
+                operation: Operation::Add,
+            }],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(f.offsets().await, vec![3, 4, 5]);
         assert_eq!(
             f.metrics.counts(),
             (replay_attempts + 1, if purge_fails { 2 } else { 1 })
@@ -343,6 +362,36 @@ async fn stopped_compactor_reports_request_failures() {
         output.contains("Failed to purge logs after backfill attempt"),
         "{output}"
     );
+    f.stop().await;
+}
+
+// As in Chroma 1.5.9, a read of an instance that has replayed its log does not reach the compactor: it waits behind no
+// backfill or purge of the writes. With the compactor stopped, the read still answers.
+#[tokio::test]
+async fn a_read_of_a_replayed_instance_does_not_wait_for_the_compactor() {
+    let mut f = Fixture::new().await;
+    f.segments.collection.dimension = Some(3);
+    f.sysdb.add_collection(f.segments.collection.clone());
+    // As in repeated_reads_skip_replay_and_inspection_but_eviction_replays_tail: the record with no vector would keep
+    // the replay from completing.
+    sqlx::query("DELETE FROM embeddings_queue WHERE seq_id = 4")
+        .execute(f.db.get_conn())
+        .await
+        .unwrap();
+    f.executor
+        .try_backfill_collection(&f.segments)
+        .await
+        .unwrap()
+        .unwrap();
+    f.executor.compactor_handle.stop();
+    f.executor.compactor_handle.join().await.unwrap();
+    f.compactor_joined = true;
+    let reader = f
+        .executor
+        .try_backfill_collection(&f.segments)
+        .await
+        .expect("a read of a replayed instance must not need the compactor");
+    assert!(reader.is_some());
     f.stop().await;
 }
 
