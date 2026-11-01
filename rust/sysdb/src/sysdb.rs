@@ -727,7 +727,26 @@ impl SysDb {
                 grpc.flush_compaction_and_attached_function(collections, attached_function_update)
                     .await
             }
-            SysDb::Sqlite(_) => todo!(),
+            SysDb::Sqlite(sqlite) => {
+                if !collections.is_empty() {
+                    return Err(FlushCompactionError::FailedToFlushCompaction(
+                        tonic::Status::unimplemented(
+                            "the single node writes the output of an attached function to the log of its output collection",
+                        ),
+                    ));
+                }
+                sqlite
+                    .update_attached_function_completion_offset(
+                        attached_function_update.attached_function_id,
+                        attached_function_update.completion_offset,
+                    )
+                    .await
+                    .map_err(FlushCompactionError::FailedToFlushCompaction)?;
+                Ok(FlushCompactionAndAttachedFunctionResponse {
+                    collections: Vec::new(),
+                    completion_offset: attached_function_update.completion_offset,
+                })
+            }
             SysDb::Test(_) => todo!(),
         }
     }
