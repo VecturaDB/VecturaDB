@@ -3156,7 +3156,10 @@ impl SysDb {
                     .try_finish_async_attached_function_invocation(request)
                     .await
             }
-            SysDb::Sqlite(_) => unimplemented!(),
+            SysDb::Sqlite(sqlite) => sqlite
+                .try_finish_async_attached_function_invocation(request)
+                .await
+                .map(tonic::Response::new),
             SysDb::Test(test) => {
                 test.try_finish_async_attached_function_invocation(request)
                     .await
@@ -3170,9 +3173,15 @@ impl SysDb {
     ) -> Result<i32, tonic::Status> {
         match self {
             SysDb::Grpc(grpc) => grpc.fail_attached_function(request).await,
-            SysDb::Sqlite(_) => Err(tonic::Status::unimplemented(
-                "fail_attached_function is not supported for SqliteSysDb",
-            )),
+            SysDb::Sqlite(sqlite) => {
+                sqlite
+                    .change_attached_function_failure_count(
+                        &request.attached_function_id,
+                        &request.collection_id,
+                        None,
+                    )
+                    .await
+            }
             SysDb::Test(test) => test.fail_attached_function(request).await,
         }
     }
@@ -3183,9 +3192,15 @@ impl SysDb {
     ) -> Result<i32, tonic::Status> {
         match self {
             SysDb::Grpc(grpc) => grpc.set_attached_function_failure_count(request).await,
-            SysDb::Sqlite(_) => Err(tonic::Status::unimplemented(
-                "set_attached_function_failure_count is not supported for SqliteSysDb",
-            )),
+            SysDb::Sqlite(sqlite) => {
+                sqlite
+                    .change_attached_function_failure_count(
+                        &request.attached_function_id,
+                        &request.collection_id,
+                        Some(request.failure_count),
+                    )
+                    .await
+            }
             SysDb::Test(test) => test.set_attached_function_failure_count(request).await,
         }
     }
@@ -3199,7 +3214,10 @@ impl SysDb {
     > {
         match self {
             SysDb::Grpc(grpc) => grpc.client.clone().check_invocation_status(request).await,
-            SysDb::Sqlite(_) => unimplemented!(),
+            SysDb::Sqlite(sqlite) => sqlite
+                .check_invocation_status(request)
+                .await
+                .map(tonic::Response::new),
             SysDb::Test(_) => unimplemented!(),
         }
     }
@@ -3215,7 +3233,11 @@ impl SysDb {
                 .finalize_async_attached_function_repair(request)
                 .await
                 .map(|_| ()),
-            SysDb::Sqlite(_) => unimplemented!(),
+            SysDb::Sqlite(sqlite) => {
+                sqlite
+                    .finalize_async_attached_function_repair(request)
+                    .await
+            }
             SysDb::Test(_) => unimplemented!(),
         }
     }

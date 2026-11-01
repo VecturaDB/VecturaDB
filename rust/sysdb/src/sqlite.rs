@@ -7,6 +7,7 @@ use chroma_error::{ChromaError, ErrorCodes, WrappedSqlxError};
 use chroma_sqlite::db::SqliteDb;
 use chroma_sqlite::helpers::{delete_metadata, get_embeddings_queue_topic_name, update_metadata};
 use chroma_sqlite::table;
+use chroma_types::chroma_proto;
 use chroma_types::{
     AttachedFunctionUuid, Collection, CollectionAndSegments, CollectionMetadataUpdate,
     CollectionUuid, CountForksError, CreateCollectionError, CreateCollectionResponse,
@@ -1450,6 +1451,195 @@ impl SqliteSysDb {
             return Err(tonic::Status::unknown(ERR_ATTACHED_FUNCTION_NOT_FOUND));
         }
         Ok(())
+    }
+
+    // TryFinishAsyncAttachedFunctionInvocation of the coordinator: the completion offset of an asynchronous function
+    // for one input, moved forward only, with heap_entry_pending set when it is behind the log position of the input,
+    // which a collection of the single node answers as the lowest max_seq_id of its segments.
+    pub(crate) async fn try_finish_async_attached_function_invocation(
+        &self,
+        request: chroma_proto::TryFinishAsyncAttachedFunctionInvocationRequest,
+    ) -> Result<chroma_proto::TryFinishAsyncAttachedFunctionInvocationResponse, tonic::Status> {
+        let id = Uuid::parse_str(&request.attached_function_id).map_err(|e| {
+            tonic::Status::invalid_argument(format!("invalid attached_function_id: {e}"))
+        })?;
+        let collection_id = CollectionUuid::from_str(&request.collection_id)
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid collection_id: {e}")))?;
+        let new_offset = request.new_completion_offset as i64;
+        let id_str = id.to_string();
+        let mut tx = self.db.get_conn().begin().await.map_err(internal)?;
+        self.db.begin_immediate(&mut *tx).await.map_err(internal)?;
+        let rows =
+            attached_function_rows(&mut tx, AttachedFunctionFilter::id(&id_str), true).await?;
+        if rows.is_empty() {
+            return Err(tonic::Status::not_found("attached function not found"));
+        }
+        let Some(row) = rows
+            .iter()
+            .find(|row| row.input_collection_id == request.collection_id)
+        else {
+            return Err(tonic::Status::not_found(
+                "attached function not found for collection",
+            ));
+        };
+        let functions = functions_by_id(&mut tx, std::slice::from_ref(row)).await?;
+        if !functions.get(&row.function_id).is_some_and(|f| f.is_async) {
+            return Err(tonic::Status::invalid_argument(
+                "attached function is not async",
+            ));
+        }
+        let log_position: Option<i64> = sqlx::query_scalar(
+            "SELECT (SELECT COALESCE(MIN(COALESCE(CAST(max_seq_id.seq_id AS INTEGER), 0)), 0) FROM segments \
+             LEFT JOIN max_seq_id ON max_seq_id.segment_id = segments.id WHERE segments.collection = collections.id) \
+             FROM collections WHERE id = $1",
+        )
+        .bind(collection_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?;
+        let Some(witnessed_log_offset) = log_position else {
+            return Err(tonic::Status::not_found("collection not found"));
+        };
+        // UpdateCompletionOffsetAndHeapEntry of the store: forward only, the failure count reset.
+        let updated = sqlx::query(
+            "UPDATE attached_functions SET completion_offset = $1, heap_entry_pending = ($1 < $2), failure_count = 0, \
+             updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+             WHERE id = $3 AND input_collection_id = $4 AND is_deleted = FALSE AND completion_offset <= $1",
+        )
+        .bind(new_offset)
+        .bind(witnessed_log_offset)
+        .bind(&id_str)
+        .bind(&request.collection_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+        if updated.rows_affected() == 0 {
+            return Err(tonic::Status::unknown(
+                "completion offset cannot move backwards",
+            ));
+        }
+        tx.commit().await.map_err(internal)?;
+        use chroma_proto::try_finish_async_attached_function_invocation_response::Result as FinishResult;
+        Ok(
+            chroma_proto::TryFinishAsyncAttachedFunctionInvocationResponse {
+                result: Some(if new_offset < witnessed_log_offset {
+                    FinishResult::NeedsRepair(chroma_proto::FinishAsyncNeedsRepair {
+                        current_collection_log_offset: witnessed_log_offset as u64,
+                    })
+                } else {
+                    FinishResult::Success(chroma_proto::FinishAsyncSuccess {
+                        updated_completion_offset: request.new_completion_offset,
+                    })
+                }),
+            },
+        )
+    }
+
+    // FailAttachedFunction (no count given: one more) and SetAttachedFunctionFailureCount (the count given) of the
+    // coordinator, with IncrementFailureCount and SetFailureCount of its store: the failure count of an asynchronous
+    // function for one input.
+    pub(crate) async fn change_attached_function_failure_count(
+        &self,
+        attached_function_id: &str,
+        collection_id: &str,
+        failure_count: Option<i32>,
+    ) -> Result<i32, tonic::Status> {
+        if failure_count.is_some_and(|count| count < 0) {
+            return Err(tonic::Status::invalid_argument(
+                "failure_count must be non-negative",
+            ));
+        }
+        let id = Uuid::parse_str(attached_function_id).map_err(|e| {
+            tonic::Status::invalid_argument(format!("invalid attached_function_id: {e}"))
+        })?;
+        CollectionUuid::from_str(collection_id)
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid collection_id: {e}")))?;
+        let updated: Option<i32> = sqlx::query_scalar(
+            "UPDATE attached_functions SET failure_count = COALESCE($1, failure_count + 1), \
+             updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+             WHERE id = $2 AND input_collection_id = $3 AND is_deleted = FALSE RETURNING failure_count",
+        )
+        .bind(failure_count)
+        .bind(id.to_string())
+        .bind(collection_id)
+        .fetch_optional(self.db.get_conn())
+        .await
+        .map_err(internal)?;
+        updated.ok_or_else(|| tonic::Status::not_found("attached function not found"))
+    }
+
+    // FinalizeAsyncAttachedFunctionRepair of the coordinator, with UpdateHeapEntryPending of its store:
+    // heap_entry_pending back to false.
+    pub(crate) async fn finalize_async_attached_function_repair(
+        &self,
+        request: chroma_proto::FinalizeAsyncAttachedFunctionRepairRequest,
+    ) -> Result<(), tonic::Status> {
+        let id = Uuid::parse_str(&request.attached_function_id).map_err(|e| {
+            tonic::Status::invalid_argument(format!("invalid attached_function_id: {e}"))
+        })?;
+        CollectionUuid::from_str(&request.collection_id)
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid collection_id: {e}")))?;
+        let updated = sqlx::query(
+            "UPDATE attached_functions SET heap_entry_pending = FALSE, \
+             updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+             WHERE id = $1 AND input_collection_id = $2 AND is_deleted = FALSE",
+        )
+        .bind(id.to_string())
+        .bind(&request.collection_id)
+        .execute(self.db.get_conn())
+        .await
+        .map_err(internal)?;
+        if updated.rows_affected() == 0 {
+            return Err(tonic::Status::unknown(ERR_ATTACHED_FUNCTION_NOT_FOUND));
+        }
+        Ok(())
+    }
+
+    // CheckInvocationStatus of the coordinator, with the query of its store: for each item, DONE when the attached
+    // function is gone or deleted, or past the offset given and not pending; NEEDS_REPAIR when past it and pending;
+    // NOT_DONE otherwise.
+    pub(crate) async fn check_invocation_status(
+        &self,
+        request: chroma_proto::CheckInvocationStatusRequest,
+    ) -> Result<chroma_proto::CheckInvocationStatusResponse, tonic::Status> {
+        let mut results = Vec::with_capacity(request.items.len());
+        for (index, item) in request.items.iter().enumerate() {
+            Uuid::parse_str(&item.function_id).map_err(|e| {
+                tonic::Status::invalid_argument(format!(
+                    "invalid function_id at index {index}: {e}"
+                ))
+            })?;
+            Uuid::parse_str(&item.input_collection_id).map_err(|e| {
+                tonic::Status::invalid_argument(format!(
+                    "invalid input_collection_id at index {index}: {e}"
+                ))
+            })?;
+            let row: Option<(bool, i64, bool)> = sqlx::query_as(
+                "SELECT is_deleted, completion_offset, heap_entry_pending FROM attached_functions \
+                 WHERE id = $1 AND input_collection_id = $2",
+            )
+            .bind(&item.function_id)
+            .bind(&item.input_collection_id)
+            .fetch_optional(self.db.get_conn())
+            .await
+            .map_err(internal)?;
+            let (status, current) = match row {
+                None => (chroma_proto::InvocationStatus::Done, item.completion_offset),
+                Some((true, offset, _)) => (chroma_proto::InvocationStatus::Done, offset),
+                Some((false, offset, true)) if offset > item.completion_offset => {
+                    (chroma_proto::InvocationStatus::NeedsRepair, offset)
+                }
+                Some((false, offset, false)) if offset > item.completion_offset => {
+                    (chroma_proto::InvocationStatus::Done, offset)
+                }
+                Some((false, offset, _)) => (chroma_proto::InvocationStatus::NotDone, offset),
+            };
+            results.push(chroma_proto::InvocationStatusResult {
+                status: status as i32,
+                current_completion_offset: current,
+            });
+        }
+        Ok(chroma_proto::CheckInvocationStatusResponse { results })
     }
 
     // GetAttachedFunctions of the coordinator, with the attached functions as the gRPC sysdb reads them.
@@ -3860,5 +4050,119 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    // The calls of the work queue of the asynchronous functions answer as the coordinator of distributed Chroma.
+    #[tokio::test]
+    async fn an_asynchronous_function_finishes_fails_and_is_checked_as_the_coordinator_does() {
+        let sysdb = SqliteSysDb::new(
+            get_new_sqlite_db().await,
+            "default".into(),
+            "default".into(),
+        );
+        let input = function_collection(&sysdb, "input").await;
+        let (id, _) = attach(&sysdb, "dummy", "dummy_async", input, "out")
+            .await
+            .unwrap();
+        finish(&sysdb, id).await;
+        let try_finish = |offset: u64| {
+            sysdb.try_finish_async_attached_function_invocation(
+                chroma_proto::TryFinishAsyncAttachedFunctionInvocationRequest {
+                    attached_function_id: id.0.to_string(),
+                    collection_id: input.to_string(),
+                    new_completion_offset: offset,
+                },
+            )
+        };
+        use chroma_proto::try_finish_async_attached_function_invocation_response::Result as FinishResult;
+        // The log position of a collection with no segment applied is 0: an offset at it is done.
+        assert!(matches!(
+            try_finish(0).await.unwrap().result,
+            Some(FinishResult::Success(_))
+        ));
+        assert!(matches!(
+            try_finish(5).await.unwrap().result,
+            Some(FinishResult::Success(_))
+        ));
+        assert_eq!(
+            try_finish(3).await.unwrap_err().message(),
+            "completion offset cannot move backwards"
+        );
+        let input_str = input.to_string();
+        let id_str = id.0.to_string();
+        let fail = || sysdb.change_attached_function_failure_count(&id_str, &input_str, None);
+        assert_eq!(fail().await.unwrap(), 1);
+        assert_eq!(fail().await.unwrap(), 2);
+        assert_eq!(
+            sysdb
+                .change_attached_function_failure_count(&id_str, &input_str, Some(7))
+                .await
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            sysdb
+                .change_attached_function_failure_count(&id_str, &input_str, Some(-1))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        // A finish resets the failure count, as UpdateCompletionOffsetAndHeapEntry does.
+        try_finish(6).await.unwrap();
+        assert_eq!(fail().await.unwrap(), 1);
+        sysdb
+            .finalize_async_attached_function_repair(
+                chroma_proto::FinalizeAsyncAttachedFunctionRepairRequest {
+                    attached_function_id: id_str.clone(),
+                    collection_id: input_str.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let check = |offset: i64, function_id: String| chroma_proto::InvocationCheckItem {
+            function_id,
+            input_collection_id: input_str.clone(),
+            completion_offset: offset,
+        };
+        let statuses = sysdb
+            .check_invocation_status(chroma_proto::CheckInvocationStatusRequest {
+                items: vec![
+                    check(6, id_str.clone()),
+                    check(5, id_str.clone()),
+                    check(0, Uuid::new_v4().to_string()),
+                ],
+            })
+            .await
+            .unwrap()
+            .results
+            .into_iter()
+            .map(|result| (result.status, result.current_completion_offset))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                (chroma_proto::InvocationStatus::NotDone as i32, 6),
+                (chroma_proto::InvocationStatus::Done as i32, 6),
+                (chroma_proto::InvocationStatus::Done as i32, 0),
+            ]
+        );
+        // A synchronous function is not finished through the work queue.
+        let other = function_collection(&sysdb, "other").await;
+        let (sync_id, _) = attach(&sysdb, "counter", "record_counter", other, "counts")
+            .await
+            .unwrap();
+        finish(&sysdb, sync_id).await;
+        let err = sysdb
+            .try_finish_async_attached_function_invocation(
+                chroma_proto::TryFinishAsyncAttachedFunctionInvocationRequest {
+                    attached_function_id: sync_id.0.to_string(),
+                    collection_id: other.to_string(),
+                    new_completion_offset: 1,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.message(), "attached function is not async");
     }
 }
