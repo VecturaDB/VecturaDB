@@ -312,6 +312,29 @@ impl HnswIndex {
             .map_err(|e| WrappedHnswError(e).boxed())
     }
 
+    /// `save_with_journal` with a whole file of the caller, `name` in the folder of the index, in the same journal: the
+    /// index and that file come from the same save after a kill.
+    pub fn save_with_journal_file(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), Box<dyn ChromaError>> {
+        self.index
+            .save_with_journal_file(name, bytes)
+            .map_err(|e| WrappedHnswError(e).boxed())
+    }
+
+    /// The journal of a save with a whole file alone, the files untouched: for tests of a save cut after its journal.
+    pub fn write_persist_journal_file(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), Box<dyn ChromaError>> {
+        self.index
+            .write_persist_journal_file(name, bytes)
+            .map_err(|e| WrappedHnswError(e).boxed())
+    }
+
     /// The journal of a save alone, the files untouched: for tests of a save cut after its journal.
     pub fn write_persist_journal(&self) -> Result<(), Box<dyn ChromaError>> {
         self.index
