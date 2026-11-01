@@ -1896,6 +1896,21 @@ impl SqliteSysDb {
         .execute(&mut *conn)
         .await?;
 
+        // As SoftDeleteCollection of the coordinator of distributed Chroma: the ready attached functions that read the
+        // collection, and those that write into it, deleted with it.
+        sqlx::query(
+            r#"
+            UPDATE attached_functions
+            SET name = '_deleted_' || name || '_' || id, is_deleted = TRUE,
+                updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
+            WHERE (input_collection_id = $1 OR output_collection_id = $1) AND is_ready = TRUE
+              AND is_deleted = FALSE
+            "#,
+        )
+        .bind(collection_id.to_string())
+        .execute(&mut *conn)
+        .await?;
+
         let deleted_rows = sqlx::query(
             r#"
             DELETE FROM collections
@@ -3674,5 +3689,39 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_the_output_collection_deletes_the_attached_functions_that_write_into_it() {
+        let sysdb = SqliteSysDb::new(
+            get_new_sqlite_db().await,
+            "default".into(),
+            "default".into(),
+        );
+        let input = function_collection(&sysdb, "input").await;
+        let (id, _) = attach(&sysdb, "f", "record_counter", input, "out")
+            .await
+            .unwrap();
+        finish(&sysdb, id).await;
+        let output = sysdb
+            .get_attached_functions(None, Some(input), vec![], true)
+            .await
+            .unwrap()[0]
+            .output_collection_id
+            .unwrap();
+        sysdb
+            .delete_collection(
+                "default_tenant".into(),
+                "default_database".into(),
+                output,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(sysdb
+            .get_attached_functions(None, Some(input), vec![], false)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
