@@ -1394,9 +1394,7 @@ async fn persist(
                 .save_with_journal_file(METADATA_FILE, &id_map)
                 .map_err(|_| LocalHnswSegmentWriterError::HnswIndexPersistError)?;
         }
-        if let Some(parent) = Path::new(path).parent() {
-            sync_dir(parent)?;
-        }
+        // No sync of the folder: a save syncs nothing, as in Chroma 1.5.9 (the fork of hnswlib, persistDirtyWithJournal).
         if verified {
             guard.verified_checkpoint = Some(VerifiedCheckpoint {
                 fingerprint: CheckpointFingerprint::read(Path::new(path))?,
@@ -1405,17 +1403,6 @@ async fn persist(
         }
     }
     Ok(guard)
-}
-
-/// Make renames and new files in `dir` durable. Windows cannot open a
-/// directory with `File::open` and has no directory fsync, so this is a no-op
-/// there.
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    std::fs::File::open(dir)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = dir;
-    Ok(())
 }
 
 #[cfg(test)]
