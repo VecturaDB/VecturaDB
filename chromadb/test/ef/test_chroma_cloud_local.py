@@ -8,6 +8,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 import threading
 import time
 import warnings
@@ -16,6 +17,7 @@ from typing import Any, Dict, Iterator, List, Set
 
 import numpy as np
 import pytest
+from packaging.requirements import Requirement
 
 import chromadb.utils.embedding_functions.chroma_cloud_local as chroma_cloud_local
 from chromadb.api.collection_configuration import (
@@ -323,6 +325,32 @@ def qwen_from_config() -> ChromaCloudQwenEmbeddingFunction:
     ef = ChromaCloudQwenEmbeddingFunction.build_from_config(QWEN_CONFIG)
     assert isinstance(ef, ChromaCloudQwenEmbeddingFunction)
     return ef
+
+
+def test_onnxruntime_is_a_dependency_below_1_29() -> None:
+    # From onnxruntime 1.29.0 on, Qwen in float16 is computed otherwise on Linux arm64:
+    # 1 - cosine up to 4.0e-4 from the vectors of Chroma Cloud, against 4.3e-6 with
+    # 1.28.0, and two of the 12 queries rank the documents otherwise.
+    root = Path(__file__).resolve().parents[3]
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    dependencies = re.search(r"^dependencies = \[(.*)\]$", pyproject, re.MULTILINE)
+    assert dependencies is not None
+    requirements = (root / "requirements.txt").read_text(encoding="utf-8").splitlines()
+    declared = {
+        "pyproject.toml": re.findall(r"'([^']+)'", dependencies.group(1)),
+        "requirements.txt": [
+            line for line in requirements if line and not line.startswith("#")
+        ],
+    }
+    for source, lines in declared.items():
+        runtime = [
+            Requirement(line)
+            for line in lines
+            if Requirement(line).name == "onnxruntime"
+        ]
+        assert len(runtime) == 1, source
+        assert "1.28.0" in runtime[0].specifier, source
+        assert "1.29.0" not in runtime[0].specifier, source
 
 
 def test_qwen_refuses_a_text_over_8192_tokens() -> None:
