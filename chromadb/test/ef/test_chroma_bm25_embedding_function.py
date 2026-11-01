@@ -1,13 +1,23 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 import math
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
 
 from chromadb import SparseVector
 from chromadb.utils.embedding_functions.chroma_bm25_embedding_function import (
     DEFAULT_CHROMA_BM25_STOPWORDS,
     ChromaBm25EmbeddingFunction,
 )
+from chromadb.utils.embedding_functions.schemas.bm25_tokenizer import (
+    Bm25Tokenizer,
+    get_english_stemmer,
+)
+
+ROOT = Path(__file__).resolve().parents[3]
 
 
 def _is_sorted(values: list[int]) -> bool:
@@ -65,6 +75,42 @@ def test_matches_rust_reference_values() -> None:
     assert embedding.indices == expected_indices
     for value in embedding.values:
         assert value == pytest.approx(expected_value, abs=1e-5)
+
+
+def test_stems_are_those_of_the_rust_and_js_clients() -> None:
+    # The stems of rust-stemmers 1.2.0 (the Rust client) and snowball-stemmers 0.6.0
+    # (the JS client), the same as those of snowballstemmer 2.2.0 on the 21,745 words
+    # of the vocabulary of BERT that we compared. snowballstemmer 3.1.1 differs on 44
+    # of them: universiti, add, internat, organiz and evening here.
+    tokenizer = Bm25Tokenizer(get_english_stemmer(), DEFAULT_CHROMA_BM25_STOPWORDS, 40)
+
+    tokens = tokenizer.tokenize(
+        "The university added an international organization in the evening"
+    )
+
+    assert tokens == ["univers", "ad", "intern", "organ", "even"]
+
+
+def test_snowballstemmer_is_a_dependency_below_3() -> None:
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    dependencies = re.search(r"^dependencies = \[(.*)\]$", pyproject, re.MULTILINE)
+    assert dependencies is not None
+    requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+    declared = {
+        "pyproject.toml": re.findall(r"'([^']+)'", dependencies.group(1)),
+        "requirements.txt": [
+            line for line in requirements if line and not line.startswith("#")
+        ],
+    }
+    for source, lines in declared.items():
+        stemmer = [
+            Requirement(line)
+            for line in lines
+            if Requirement(line).name == "snowballstemmer"
+        ]
+        assert len(stemmer) == 1, source
+        assert "2.2.0" in stemmer[0].specifier, source
+        assert "3.0.0" not in stemmer[0].specifier, source
 
 
 def test_generates_embeddings_for_multiple_documents() -> None:
