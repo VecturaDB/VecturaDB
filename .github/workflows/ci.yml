@@ -66,6 +66,10 @@ jobs:
   cli-windows:
     name: CLI Windows x64
     runs-on: windows-latest
+    # The C runtime linked in the exe (static CRT): the CLI then runs on a Windows without the Visual C++ runtime, which
+    # the exe of Chroma needs. Only this job: the wheels load in Python, which brings the runtime.
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
     steps:
       - name: Machine
         shell: bash
