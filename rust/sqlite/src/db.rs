@@ -57,26 +57,23 @@ impl SqliteDb {
         {
             tracing::warn!("Checkpoint of SQLite at close failed: {err}");
         }
-        // sqlx waits for the connections still taken to come back before its close ends, but its wait can end before
-        // they are closed (above): both are waited for within the grace.
-        let closed = tokio::time::timeout(grace, async {
-            self.conn.close().await;
-            while self.conn.size() > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        if closed.is_err() {
+        // sqlx waits for the connections still taken to come back before its close ends: within the grace.
+        let started = std::time::Instant::now();
+        if tokio::time::timeout(grace, self.conn.close()).await.is_err() {
             tracing::warn!(
-                "{} connections of SQLite still open {} s after the close: closed without waiting, with the log of the writes",
+                "{} connections of SQLite still taken {} s after the close: closed without waiting, with the log of the writes",
                 self.conn.size(),
                 grace.as_secs()
             );
             return;
         }
+        // The wait of sqlx can end before every connection it closes is closed in SQLite (above), and its count of
+        // connections can stay above zero with none left. SQLite itself says when the last one is gone: a connection
+        // alone to the file removes the log at its close only then. It is tried again until the log is gone, within the
+        // grace; past it the log stays, and SQLite writes it back at the next open.
         let options = self.conn.connect_options();
-        let wal = format!("{}-wal", options.get_filename().display());
-        if std::path::Path::new(&wal).exists() {
+        let wal = std::path::PathBuf::from(format!("{}-wal", options.get_filename().display()));
+        while wal.exists() {
             match SqliteConnection::connect_with(&options).await {
                 Ok(mut alone) => {
                     let _ = sqlx::query("SELECT COUNT(*) FROM sqlite_master")
@@ -84,8 +81,22 @@ impl SqliteDb {
                         .await;
                     let _ = alone.close().await;
                 }
-                Err(err) => tracing::warn!("Last connection of SQLite at close failed: {err}"),
+                Err(err) => {
+                    tracing::warn!("Last connection of SQLite at close failed: {err}");
+                    return;
+                }
             }
+            if !wal.exists() {
+                break;
+            }
+            if started.elapsed() > grace {
+                tracing::warn!(
+                    "Other connections of SQLite still open {} s after the close: the log of the writes stays",
+                    grace.as_secs()
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 
