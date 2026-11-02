@@ -35,7 +35,7 @@ use std::{
 use thiserror::Error;
 
 use crate::local_hnsw::{
-    validate_checkpoint, Inner, LocalHnswIndex, LocalHnswSegmentReader,
+    validate_checkpoint, IndexShared, LocalHnswIndex, LocalHnswSegmentReader,
     LocalHnswSegmentReaderError, LocalHnswSegmentWriter, LocalHnswSegmentWriterError,
 };
 use crate::spann_provider::SpannProvider;
@@ -62,7 +62,7 @@ pub struct LocalSegmentManager {
     // Cache eviction must not allow a second native writer while a caller
     // still holds the first index. Serialize misses and retain weak identities.
     live_indexes:
-        AysncPartitionedMutex<IndexUuid, HashMap<IndexUuid, Weak<tokio::sync::RwLock<Inner>>>>,
+        AysncPartitionedMutex<IndexUuid, HashMap<IndexUuid, Weak<IndexShared>>>,
     #[allow(dead_code)]
     eviction_callback_task_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     cleanup_task: Option<Arc<CleanupTask>>,

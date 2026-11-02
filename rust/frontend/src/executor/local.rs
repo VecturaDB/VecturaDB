@@ -283,6 +283,41 @@ impl LocalExecutor {
         })
     }
 
+    // A get of an HNSW collection whose records are then read from the index, at a snapshot of SQLite: while a write's
+    // backfill has committed its records to SQLite and not yet applied them to the index, the read waits for that
+    // backfill, so that the index holds every record of its snapshot (the read of Chroma 1.5.9, which waited for every
+    // backfill). Other reads do not wait for a running backfill.
+    async fn get_with_index_at_snapshot(
+        &mut self,
+        hnsw_reader: &LocalHnswSegmentReader,
+        plan: Get,
+    ) -> Result<GetResult, ExecutorError> {
+        let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
+        let collection_and_segments = plan.scan.collection_and_segments.clone();
+        let mut snapshot = self.metadata_reader.snapshot().await.map_err(internal)?;
+        let applied = snapshot
+            .max_seq_id(&collection_and_segments.metadata_segment.id)
+            .await
+            .map_err(internal)?;
+        if hnsw_reader.index.applied_seq_id_in_memory() < applied {
+            let backfill_msg = BackfillMessage {
+                collection_id: collection_and_segments.collection.collection_id,
+            };
+            self.compactor_handle
+                .request(backfill_msg, None)
+                .await
+                .map_err(|err| ExecutorError::BackfillError(Box::new(err)))?
+                .map_err(|err| ExecutorError::BackfillError(Box::new(err)))?;
+        }
+        let result = self
+            .metadata_reader
+            .get_at(&mut snapshot, plan)
+            .await
+            .map_err(internal)?;
+        snapshot.close().await.map_err(internal)?;
+        Ok(result)
+    }
+
     // Pin the index through replay and the read. A collection-level "backfilled"
     // flag outlives evicted indexes and cannot establish that this instance has
     // applied the unpersisted tail of the log.
@@ -380,11 +415,17 @@ impl LocalExecutor {
             .try_backfill_collection(&collection_and_segments)
             .await?;
         let load_embedding = plan.proj.embedding;
-        let mut result = self
-            .metadata_reader
-            .get(plan)
-            .await
-            .map_err(|err| ExecutorError::Internal(Box::new(err)))?;
+        let mut result = match &hnsw_reader {
+            // The embeddings come from the index: it must hold every record of the snapshot of the get.
+            Some(hnsw_reader) if load_embedding => {
+                self.get_with_index_at_snapshot(hnsw_reader, plan).await?
+            }
+            _ => self
+                .metadata_reader
+                .get(plan)
+                .await
+                .map_err(|err| ExecutorError::Internal(Box::new(err)))?,
+        };
         if load_embedding {
             if let Some(hnsw_reader) = hnsw_reader {
                 for record in &mut result.result.records {
@@ -650,15 +691,9 @@ impl LocalExecutor {
                     proj: Default::default(),
                 };
 
-                let replan = {
-                    let plan = filter_plan.clone();
-                    move |_: tonic::Code| {
-                        let plan = plan.clone();
-                        async move { Ok(plan) }
-                    }
-                };
+                // The ids that the filter gives are looked up in the index, which must hold every record of its snapshot.
                 let allowed_uids = self
-                    .get(filter_plan, replan)
+                    .get_with_index_at_snapshot(&hnsw_reader, filter_plan)
                     .await?
                     .result
                     .records

@@ -15,7 +15,10 @@ use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     mem::size_of,
     path::Path,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use chroma_cache::Weighted;
@@ -331,7 +334,7 @@ impl LocalHnswSegmentReader {
                     // TODO(Sanket): Set allow reset appropriately.
                     return Ok(Self {
                         index: LocalHnswIndex {
-                            inner: Arc::new(tokio::sync::RwLock::new(Inner {
+                            inner: Arc::new(IndexShared::new(Inner {
                                 index,
                                 id_map,
                                 index_init: true,
@@ -390,7 +393,7 @@ impl LocalHnswSegmentReader {
 
                 Ok(Self {
                     index: LocalHnswIndex {
-                        inner: Arc::new(tokio::sync::RwLock::new(Inner {
+                        inner: Arc::new(IndexShared::new(Inner {
                             index,
                             id_map: IdMap::new(dimensionality),
                             index_init: true,
@@ -761,12 +764,44 @@ impl Inner {
     }
 }
 
+/// An index and the position in the log of the last record it holds in memory, readable without its lock: a read that
+/// needs the records of its snapshot of SQLite in the index compares the two, while a backfill holds the write lock for
+/// its apply and its save.
+pub struct IndexShared {
+    lock: tokio::sync::RwLock<Inner>,
+    applied_seq_id: AtomicU64,
+}
+
+impl IndexShared {
+    // The position of a loaded index, set before the index is shared.
+    fn new(inner: Inner) -> Self {
+        Self {
+            applied_seq_id: AtomicU64::new(inner.last_seen_seq_id),
+            lock: tokio::sync::RwLock::new(inner),
+        }
+    }
+}
+
+impl std::ops::Deref for IndexShared {
+    type Target = tokio::sync::RwLock<Inner>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lock
+    }
+}
+
 #[derive(Clone)]
 pub struct LocalHnswIndex {
-    pub(crate) inner: Arc<tokio::sync::RwLock<Inner>>,
+    pub(crate) inner: Arc<IndexShared>,
 }
 
 impl LocalHnswIndex {
+    /// The position in the log of the last record that this instance holds in memory, read without the lock: every
+    /// record up to it is in the index. Stored by apply_log_chunk once the index holds its chunk.
+    pub fn applied_seq_id_in_memory(&self) -> u64 {
+        self.inner.applied_seq_id.load(Ordering::Acquire)
+    }
+
     /// Last successfully applied offset in this instance, independent of durability.
     pub async fn applied_seq_id(&self) -> Result<u64, LocalHnswSegmentWriterError> {
         let guard = self.inner.read().await;
@@ -1041,7 +1076,7 @@ impl LocalHnswSegmentWriter {
                     // TODO(Sanket): Set allow reset appropriately.
                     return Ok(Self {
                         index: LocalHnswIndex {
-                            inner: Arc::new(tokio::sync::RwLock::new(Inner {
+                            inner: Arc::new(IndexShared::new(Inner {
                                 index,
                                 id_map,
                                 index_init: true,
@@ -1101,7 +1136,7 @@ impl LocalHnswSegmentWriter {
                 // Return uninitialized reader.
                 Ok(Self {
                     index: LocalHnswIndex {
-                        inner: Arc::new(tokio::sync::RwLock::new(Inner {
+                        inner: Arc::new(IndexShared::new(Inner {
                             index,
                             id_map: IdMap::new(dimensionality),
                             index_init: true,
@@ -1145,7 +1180,7 @@ impl LocalHnswSegmentWriter {
                 .map_err(|_| LocalHnswSegmentWriterError::HnswIndexInitError)?;
                 Ok(Self {
                     index: LocalHnswIndex {
-                        inner: Arc::new(tokio::sync::RwLock::new(Inner {
+                        inner: Arc::new(IndexShared::new(Inner {
                             index,
                             id_map: IdMap::new(dimensionality),
                             index_init: true,
@@ -1373,6 +1408,8 @@ impl LocalHnswSegmentWriter {
         // Native mutations succeeded. A later checkpoint error must not replay
         // already applied records into this live instance.
         guard.last_seen_seq_id = max_seq_id;
+        // The index holds the chunk in memory: a read that waits for these records may go on.
+        self.index.inner.applied_seq_id.store(max_seq_id, Ordering::Release);
         guard.id_map.total_elements_added = next_label - 1;
         if guard.needs_checkpoint() {
             guard = persist(guard).await?;
@@ -1829,7 +1866,7 @@ mod tests {
         .expect("hnsw init");
         let mut writer = LocalHnswSegmentWriter {
             index: LocalHnswIndex {
-                inner: Arc::new(tokio::sync::RwLock::new(Inner {
+                inner: Arc::new(IndexShared::new(Inner {
                     index,
                     id_map: IdMap::new(2),
                     index_init: true,
