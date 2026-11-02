@@ -1402,3 +1402,36 @@ async fn a_journal_older_than_files_saved_by_chroma_1_5_9_is_discarded() {
         vec![(saved + 1) as f32; 3]
     );
 }
+
+// As a count or a get of Chroma 1.5.9, which checked a flag of the collection and read SQLite: the checks of a read on a
+// replayed instance answer while a backfill holds the write lock of the index for its apply and save.
+#[tokio::test]
+async fn the_checks_of_a_read_answer_while_a_backfill_holds_the_index() {
+    let (_root, _sqlite, _collection, _segment, writer) = fixture().await;
+    writer.index.set_replay_complete(true).await;
+    let index = writer.index.clone();
+    let backfill = writer.index.inner.write().await;
+    let checks = async {
+        index.ensure_usable().await.unwrap();
+        index.replay_complete().await
+    };
+    let replayed = tokio::time::timeout(std::time::Duration::from_secs(1), checks)
+        .await
+        .expect("the checks of a read must not wait for the write lock");
+    assert!(replayed);
+    drop(backfill);
+}
+
+// A deleted instance answers Deleted to a read at once, also while the write lock of the index is held.
+#[tokio::test]
+async fn a_read_of_a_deleted_index_answers_while_the_index_is_held() {
+    let (_root, _sqlite, _collection, _segment, writer) = fixture().await;
+    writer.index.mark_deleted().await;
+    let index = writer.index.clone();
+    let held = writer.index.inner.write().await;
+    let checked = tokio::time::timeout(std::time::Duration::from_secs(1), index.ensure_usable())
+        .await
+        .expect("the check of a read must not wait for the write lock");
+    assert!(matches!(checked, Err(LocalHnswSegmentWriterError::Deleted)));
+    drop(held);
+}
