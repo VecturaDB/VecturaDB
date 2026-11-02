@@ -309,6 +309,7 @@ impl LocalHnswSegmentReader {
                         });
                     }
                     id_map.dimensionality = Some(dimensionality);
+                    let loaded_before = CheckpointFingerprint::read(&index_folder).ok();
                     let inspection = persistence::validate_files(&index_folder, Some(&id_map))
                         .map_err(|_| LocalHnswSegmentReaderError::HnswIndexLoadError)?;
                     // Load hnsw index.
@@ -324,6 +325,8 @@ impl LocalHnswSegmentReader {
                     )
                     .map_err(|_| LocalHnswSegmentReaderError::HnswIndexLoadError)?;
                     index.close_fd();
+                    let verified_checkpoint =
+                        loaded_verified(loaded_before, &index_folder, &inspection);
 
                     reconcile_checkpoint(&index, &mut id_map, &inspection)
                         .map_err(|_| LocalHnswSegmentReaderError::HnswIndexLoadError)?;
@@ -341,7 +344,7 @@ impl LocalHnswSegmentReader {
                                 deleted: false,
                                 replay_complete: false,
                                 recovery_checkpoint_pending: inspection.recovery_required,
-                                verified_checkpoint: None,
+                                verified_checkpoint,
                                 failed: false,
                                 deleted_on_load: inspection
                                     .mapped_deleted_labels
@@ -1062,6 +1065,7 @@ impl LocalHnswSegmentWriter {
                         });
                     }
                     id_map.dimensionality = Some(dimensionality);
+                    let loaded_before = CheckpointFingerprint::read(&index_folder).ok();
                     let inspection = persistence::validate_files(&index_folder, Some(&id_map))
                         .map_err(|_| LocalHnswSegmentWriterError::HnswIndexLoadError)?;
                     // Load hnsw index.
@@ -1077,6 +1081,8 @@ impl LocalHnswSegmentWriter {
                     )
                     .map_err(|_| LocalHnswSegmentWriterError::HnswIndexLoadError)?;
                     index.close_fd();
+                    let verified_checkpoint =
+                        loaded_verified(loaded_before, &index_folder, &inspection);
 
                     reconcile_checkpoint(&index, &mut id_map, &inspection)
                         .map_err(|_| LocalHnswSegmentWriterError::HnswIndexLoadError)?;
@@ -1094,7 +1100,7 @@ impl LocalHnswSegmentWriter {
                                 deleted: false,
                                 replay_complete: false,
                                 recovery_checkpoint_pending: inspection.recovery_required,
-                                verified_checkpoint: None,
+                                verified_checkpoint,
                                 failed: false,
                                 deleted_on_load: inspection
                                     .mapped_deleted_labels
@@ -1446,6 +1452,26 @@ impl LocalHnswSegmentWriter {
 
         Ok(next_label)
     }
+}
+
+// The load of an index inspects its files as fully as a purge does (validate_files, Strict); when the files
+// did not change between that inspection and the end of the load, the purge takes it as verified, instead of inspecting
+// again under the lock of the index at its first purge.
+fn loaded_verified(
+    before: Option<CheckpointFingerprint>,
+    path: &Path,
+    inspection: &PersistedHnswIndex,
+) -> Option<VerifiedCheckpoint> {
+    let before = before?;
+    #[cfg(feature = "test-hooks")]
+    persistence::touch_after_inspection(path).ok()?;
+    if inspection.recovery_required || CheckpointFingerprint::read(path).ok()? != before {
+        return None;
+    }
+    Some(VerifiedCheckpoint {
+        fingerprint: before,
+        seq_id: inspection.checkpoint_seq_id,
+    })
 }
 
 fn reconcile_checkpoint(
@@ -1933,5 +1959,128 @@ mod tests {
         assert_eq!(guard.id_map.total_elements_added, 0);
         assert_eq!(guard.num_elements_since_last_persist, 0);
         assert_eq!(guard.last_seen_seq_id, 0);
+    }
+
+    // An index loaded from its files counts as verified for the purges, as its load inspected the files as fully as a
+    // purge does: the first purge after a start does not inspect them again under the lock of the index, whether a writer
+    // or a reader loaded it. Files that change after the load are inspected again. A checkpoint that needs a replay of the
+    // log is not verified by its load: the purge inspects it, and refuses.
+    #[tokio::test]
+    async fn a_loaded_checkpoint_is_verified_for_the_first_purge() {
+        let sqlite = get_new_sqlite_db().await;
+        let persist_dir = tempfile::tempdir().expect("persist dir");
+        let persist_path = persist_dir.path().to_str().expect("utf-8 path").to_string();
+        let mut collection = Collection::test_collection(3);
+        collection.schema = Some(Schema::new_default(KnnIndex::Hnsw));
+        let vector_segment = Segment {
+            id: SegmentUuid::new(),
+            r#type: SegmentType::HnswLocalPersisted,
+            scope: SegmentScope::VECTOR,
+            collection: collection.collection_id,
+            metadata: None,
+            file_path: Default::default(),
+        };
+        let writer = || {
+            super::LocalHnswSegmentWriter::from_segment(
+                &collection,
+                &vector_segment,
+                3,
+                Some(persist_path.clone()),
+                sqlite.clone(),
+            )
+        };
+        let reader = || {
+            LocalHnswSegmentReader::from_segment(
+                &collection,
+                &vector_segment,
+                3,
+                Some(persist_path.clone()),
+                sqlite.clone(),
+            )
+        };
+        let chunk = |log_offset: i64, id: &str| {
+            Chunk::new(
+                vec![LogRecord {
+                    log_offset,
+                    record: OperationRecord {
+                        id: id.to_string(),
+                        embedding: Some(vec![1.0, 2.0, 3.0]),
+                        encoding: None,
+                        metadata: None,
+                        document: None,
+                        operation: Operation::Add,
+                    },
+                }]
+                .into(),
+            )
+        };
+        let mut first = writer().await.expect("writer");
+        first
+            .apply_log_chunk(chunk(1, "id-1"))
+            .await
+            .expect("apply log");
+        drop(
+            super::persist(first.index.inner.write().await)
+                .await
+                .expect("persist"),
+        );
+        first.index.close().await;
+        drop(first);
+        let path = std::path::Path::new(&persist_path).join(vector_segment.id.to_string());
+        let loaded = writer().await.expect("load");
+        assert!(!loaded
+            .index
+            .validate_persisted_checkpoint(&path, 1)
+            .await
+            .expect("checkpoint"));
+        std::fs::File::options()
+            .append(true)
+            .open(path.join(super::METADATA_FILE))
+            .expect("metadata file")
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+            .expect("touch");
+        assert!(loaded
+            .index
+            .validate_persisted_checkpoint(&path, 1)
+            .await
+            .expect("checkpoint"));
+        loaded.index.close().await;
+        drop(loaded);
+        let loaded = reader().await.expect("load");
+        assert!(!loaded
+            .index
+            .validate_persisted_checkpoint(&path, 1)
+            .await
+            .expect("checkpoint"));
+        loaded.index.close().await;
+        drop(loaded);
+
+        // The native files of a save with the ID map of the save before, as a kill between the two would leave them.
+        let pickle = path.join(super::METADATA_FILE);
+        let old_map = std::fs::read(&pickle).expect("metadata file");
+        let mut second = writer().await.expect("load");
+        second
+            .apply_log_chunk(chunk(2, "id-2"))
+            .await
+            .expect("apply log");
+        drop(
+            super::persist(second.index.inner.write().await)
+                .await
+                .expect("persist"),
+        );
+        second.index.close().await;
+        drop(second);
+        std::fs::write(&pickle, old_map).expect("metadata file");
+        assert!(
+            super::inspect_persisted_hnsw_index(&path)
+                .expect("inspection")
+                .recovery_required
+        );
+        let loaded = writer().await.expect("load");
+        assert!(loaded
+            .index
+            .validate_persisted_checkpoint(&path, 1)
+            .await
+            .is_err());
     }
 }
