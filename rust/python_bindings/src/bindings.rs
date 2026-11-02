@@ -688,11 +688,17 @@ impl Bindings {
         };
 
         let configuration = match configuration_json {
-            Some(c) => Some(InternalCollectionConfiguration::try_from_config(
-                c,
-                self.frontend.get_default_knn_index(),
-                metadata.clone(),
-            )?),
+            // A SPANN configuration gets SPANN where the executor has it, as from the server (create_collection of
+            // server.rs) and on distributed Chroma.
+            Some(c) => {
+                let c: CollectionConfiguration = c;
+                let knn_index = self.frontend.knn_index_for(c.spann.is_some());
+                Some(InternalCollectionConfiguration::try_from_config(
+                    c,
+                    knn_index,
+                    metadata.clone(),
+                )?)
+            }
             None => Some(InternalCollectionConfiguration::try_from_config(
                 CollectionConfiguration {
                     hnsw: None,
@@ -1550,6 +1556,42 @@ mod tests {
             .expect("persistent bindings");
 
         (temp_dir, bindings)
+    }
+
+    // A SPANN configuration gets SPANN in process with a data path, as from the server and on distributed Chroma; an
+    // HNSW configuration and none get HNSW.
+    #[test]
+    fn a_spann_configuration_gets_spann_in_process() {
+        let (temp_dir, mut bindings) = new_persistent_bindings();
+        let create = |name: &str, configuration: Option<&str>| {
+            bindings
+                .create_collection(
+                    name.to_string(),
+                    configuration.map(str::to_string),
+                    None,
+                    None,
+                    false,
+                    DEFAULT_TENANT.to_string(),
+                    DEFAULT_DATABASE.to_string(),
+                )
+                .expect("collection created")
+                .config
+                .vector_index
+        };
+        assert!(matches!(
+            create("asks_spann", Some(r#"{"spann": {"space": "cosine"}}"#)),
+            chroma_types::VectorIndexConfiguration::Spann(_)
+        ));
+        assert!(matches!(
+            create("asks_hnsw", Some(r#"{"hnsw": {"space": "cosine"}}"#)),
+            chroma_types::VectorIndexConfiguration::Hnsw(_)
+        ));
+        assert!(matches!(
+            create("asks_nothing", None),
+            chroma_types::VectorIndexConfiguration::Hnsw(_)
+        ));
+        bindings.close();
+        temp_dir.close().expect("persistent directory cleanup");
     }
 
     #[test]

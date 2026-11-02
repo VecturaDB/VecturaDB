@@ -132,7 +132,7 @@ pub async fn connect_local(
         let port = find_available_port()?;
         config.persist_path = path;
         config.port = port;
-        config.server_info = Some(crate::commands::run::server_info());
+        config.server_info = Some(crate::commands::run::server_info(&config));
 
         let host = format!("http://localhost:{}", config.port);
         let handle = spawn(async move {
