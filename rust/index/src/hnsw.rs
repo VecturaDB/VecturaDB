@@ -7,7 +7,7 @@ use thiserror::Error;
 use tracing::instrument;
 
 /// The journal that a save keeps in the folder of a local index while it writes the files, and what a load finds.
-pub use hnswlib::{PersistJournal, PERSIST_JOURNAL_FILE};
+pub use hnswlib::{PersistJournal, PersistJournalInfo, PERSIST_JOURNAL_FILE};
 
 // Setting it to a small value to prevent
 // bloating of the index which directly impacts query latency by increasing
@@ -340,6 +340,16 @@ impl HnswIndex {
         self.index
             .write_persist_journal()
             .map_err(|e| WrappedHnswError(e).boxed())
+    }
+
+    /// The journal left in the folder of the index in `path`, read and not applied (hnswlib::persist_journals).
+    pub fn persist_journals(path: &Path) -> Result<Vec<PersistJournalInfo>, Box<dyn ChromaError>> {
+        hnswlib::persist_journals(path).map_err(|e| WrappedHnswInitError::Other(e).boxed())
+    }
+
+    /// The journal left in the folder of the index in `path` removed, unapplied (hnswlib::discard_persist_journals).
+    pub fn discard_persist_journals(path: &Path) -> Result<(), Box<dyn ChromaError>> {
+        hnswlib::discard_persist_journals(path).map_err(|e| WrappedHnswInitError::Other(e).boxed())
     }
 
     /// The journal of a save cut by a stop, written again to the files of the index in `path`, before anything reads

@@ -1322,3 +1322,83 @@ async fn a_save_that_fails_in_the_middle_leaves_its_journal() {
     drop(writer);
     assert_journal_fixture_recovers(&root, &sqlite, &collection, &segment, tail).await;
 }
+
+async fn set_segment_position(sqlite: &SqliteDb, segment: &Segment, seq: u64) {
+    sqlx::query("UPDATE max_seq_id SET seq_id = ? WHERE segment_id = ?")
+        .bind(seq as i64)
+        .bind(segment.id.to_string())
+        .execute(sqlite.get_conn())
+        .await
+        .unwrap();
+}
+
+// The journal of a save of the writer, as a stop in the middle of persist leaves it, and its log position.
+async fn journal_of_a_cut_save(writer: &LocalHnswSegmentWriter) -> u64 {
+    let mut guard = writer.index.inner.write().await;
+    guard.id_map.checkpoint_seq_id = Some(guard.last_seen_seq_id);
+    let mut id_map = Vec::new();
+    serde_pickle::to_writer(&mut id_map, &guard.id_map, SerOptions::new()).unwrap();
+    let _permit = acquire_hnsw_files().await;
+    let files = HnswFiles(&guard.index);
+    files.0.open_fd().unwrap();
+    files
+        .0
+        .write_persist_journal_file(METADATA_FILE, &id_map)
+        .unwrap();
+    guard.last_seen_seq_id
+}
+
+// A save cut by a stop after its journal, the position in SQLite not moved yet: the journal reaches past it, and the
+// load applies it, so the writer has every record.
+#[tokio::test]
+async fn a_journal_newer_than_the_position_in_sqlite_is_applied() {
+    let (root, sqlite, collection, segment, writer, tail) = journal_fixture().await;
+    let saved = journal_of_a_cut_save(&writer).await;
+    assert!(get_current_seq_id(&segment, &sqlite).await.unwrap() < saved);
+    writer.index.close().await;
+    drop(writer);
+    let folder = root.path().join(segment.id.to_string());
+    assert_eq!(HnswIndex::persist_journals(&folder).unwrap().len(), 1);
+    assert_journal_fixture_recovers(&root, &sqlite, &collection, &segment, tail).await;
+}
+
+// The round trip with Chroma 1.5.9: VecturaDB stopped in the middle of a save leaves its journal; Chroma 1.5.9 opens the
+// folder, applies the log past it and saves the files and the ID map with no journal. Back on VecturaDB the journal is
+// older than the files: it is discarded, not applied over them, and the record of 1.5.9 stays.
+#[tokio::test]
+async fn a_journal_older_than_files_saved_by_chroma_1_5_9_is_discarded() {
+    let (root, sqlite, collection, segment, mut writer, _tail) = journal_fixture().await;
+    let folder = root.path().join(segment.id.to_string());
+    let saved = journal_of_a_cut_save(&writer).await;
+    // Chroma 1.5.9: a later record of the log, then the native files and the ID map saved with no journal.
+    writer
+        .apply_log_chunk(Chunk::new(vec![record(saved as i64 + 1, 1, 2)].into()))
+        .await
+        .unwrap();
+    {
+        let mut guard = writer.index.inner.write().await;
+        guard.id_map.checkpoint_seq_id = None;
+        guard.id_map.max_seq_id = Some(saved + 1);
+        let _permit = acquire_hnsw_files().await;
+        let files = HnswFiles(&guard.index);
+        files.0.open_fd().unwrap();
+        files.0.save().unwrap();
+        drop(files);
+        let mut id_map = Vec::new();
+        serde_pickle::to_writer(&mut id_map, &guard.id_map, SerOptions::new()).unwrap();
+        std::fs::write(folder.join(METADATA_FILE), id_map).unwrap();
+    }
+    set_segment_position(&sqlite, &segment, saved + 1).await;
+    writer.index.close().await;
+    drop(writer);
+    assert_eq!(HnswIndex::persist_journals(&folder).unwrap().len(), 1);
+    let persist_path = Some(root.path().to_str().unwrap().to_string());
+    let reader = LocalHnswSegmentReader::from_segment(&collection, &segment, 3, persist_path, sqlite.clone())
+        .await
+        .unwrap();
+    assert!(HnswIndex::persist_journals(&folder).unwrap().is_empty());
+    assert_eq!(
+        reader.get_embedding_by_user_id(&"1".to_string()).await.unwrap(),
+        vec![(saved + 1) as f32; 3]
+    );
+}

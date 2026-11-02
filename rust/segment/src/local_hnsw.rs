@@ -143,6 +143,52 @@ async fn get_current_seq_id(
 // Only call after validating and loading the matching native files. A new pickle
 // can be ahead of SQLite if publication was interrupted; replay must start after
 // that pickle's operations. Legacy offsets only initialize an absent watermark.
+// The journal of a save cut by a stop, before anything reads the files of the index in index_folder: applied when it is
+// the last save of the index, and discarded when the files were saved after it by a program that writes no journal, as
+// Chroma 1.5.9 opening the same folder. The journal carries the ID map of its save, with the log position it publishes;
+// VecturaDB moves the position of the segment in SQLite only after that save, so its own journal always reaches the
+// position in SQLite. A journal that stops before it is older than the files: applying it would put back records that
+// the log already replayed past.
+async fn apply_journals_newer_than_data(
+    index_folder: &Path,
+    segment: &Segment,
+    sql_db: &SqliteDb,
+) -> Result<(), Box<dyn ChromaError>> {
+    let journals = HnswIndex::persist_journals(index_folder)?;
+    if journals.is_empty() {
+        return Ok(());
+    }
+    let newest = journals
+        .iter()
+        .filter(|journal| journal.complete)
+        .filter_map(|journal| {
+            journal
+                .whole_files
+                .iter()
+                .find(|(name, _)| name == METADATA_FILE)
+                .and_then(|(_, bytes)| {
+                    serde_pickle::from_slice::<IdMap>(bytes, DeOptions::new()).ok()
+                })
+                .and_then(|id_map| id_map.checkpoint_seq_id.or(id_map.max_seq_id))
+        })
+        .max();
+    let current = get_current_seq_id(segment, sql_db)
+        .await
+        .map_err(|e| LocalHnswSegmentWriterError::from(e).boxed())?;
+    match newest {
+        Some(newest) if newest < current => {
+            tracing::warn!(
+                folder = %index_folder.display(),
+                journals = newest,
+                log = current,
+                "Journals of saves older than the files of the index, saved after them without a journal: discarded"
+            );
+            HnswIndex::discard_persist_journals(index_folder)
+        }
+        _ => HnswIndex::apply_persist_journal(index_folder).map(|_| ()),
+    }
+}
+
 async fn restore_checkpoint_seq_id(
     segment: &Segment,
     sql_db: &SqliteDb,
@@ -215,9 +261,11 @@ impl LocalHnswSegmentReader {
                 let _files = acquire_hnsw_files().await;
                 let path = Path::new(&path_str);
                 let index_folder = path.join(segment.id.to_string());
-                // A save cut by a stop leaves its journal: its bytes go back to the files before anything reads them.
+                // A save cut by a stop leaves its journal: its bytes go back to the files before anything reads them, unless
+                // the files were saved after it (apply_journals_newer_than_data).
                 if index_folder.exists() {
-                    HnswIndex::apply_persist_journal(&index_folder)
+                    apply_journals_newer_than_data(&index_folder, segment, &sql_db)
+                        .await
                         .map_err(|_| LocalHnswSegmentReaderError::HnswIndexLoadError)?;
                 }
                 if !index_folder.join(METADATA_FILE).is_file()
@@ -924,9 +972,11 @@ impl LocalHnswSegmentWriter {
                 let _files = acquire_hnsw_files().await;
                 let path = Path::new(&path_str);
                 let index_folder = path.join(segment.id.to_string());
-                // A save cut by a stop leaves its journal: its bytes go back to the files before anything reads them.
+                // A save cut by a stop leaves its journal: its bytes go back to the files before anything reads them, unless
+                // the files were saved after it (apply_journals_newer_than_data).
                 if index_folder.exists() {
-                    HnswIndex::apply_persist_journal(&index_folder)
+                    apply_journals_newer_than_data(&index_folder, segment, &sql_db)
+                        .await
                         .map_err(|_| LocalHnswSegmentWriterError::HnswIndexLoadError)?;
                 }
                 if !index_folder.join(METADATA_FILE).is_file()
