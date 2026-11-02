@@ -652,9 +652,8 @@ def _assert_schema_indexes(
 @multi_region_test
 
 def _asks_for_spann(configuration: Any, schema: Any) -> bool:
-    """Whether a new collection asks for SPANN where the single node gives it: in its schema. A SPANN configuration
-    gets HNSW on the single node, as on single-node Chroma (InternalCollectionConfiguration::try_from_config with HNSW
-    as the default); distributed Chroma gives it SPANN."""
+    """Whether the configuration or the schema of a new collection asks for SPANN: the single node gives it with a data
+    path, as distributed Chroma."""
 
     def has_spann(value: Any) -> bool:
         if isinstance(value, dict):
@@ -666,6 +665,8 @@ def _asks_for_spann(configuration: Any, schema: Any) -> bool:
             return any(has_spann(item) for item in value)
         return False
 
+    if configuration is not None and has_spann(dict(configuration)):
+        return True
     return schema is not None and has_spann(schema.serialize_to_json())
 
 
