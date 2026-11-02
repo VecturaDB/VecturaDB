@@ -431,6 +431,25 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
         message: BackfillMessage,
         _: &ComponentContext<LocalCompactionManager>,
     ) -> Self::Result {
+        // A backfill that fails leaves the loaded instance not replayed, so that the next read asks for a backfill
+        // again; one that succeeds, or runs, leaves it as it is (see below).
+        let mut loaded = None;
+        let result = self.backfill(message, &mut loaded).await;
+        if result.is_err() {
+            if let Some(index) = loaded {
+                index.set_replay_complete(false).await;
+            }
+        }
+        result
+    }
+}
+
+impl LocalCompactionManager {
+    async fn backfill(
+        &mut self,
+        message: BackfillMessage,
+        loaded: &mut Option<chroma_segment::local_hnsw::LocalHnswIndex>,
+    ) -> Result<(), CompactionManagerError> {
         // Applying logs moves the watermarks, even when the backfill fails part way.
         self.purged.remove(&message.collection_id);
         self.metrics.replay_attempts.add(1, &[]);
@@ -483,8 +502,11 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
             Err(err) => return Err(CompactionManagerError::HnswReaderConstructionError(err)),
         };
         let hnsw_max_seq_id = match &hnsw_reader {
+            // The instance stays replayed while a write's backfill runs: a read that needs the records of its snapshot
+            // in the index waits for them (applied_seq_id_in_memory), and the others go on, as in Chroma 1.5.9, whose
+            // writes did not reset the flag of the collection. A backfill that fails resets it (handle).
             Some(reader) => {
-                reader.index.set_replay_complete(false).await;
+                *loaded = Some(reader.index.clone());
                 reader
                     .index
                     .applied_seq_id()
