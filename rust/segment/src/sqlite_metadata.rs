@@ -576,9 +576,12 @@ impl SqliteMetadataWriter {
         // acquired the write lock. An earlier read in a deferred transaction
         // would introduce a read-to-write lock upgrade race.
         if !meta.is_empty() && sparse_presence.is_none() {
-            *sparse_presence = Some(sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM embedding_metadata_sparse AS sparse JOIN embeddings ON embeddings.id = sparse.id WHERE embeddings.segment_id = ?)",
-            ).bind(segment_id.to_string()).fetch_one(&mut *tx).await?);
+            *sparse_presence = Some(
+                sqlx::query_scalar::<_, bool>(SPARSE_PRESENCE_QUERY)
+                    .bind(segment_id.to_string())
+                    .fetch_one(&mut *tx)
+                    .await?,
+            );
         }
         // A proven-absent segment needs no sparse DELETE per ordinary record.
         // Once true, remain conservative through later removals in this chunk.
@@ -2235,6 +2238,13 @@ async fn stop_get(segment: &chroma_types::SegmentUuid) {
         let _ = go_on.await;
     }
 }
+
+// Whether a segment has sparse metadata, asked once per apply_logs inside the write transaction. CROSS JOIN keeps the
+// sparse table as the outer loop: with JOIN, SQLite walked every embedding of the segment through its index on
+// segment_id and looked each one up in the sparse table, empty or not, so every write waited 27 ms at 325k
+// embeddings, more as the collection grew. Now the walk is bounded by the sparse rows, and a segment that has some
+// answers at its first.
+pub(crate) const SPARSE_PRESENCE_QUERY: &str = "SELECT EXISTS(SELECT 1 FROM embedding_metadata_sparse AS sparse CROSS JOIN embeddings ON embeddings.id = sparse.id WHERE embeddings.segment_id = ?)";
 
 #[cfg(test)]
 mod tests {
@@ -5336,5 +5346,74 @@ mod tests {
         let plan = make_get_plan(&cas, Some(contains_arr));
         let result = reader.get(plan).await.expect("get");
         assert_eq!(result.result.records.len(), 0);
+    }
+
+    // The sparse table is the outer loop of the presence check: SQLite does not walk the embeddings of the segment.
+    #[tokio::test]
+    async fn sparse_presence_starts_from_the_sparse_table() {
+        let db = get_new_sqlite_db().await;
+        // The detail of each step of the plan, its fourth column.
+        let plan: Vec<String> = sqlx::query(&format!("EXPLAIN QUERY PLAN {}", super::SPARSE_PRESENCE_QUERY))
+            .bind("segment")
+            .fetch_all(db.get_conn())
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| sqlx::Row::get::<String, _>(row, 3))
+            .collect();
+        let sparse = plan.iter().position(|step| step.contains("sparse"));
+        let embeddings = plan.iter().position(|step| step.contains("embeddings"));
+        assert!(
+            matches!((sparse, embeddings), (Some(s), Some(e)) if s < e),
+            "the sparse table must be scanned before the embeddings are searched: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("embeddings") && step.contains("segment_id")),
+            "the embeddings must not be walked by segment: {plan:?}"
+        );
+    }
+
+    // The presence check answers as before with sparse rows in the segment, only in another segment, and in none.
+    #[tokio::test]
+    async fn sparse_presence_answers_for_the_segment_only() {
+        let db = get_new_sqlite_db().await;
+        for (id, segment) in [(1, "a"), (2, "a"), (3, "b"), (4, "b")] {
+            sqlx::query("INSERT INTO embeddings (id, segment_id, embedding_id, seq_id) VALUES (?, ?, ?, ?)")
+                .bind(id)
+                .bind(segment)
+                .bind(format!("e{id}"))
+                .bind(vec![0u8])
+                .execute(db.get_conn())
+                .await
+                .unwrap();
+        }
+        let present = |segment: &'static str| {
+            let db = db.clone();
+            async move {
+                let new: bool = sqlx::query_scalar(super::SPARSE_PRESENCE_QUERY)
+                    .bind(segment)
+                    .fetch_one(db.get_conn())
+                    .await
+                    .unwrap();
+                let old: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM embedding_metadata_sparse AS sparse JOIN embeddings ON embeddings.id = sparse.id WHERE embeddings.segment_id = ?)")
+                    .bind(segment)
+                    .fetch_one(db.get_conn())
+                    .await
+                    .unwrap();
+                assert_eq!(new, old, "segment {segment}");
+                new
+            }
+        };
+        assert!(!present("a").await && !present("b").await && !present("c").await);
+        sqlx::query("INSERT INTO embedding_metadata_sparse (id, key, value) VALUES (3, 'k', '{}')")
+            .execute(db.get_conn())
+            .await
+            .unwrap();
+        assert!(!present("a").await && present("b").await && !present("c").await);
+        sqlx::query("INSERT INTO embedding_metadata_sparse (id, key, value) VALUES (2, 'k', '{}')")
+            .execute(db.get_conn())
+            .await
+            .unwrap();
+        assert!(present("a").await && present("b").await && !present("c").await);
     }
 }
