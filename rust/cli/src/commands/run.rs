@@ -5,6 +5,7 @@ use crate::ui_utils::{HOLIDAY_LOGO, LOGO};
 use crate::utils::CliError;
 use chroma_frontend::auth::AuthenticateAndAuthorize;
 use chroma_frontend::config::FrontendServerConfig;
+use chroma_frontend::executor::config::ExecutorConfig;
 use chroma_frontend::frontend_service_entrypoint_with_config;
 use chroma_frontend::token_auth::TokenAuthentication;
 use chroma_types::ServerInfo;
@@ -97,20 +98,26 @@ fn override_default_config_with_args(args: RunArgs) -> Result<FrontendServerConf
 
 /// The `server` block of `/api/v2/pre-flight-checks`: what VecturaDB has beyond the single node of Chroma. The
 /// release sets the version of this crate to the tag's (.github/workflows/ci.yml, "CLI version from the release tag").
-pub(crate) fn server_info() -> ServerInfo {
+/// spann when the server gives SPANN to the collections that ask for it: its local executor has the option on, and the
+/// server always has a data path.
+pub(crate) fn server_info(config: &FrontendServerConfig) -> ServerInfo {
+    let mut features: Vec<String> = [
+        "sparse_vector_index",
+        "bm25",
+        "search",
+        "fork",
+        "api_keys",
+        "indexing_status",
+    ]
+    .map(String::from)
+    .to_vec();
+    if matches!(&config.frontend.executor, ExecutorConfig::Local(local) if local.spann) {
+        features.push("spann".to_string());
+    }
     ServerInfo {
         name: "VecturaDB".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        features: [
-            "sparse_vector_index",
-            "bm25",
-            "search",
-            "fork",
-            "api_keys",
-            "indexing_status",
-        ]
-        .map(String::from)
-        .to_vec(),
+        features,
     }
 }
 
@@ -164,7 +171,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         }
     };
 
-    config.server_info = Some(server_info());
+    config.server_info = Some(server_info(&config));
 
     display_run_message(&config, &mut term);
 
@@ -200,6 +207,18 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(!validate_host(&"127.0.0.1".to_string(), port));
+    }
+
+    // The pre-flight checks declare spann when the server gives SPANN to the collections that ask for it, which it does
+    // by default, and not when the option is off.
+    #[test]
+    fn the_server_declares_spann_when_it_has_it() {
+        let mut config = FrontendServerConfig::single_node_default();
+        assert!(server_info(&config).features.contains(&"spann".to_string()));
+        if let ExecutorConfig::Local(local) = &mut config.frontend.executor {
+            local.spann = false;
+        }
+        assert!(!server_info(&config).features.contains(&"spann".to_string()));
     }
 
     #[test]
