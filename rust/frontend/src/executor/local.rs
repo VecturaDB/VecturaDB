@@ -52,6 +52,9 @@ pub struct LocalExecutor {
     // The records of the log after the last flush that a count of a SPANN collection reads at IndexAndBoundedWal.
     bounded_wal_limit: u32,
     spann_warm_up: SpannWarmUp,
+    // The files of the last flush of each SPANN collection that a write found readable (validate_spann_index), so that
+    // the next writes open them again only once a flush has replaced them, as the check of an HNSW index loads it once.
+    validated_spann: ValidatedSpann,
     /// Test switch: a search of a SPANN collection runs all in its snapshot of SQLite, as before spann_search took it
     /// in two moments, for the test that compares the answers of the two.
     #[cfg(test)]
@@ -73,6 +76,7 @@ impl LocalExecutor {
             retry: RetryConfig::default(),
             bounded_wal_limit: LocalExecutorConfig::default().bounded_wal_limit,
             spann_warm_up: SpannWarmUp::default(),
+            validated_spann: ValidatedSpann::default(),
             #[cfg(test)]
             search_in_one_snapshot: Default::default(),
         }
@@ -559,14 +563,27 @@ impl LocalExecutor {
         &self,
         collection_and_segments: &CollectionAndSegments,
     ) -> Result<(), Box<dyn ChromaError>> {
+        // Only the files: the records of the tail are in the log, which the write reaches anyway.
         let (_, collection_and_segments, _) = self
-            .snapshot_files(collection_and_segments, ReadLevel::IndexAndWal)
+            .snapshot_files(collection_and_segments, ReadLevel::IndexOnly)
             .await
             .map_err(|err| err.boxed())?;
-        // Only the files: the records of the tail are in the log, which the write reaches anyway.
+        let files = (
+            collection_and_segments.record_segment.file_path.clone(),
+            collection_and_segments.vector_segment.file_path.clone(),
+        );
+        let collection_id = collection_and_segments.collection.collection_id;
+        if self.validated_spann.lock().get(&collection_id) == Some(&files) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        self.validated_spann
+            .opened
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Box::pin(self.spann_view(&collection_and_segments, Chunk::new(Vec::new().into())))
             .await
             .map_err(|err| err.boxed())?;
+        self.validated_spann.lock().insert(collection_id, files);
         Ok(())
     }
 
@@ -1278,6 +1295,34 @@ impl LocalExecutor {
 // is only logged. A read never waits for an opening, and opens what it does not find in memory, as before.
 // Distributed Chroma prefetches the record and the metadata segments at the start of each get instead
 // (rust/worker/src/execution/orchestration/get.rs), into a cache on disk: its compactor runs in another process.
+// The files of the record and the SPANN segments of the last flush of each collection that validate_spann_index read,
+// shared by the clones of the executor.
+type SegmentFiles = (
+    std::collections::HashMap<String, Vec<String>>,
+    std::collections::HashMap<String, Vec<String>>,
+);
+
+#[derive(Clone, Debug, Default)]
+struct ValidatedSpann {
+    files: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<chroma_types::CollectionUuid, SegmentFiles>>,
+    >,
+    /// For tests: how many times the check opened the files.
+    #[cfg(test)]
+    pub(crate) opened: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ValidatedSpann {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        std::collections::HashMap<chroma_types::CollectionUuid, SegmentFiles>,
+    > {
+        self.files.lock().unwrap_or_else(|err| err.into_inner())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 #[allow(clippy::type_complexity)]
 struct SpannWarmUp {
@@ -2101,6 +2146,14 @@ impl LocalExecutor {
     /// Whether the collection is marked as read since its last flush.
     pub(crate) fn spann_marked_read(&self, collection_id: chroma_types::CollectionUuid) -> bool {
         SpannWarmUp::lock(&self.spann_warm_up.read).contains(&collection_id)
+    }
+
+    /// For tests: how many times the check of the files of a SPANN collection before a write opened them.
+    #[cfg(test)]
+    pub(crate) fn spann_files_checked(&self) -> usize {
+        self.validated_spann
+            .opened
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The manager of the segments, whose cleanup of SPANN files the tests call.

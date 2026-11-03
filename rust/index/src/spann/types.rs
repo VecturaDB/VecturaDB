@@ -4480,6 +4480,74 @@ mod tests {
         });
     }
 
+    // On vectors around centres, as embeddings are, the writer of distributed Chroma with its default configuration
+    // keeps postings of tens of records: 5,000 records around 100 centres leave fewer than 1 head for 10 records. On
+    // uniform random vectors it makes about 1 head for 2 records, which slows every write of a SPANN collection down.
+    #[test]
+    fn clustered_vectors_keep_few_heads() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .thread_stack_size(8 * 1024 * 1024)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let tmp_dir = tempfile::tempdir().unwrap();
+            let storage = Storage::Local(LocalStorage::new(tmp_dir.path().to_str().unwrap()));
+            let blockfile_provider =
+                new_blockfile_provider_for_tests(8 * 1024 * 1024, storage.clone());
+            let hnsw_provider = new_hnsw_provider_for_tests(storage);
+            let gc_context = GarbageCollectionContext::try_from_config(
+                &(
+                    PlGarbageCollectionConfig {
+                        enabled: true,
+                        policy: PlGarbageCollectionPolicyConfig::RandomSample(
+                            RandomSamplePolicyConfig { sample_size: 0.1 },
+                        ),
+                    },
+                    HnswGarbageCollectionConfig {
+                        enabled: true,
+                        policy: HnswGarbageCollectionPolicyConfig::FullRebuild,
+                    },
+                ),
+                &Registry::default(),
+            )
+            .await
+            .unwrap();
+            let mut writer = SpannIndexWriter::from_id(
+                &hnsw_provider,
+                None,
+                None,
+                None,
+                None,
+                &CollectionUuid::new(),
+                "",
+                64,
+                &blockfile_provider,
+                InternalSpannConfiguration::default(),
+                gc_context,
+                5 * 1024 * 1024,
+                SpannMetrics::default(),
+                None,
+            )
+            .await
+            .unwrap();
+            let mut rng = rand::thread_rng();
+            let centres: Vec<Vec<f32>> = (0..100)
+                .map(|_| (0..64).map(|_| rng.gen::<f32>()).collect())
+                .collect();
+            for id in 1..=5000u32 {
+                let centre = &centres[rng.gen_range(0..100)];
+                let embedding: Vec<f32> = centre
+                    .iter()
+                    .map(|x| x + (rng.gen::<f32>() - 0.5) * 0.17)
+                    .collect();
+                writer.add(id, &embedding).await.unwrap();
+            }
+            writer.garbage_collect().await.unwrap();
+            let heads = writer.hnsw_index.inner.read().hnsw_index.len();
+            assert!(heads < 500, "{heads} heads for 5,000 records");
+        });
+    }
+
     // NOTE(Sanket): It is non-trivial to use shuttle for this test since it requires
     // a tokio runtime for creating the hnsw provider - the cache requires a mpsc channel,
     // the construction of hnsw provider calls async tokio filesystem apis that also need

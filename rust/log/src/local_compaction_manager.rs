@@ -48,7 +48,10 @@ pub struct LocalCompactionManagerConfig {
     /// The records of the log after its last flush from which a collection flushes.
     #[serde(default = "LocalCompactionManagerConfig::default_min_compaction_size")]
     pub min_compaction_size: usize,
-    /// The records of the log that one flush writes at most.
+    /// The records of the log that one flush writes at most: 50,000 on the single node, where a flush of the timer that
+    /// takes them all is followed by the next at once; the compactor of distributed Chroma takes 10,000
+    /// (rust/worker/chroma_config.yaml), and the measures of the single node under a continuous load drained the log too
+    /// slowly with them.
     #[serde(default = "LocalCompactionManagerConfig::default_max_compaction_size")]
     pub max_compaction_size: usize,
     /// How long the oldest record of the log after the last flush waits, at most, before its collection flushes with
@@ -73,7 +76,7 @@ impl LocalCompactionManagerConfig {
     }
 
     fn default_max_compaction_size() -> usize {
-        10_000
+        50_000
     }
 
     fn default_timeout_us() -> u64 {
@@ -653,6 +656,22 @@ impl Handler<ScheduledCompactMessage> for LocalCompactionManager {
         if let Log::Sqlite(log) = &self.log {
             log.spann_round_started(self.compaction_interval, self.max_compaction_size as u64);
         }
+        // As the compaction manager of distributed Chroma, which schedules its next round once the compactions of this
+        // one are kicked off, not once they end (rust/worker/src/compactor/compaction_manager.rs): a collection whose
+        // flush takes less than the interval flushes again an interval after the start of its flush, and one still
+        // flushing is skipped by the next round, below.
+        ctx.scheduler.schedule(
+            ScheduledCompactMessage {},
+            self.compaction_interval,
+            ctx,
+            || {
+                Some(tracing::span!(
+                    parent: None,
+                    tracing::Level::INFO,
+                    "Scheduled compaction"
+                ))
+            },
+        );
         let collections = match self.spann_collections_to_compact().await {
             Ok(collections) => collections,
             Err(err) => {
@@ -683,24 +702,11 @@ impl Handler<SpannRoundDone> for LocalCompactionManager {
     async fn handle(
         &mut self,
         message: SpannRoundDone,
-        ctx: &ComponentContext<LocalCompactionManager>,
+        _ctx: &ComponentContext<LocalCompactionManager>,
     ) {
         if let Log::Sqlite(log) = &self.log {
             log.spann_round_ended();
         }
-        // As distributed Chroma: the next compaction once this one is done.
-        ctx.scheduler.schedule(
-            ScheduledCompactMessage {},
-            self.compaction_interval,
-            ctx,
-            || {
-                Some(tracing::span!(
-                    parent: None,
-                    tracing::Level::INFO,
-                    "Scheduled compaction"
-                ))
-            },
-        );
         // The message of the round may come from no one who waits for it, as from the scheduler.
         let _ = message.round.send(());
     }
@@ -754,7 +760,9 @@ impl Handler<SpannFlushed> for LocalCompactionManager {
             collection_id,
             result,
         } = message;
+        let full = matches!(&result, Ok(Some((_, flush))) if flush.full);
         let result = self.finish_spann_flush(collection_id, result).await;
+        let flushed = result.is_ok();
         if let Err(err) = &result {
             tracing::warn!(
                 collection_id = %collection_id,
@@ -767,10 +775,17 @@ impl Handler<SpannFlushed> for LocalCompactionManager {
             .running
             .remove(&collection_id)
             .unwrap_or_default();
+        // A flush asked by a one-off request does as much as it was asked: only the flushes of the timer go on.
+        let of_the_timer = requests.is_empty();
         answer_flush_requests(requests, result);
         // The one-off flushes asked while this one ran get their own, now that it ended.
         if let Some(queued) = self.spann_flushes.queued.remove(&collection_id) {
             self.spann_flushes.running.insert(collection_id, queued);
+            self.launch_spann_flushes(vec![collection_id], None, ctx);
+        } else if full && flushed && of_the_timer {
+            // A flush of the timer that took max_compaction_size records leaves more waiting: the next one starts now,
+            // not at the next round, so that a collection written faster than one flush a round takes catches up.
+            self.spann_flushes.running.insert(collection_id, Vec::new());
             self.launch_spann_flushes(vec![collection_id], None, ctx);
         }
     }
@@ -797,6 +812,8 @@ struct SpannFlush {
     log_position: i64,
     record_files: HashMap<String, Vec<String>>,
     vector_files: HashMap<String, Vec<String>>,
+    // Whether the flush took max_compaction_size records, so that more may wait for the next one.
+    full: bool,
 }
 
 impl LocalCompactionManager {
@@ -1091,6 +1108,7 @@ impl SpannFlusher {
         // A write puts its records in the log, then applies them to the metadata: the records past the metadata, if any,
         // wait for it.
         logs.retain(|log| log.log_offset <= applied);
+        let full = logs.len() >= self.max_compaction_size;
         if let Some(stop) = &self.stop {
             stop.stop().await;
         }
@@ -1102,7 +1120,10 @@ impl SpannFlusher {
             )
             .await;
         let flush = match flush {
-            Ok(Some(flush)) => self.register(&collection_and_segments, flush).await,
+            Ok(Some(flush)) => {
+                self.register(&collection_and_segments, SpannFlush { full, ..flush })
+                    .await
+            }
             other => other,
         };
         if flush.is_err() {
@@ -1265,6 +1286,7 @@ impl SpannFlusher {
             log_position,
             record_files,
             vector_files,
+            full: false,
         }))
     }
 }

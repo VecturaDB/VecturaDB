@@ -1805,3 +1805,136 @@ async fn a_stop_during_a_flush_waits_for_it_and_leaves_the_data_right_impl() {
     );
     assert_eq!(status(&mut reopened, collection_id).await.2, 12);
 }
+
+// As the compaction manager of distributed Chroma, a round of the timer schedules the next one when it starts, not when
+// its flushes end: while the flush of one collection runs, the next round flushes another collection, and skips the one
+// still flushing. Before, no round started until the flushes of the last one had ended.
+#[test]
+fn a_round_starts_while_a_flush_of_the_last_one_runs() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        a_round_starts_while_a_flush_of_the_last_one_runs_impl,
+    )
+}
+
+async fn a_round_starts_while_a_flush_of_the_last_one_runs_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = Registry::new();
+    let stop = chroma_log::SpannFlushStop::default();
+    registry.register(stop.clone());
+    let executor = crate::executor::config::LocalExecutorConfig {
+        spann: true,
+        ..Default::default()
+    };
+    let flushes = chroma_log::LocalCompactionManagerConfig {
+        compaction_interval_sec: 1,
+        ..Default::default()
+    };
+    let mut frontend = frontend_with_flushes(root.path(), executor, flushes, &registry).await;
+    let held = empty_spann_collection(&mut frontend, "held").await;
+    add_numbers(&mut frontend, held, 0..12).await;
+    tokio::time::timeout(std::time::Duration::from_secs(60), stop.reached())
+        .await
+        .expect("no round of the timer flushed in 60 s, the limit of the wait");
+    let other = empty_spann_collection(&mut frontend, "other").await;
+    add_numbers(&mut frontend, other, 0..12).await;
+    let flushed_meanwhile = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while status(&mut frontend, other).await.2 < 12 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    stop.go_on();
+    assert!(
+        flushed_meanwhile.is_ok(),
+        "no round flushed the other collection while the first flush ran, up to 30 s"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while status(&mut frontend, held).await.2 < 12 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the held flush did not end in 60 s, the limit of the wait");
+}
+
+// A write to a SPANN collection checks that the files of its last flush can be read once for each flush, as the check of
+// an HNSW index loads it once: 20 writes with no flush between them open the files once, and the first write after a
+// flush opens the new ones. Before, every write opened them.
+#[test]
+fn a_write_checks_the_files_of_a_flush_once() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_write_checks_the_files_of_a_flush_once_impl,
+    )
+}
+
+async fn a_write_checks_the_files_of_a_flush_once_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let collection_id = empty_spann_collection(&mut frontend, "checked").await;
+    add_numbers(&mut frontend, collection_id, 0..12).await;
+    local_executor(&frontend)
+        .flush_spann(collection_id)
+        .await
+        .unwrap();
+    let before = local_executor(&frontend).spann_files_checked();
+    for n in 12..32 {
+        add_numbers(&mut frontend, collection_id, n..n + 1).await;
+    }
+    assert_eq!(local_executor(&frontend).spann_files_checked() - before, 1);
+    local_executor(&frontend)
+        .flush_spann(collection_id)
+        .await
+        .unwrap();
+    add_numbers(&mut frontend, collection_id, 32..33).await;
+    add_numbers(&mut frontend, collection_id, 33..34).await;
+    assert_eq!(local_executor(&frontend).spann_files_checked() - before, 2);
+    assert_eq!(
+        get_ids(&mut frontend, collection_id, None, None, 0)
+            .await
+            .len(),
+        34
+    );
+}
+
+// A flush that takes max_compaction_size records leaves more waiting, and the next flush of the collection starts as
+// soon as it ends, not a round later: a round of a collection with 3 flushes waiting flushes them all.
+#[test]
+fn a_full_flush_is_followed_by_the_next_one_at_once() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        a_full_flush_is_followed_by_the_next_one_at_once_impl,
+    )
+}
+
+async fn a_full_flush_is_followed_by_the_next_one_at_once_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let executor = crate::executor::config::LocalExecutorConfig {
+        spann: true,
+        ..Default::default()
+    };
+    let flushes = chroma_log::LocalCompactionManagerConfig {
+        compaction_interval_sec: 3600,
+        max_compaction_size: 10,
+        ..Default::default()
+    };
+    let mut frontend =
+        frontend_with_flushes(root.path(), executor, flushes, &Registry::new()).await;
+    let collection_id = empty_spann_collection(&mut frontend, "chained").await;
+    add_numbers(&mut frontend, collection_id, 0..30).await;
+    local_executor(&frontend).compaction_round().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while status(&mut frontend, collection_id).await.2 < 30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the 30 records were not all flushed by one round in 60 s, the limit of the wait");
+    assert_eq!(
+        get_ids(&mut frontend, collection_id, None, None, 0)
+            .await
+            .len(),
+        30
+    );
+}
