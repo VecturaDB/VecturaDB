@@ -273,6 +273,43 @@ mod tests {
         assert_eq!(files_of(dir.path()), vec!["chroma.sqlite3"]);
     }
 
+    // A connection that comes back to the pool while the pool closes stays open in it: the wait of sqlx 0.8.6 ends with the
+    // last permit, which that connection gives back, and nothing takes it after. The close takes it too, and the database
+    // file is alone.
+    #[tokio::test]
+    async fn a_connection_that_comes_back_during_the_close_is_closed_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chroma.sqlite3");
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let conn = SqlitePoolOptions::new()
+            .after_release(move |_, _| {
+                let late = first.swap(false, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    if late {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    Ok(true)
+                })
+            })
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal),
+            )
+            .await
+            .unwrap();
+        let db = SqliteDb::new(conn, MigrationHash::MD5);
+        sqlx::query("CREATE TABLE written (value INTEGER)")
+            .execute(db.get_conn())
+            .await
+            .unwrap();
+        // The connection is on its way back, past the check of the pool on its close.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        db.close_within(Duration::from_secs(5)).await;
+        assert_eq!(files_of(dir.path()), vec!["chroma.sqlite3"]);
+    }
+
     // journal_mode delete keeps the rollback journal of Chroma, for a data path on a network filesystem.
     #[tokio::test]
     async fn a_database_file_keeps_a_rollback_journal_when_asked() {
