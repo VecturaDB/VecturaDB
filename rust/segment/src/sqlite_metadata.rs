@@ -1588,6 +1588,8 @@ impl SqliteMetadataReader {
         snapshot: &mut MetadataSnapshot,
         collection: &chroma_types::CollectionAndSegments,
         payloads: &[chroma_types::plan::SearchPayload],
+        // The rows that the caller may leave out of a sparse leaf, which then gives as many more.
+        unseen: u32,
     ) -> Result<Vec<SpannSearchSqlite>, SqliteMetadataError> {
         use chroma_types::operator::QueryVector;
         let conn: &mut sqlx::SqliteConnection = &mut snapshot.tx;
@@ -1611,7 +1613,7 @@ impl SqliteMetadataReader {
                                         &payload.filter,
                                         &knn.key.to_string(),
                                         &query,
-                                        knn.limit,
+                                        knn.limit.saturating_add(unseen),
                                     )
                                     .await?;
                                 Some(self.user_ids_of_rows(conn, collection, measures).await?)

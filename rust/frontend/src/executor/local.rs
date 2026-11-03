@@ -65,6 +65,9 @@ pub struct LocalExecutor {
     /// in two moments, for the test that compares the answers of the two.
     #[cfg(test)]
     pub(crate) search_in_one_snapshot: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// For tests: the rows that SQLite gave for the sparse leaves of the last search of a SPANN collection.
+    #[cfg(test)]
+    pub(crate) search_sparse_rows: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Test switch: a read of a SPANN collection takes its tail by the reference path, the whole tail read from the log,
     /// materialized and searched by brute force, as today, for the oracle test that compares it with the default path.
     /// Today the two are the same path; a faster tail (an index of the recent records) goes behind the default only.
@@ -91,6 +94,8 @@ impl LocalExecutor {
             recent_tails: RecentTails::default(),
             #[cfg(test)]
             search_in_one_snapshot: Default::default(),
+            #[cfg(test)]
+            search_sparse_rows: Default::default(),
             #[cfg(test)]
             spann_tail_reference: Default::default(),
         }
@@ -1335,8 +1340,14 @@ impl LocalExecutor {
             return self.spann_search_in_one_snapshot(plan).await;
         }
         let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
+        // As distributed Chroma (rust/worker/src/server.rs:712): a search reads the log as its read level asks. SQLite
+        // holds the records of the whole log, whatever the level: below IndexAndWal the records it gives that this read
+        // does not see are left out. One difference from distributed Chroma, whose metadata stops at its last compaction:
+        // filters and sparse leaves read the current data of the records.
+        let read_level = plan.read_level;
+        let whole_log = read_level == ReadLevel::IndexAndWal;
         let (mut snapshot, collection_and_segments, tail) = self
-            .spann_snapshot(&plan.scan.collection_and_segments, ReadLevel::IndexAndWal)
+            .spann_snapshot(&plan.scan.collection_and_segments, read_level)
             .await?;
         // As distributed Chroma (rust/worker/src/server.rs:697-701): an uninitialized collection has no results.
         if collection_and_segments.is_uninitialized() {
@@ -1345,11 +1356,40 @@ impl LocalExecutor {
                 pulled_log_bytes: 0,
             });
         }
+        // The rows of the log that a sparse leaf may give and this read leave out, at most one for each record after the flush:
+        // a sparse leaf asks for as many more, so that its answer is not short.
+        let unseen = if whole_log {
+            0
+        } else {
+            let applied = snapshot
+                .max_seq_id(&collection_and_segments.metadata_segment.id)
+                .await
+                .map_err(internal)?;
+            let flushed = snapshot
+                .max_seq_id(&collection_and_segments.vector_segment.id)
+                .await
+                .map_err(internal)?;
+            u32::try_from(applied.saturating_sub(flushed)).unwrap_or(u32::MAX)
+        };
         let sqlite = self
             .metadata_reader
-            .spann_search_sqlite_at(&mut snapshot, &collection_and_segments, &plan.payloads)
+            .spann_search_sqlite_at(
+                &mut snapshot,
+                &collection_and_segments,
+                &plan.payloads,
+                unseen,
+            )
             .await
             .map_err(internal)?;
+        #[cfg(test)]
+        self.search_sparse_rows.store(
+            sqlite
+                .iter()
+                .flat_map(|part| part.sparse.iter().flatten())
+                .map(Vec::len)
+                .sum(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         snapshot.close().await.map_err(internal)?;
         let Some(spann) = Box::pin(self.spann_view(&collection_and_segments, tail)).await? else {
             // A collection without its dimension, which no write has reached: SQLite holds none of its records either,
@@ -1379,8 +1419,10 @@ impl LocalExecutor {
                     for (knn, sparse) in expr.knn_queries().into_iter().zip(sqlite.sparse) {
                         knn_results.push(match (knn.query, sparse) {
                             (_, Some(sparse)) => {
-                                let mut measures = spann.measures_by_offset(sparse).await?;
+                                let mut measures =
+                                    spann.measures_by_offset(sparse, whole_log).await?;
                                 measures.sort_unstable();
+                                measures.truncate(knn.limit as usize);
                                 measures
                             }
                             (QueryVector::Dense(query), None) => {
@@ -1434,6 +1476,7 @@ impl LocalExecutor {
                                 .enumerate()
                                 .map(|(position, user_id)| (user_id, position as f32))
                                 .collect(),
+                            whole_log,
                         )
                         .await?
                 }
@@ -2130,15 +2173,19 @@ impl SpannView<'_> {
     async fn measures_by_offset(
         &self,
         measures: Vec<(String, f32)>,
+        whole_log: bool,
     ) -> Result<Vec<RecordMeasure>, ExecutorError> {
         let mut by_offset = Vec::with_capacity(measures.len());
         for (user_id, measure) in measures {
-            let offset_id = self
+            match self
                 .offset_id(&user_id)
                 .await
                 .map_err(ExecutorError::Internal)?
-                .ok_or(ExecutorError::InconsistentData)?;
-            by_offset.push(RecordMeasure { offset_id, measure });
+            {
+                Some(offset_id) => by_offset.push(RecordMeasure { offset_id, measure }),
+                None if whole_log => return Err(ExecutorError::InconsistentData),
+                None => {}
+            }
         }
         Ok(by_offset)
     }
