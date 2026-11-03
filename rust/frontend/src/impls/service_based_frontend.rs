@@ -4454,6 +4454,8 @@ mod tests {
     fn no_timer_flush() -> chroma_log::LocalCompactionManagerConfig {
         chroma_log::LocalCompactionManagerConfig {
             compaction_interval_sec: 3600,
+            // Small partitions, so that the small logs of the tests flush in several of them, at once.
+            max_partition_size: 7,
             ..Default::default()
         }
     }

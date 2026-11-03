@@ -318,12 +318,17 @@ mod tests {
                 config.compaction_interval_sec,
                 config.min_compaction_size,
                 config.timeout_us,
+                config.max_partition_size,
+                config.max_concurrent_jobs,
             )
         };
-        assert_eq!(read("allow_reset: false\n"), (10, 10, 86_400_000_000));
+        assert_eq!(
+            read("allow_reset: false\n"),
+            (10, 10, 86_400_000_000, 5_000, 50)
+        );
         assert_eq!(
             read("local_compaction_manager:\n  compaction_interval_sec: 30\n"),
-            (30, 10, 86_400_000_000)
+            (30, 10, 86_400_000_000, 5_000, 50)
         );
     }
 

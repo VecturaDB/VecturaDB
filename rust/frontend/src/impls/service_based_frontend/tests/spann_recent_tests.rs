@@ -666,3 +666,61 @@ async fn a_filter_selects_by_the_metadata_of_the_last_update_impl() {
         .remove(0);
     assert_eq!(filtered, ["r0"]);
 }
+
+// Records at equal distances from the query: 10 rings of 4, each ring at its own distance, written ring after ring
+// interleaved, so that the records of a ring are apart in the log.
+async fn add_rings(frontend: &mut ServiceBasedFrontend, collection_id: CollectionUuid) {
+    let directions = [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]];
+    let (mut ids, mut vectors) = (Vec::new(), Vec::new());
+    for i in 0..40usize {
+        let (ring, direction) = (i % 10, directions[i / 10]);
+        let radius = (ring + 1) as f32;
+        ids.push(format!("r{i:02}"));
+        vectors.push(vec![direction[0] * radius, direction[1] * radius]);
+    }
+    frontend
+        .add(
+            AddCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                ids,
+                vectors,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+// Federico (3/11), option (a): records of equal score keep the order of their offset ids, as distributed Chroma, and a
+// flush gives the new records their offset ids in the order of the log, as a read of the tail does: the same query
+// answers the records of a ring in the same order before and after a flush that runs in several partitions at once.
+// With the partitions materialized at once, as distributed Chroma, the order of the ids goes with that of the tasks.
+#[test]
+fn a_flush_keeps_the_order_of_records_of_equal_score() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        a_flush_keeps_the_order_of_records_of_equal_score_impl,
+    )
+}
+
+async fn a_flush_keeps_the_order_of_records_of_equal_score_impl() {
+    for round in 0..10 {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann_registry(root.path(), true, &Registry::new()).await;
+        let collection_id = empty_spann_collection(&mut frontend, "rings").await;
+        add_rings(&mut frontend, collection_id).await;
+        let before = nearest(&mut frontend, collection_id, vec![0.0, 0.0], 40).await;
+        let expected: Vec<String> = (0..10)
+            .flat_map(|ring| (0..4).map(move |direction| format!("r{:02}", ring + 10 * direction)))
+            .collect();
+        assert_eq!(before, expected, "before the flush, round {round}");
+        flush_spann(&frontend, collection_id).await;
+        let after = nearest(&mut frontend, collection_id, vec![0.0, 0.0], 40).await;
+        assert_eq!(after, expected, "after the flush, round {round}");
+    }
+}

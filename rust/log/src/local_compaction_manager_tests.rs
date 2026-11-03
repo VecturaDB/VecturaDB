@@ -94,6 +94,8 @@ impl Fixture {
             compaction_interval: Duration::from_secs(10),
             min_compaction_size: 10,
             max_compaction_size: 10_000,
+            max_partition_size: 5_000,
+            max_concurrent_jobs: 50,
             compaction_timeout: Duration::from_secs(86_400),
             spann_flushes: SpannFlushes::default(),
             spann_flush_stop: None,
@@ -234,6 +236,8 @@ impl Fixture {
             compaction_interval: Duration::from_secs(10),
             min_compaction_size: 10,
             max_compaction_size: 10_000,
+            max_partition_size: 5_000,
+            max_concurrent_jobs: 50,
             compaction_timeout: Duration::from_secs(86_400),
             spann_flushes: SpannFlushes::default(),
             spann_flush_stop: None,
@@ -1569,6 +1573,8 @@ async fn replaced_spann_versions_are_forgotten_after_the_grace() {
         compaction_interval: Duration::from_secs(10),
         min_compaction_size: 10,
         max_compaction_size: 10_000,
+        max_partition_size: 5_000,
+        max_concurrent_jobs: 50,
         compaction_timeout: Duration::from_secs(86_400),
         spann_flushes: SpannFlushes::default(),
         spann_flush_stop: None,
@@ -1598,4 +1604,184 @@ async fn replaced_spann_versions_are_forgotten_after_the_grace() {
         "{} segments remembered",
         compactor.spann_versions.len()
     );
+}
+
+fn partition_log(ids: &[&str]) -> Chunk<LogRecord> {
+    let logs: Vec<LogRecord> = ids
+        .iter()
+        .enumerate()
+        .map(|(offset, id)| LogRecord {
+            log_offset: offset as i64,
+            record: OperationRecord {
+                id: id.to_string(),
+                embedding: None,
+                encoding: None,
+                metadata: None,
+                document: None,
+                operation: Operation::Add,
+            },
+        })
+        .collect();
+    Chunk::new(logs.into())
+}
+
+fn partition_ids(partition: &Chunk<LogRecord>) -> Vec<String> {
+    partition
+        .iter()
+        .map(|(log, _)| log.record.id.clone())
+        .collect()
+}
+
+// Federico: «Ordine fisso». The partitions follow the first record of each id in the log, whatever the hashes of the ids:
+// with the order of a HashMap, as distributed Chroma, this fails.
+#[test]
+fn partitions_follow_the_order_of_the_log() {
+    let ids: Vec<String> = (0..1000).map(|i| format!("id{i}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let partitions = partition_records(&partition_log(&refs), 10, false);
+    assert_eq!(partitions.len(), 100);
+    let mut seen = Vec::new();
+    for partition in &partitions {
+        seen.extend(partition_ids(partition));
+    }
+    assert_eq!(seen, ids);
+}
+
+#[test]
+fn all_the_records_of_an_id_stay_in_one_partition() {
+    let partitions = partition_records(&partition_log(&["a", "b", "a", "c", "b", "a"]), 2, false);
+    assert_eq!(partition_ids(&partitions[0]), ["a", "a", "a"]);
+    assert_eq!(partition_ids(&partitions[1]), ["b", "b"]);
+    assert_eq!(partition_ids(&partitions[2]), ["c"]);
+}
+
+#[test]
+fn the_chunks_of_a_document_stay_together_only_when_the_collection_asks() {
+    let log = partition_log(&["doc-0", "x", "doc-1", "report-2024-a"]);
+    let grouped = partition_records(&log, 1, true);
+    assert_eq!(partition_ids(&grouped[0]), ["doc-0", "doc-1"]);
+    let apart = partition_records(&log, 1, false);
+    assert_eq!(partition_ids(&apart[0]), ["doc-0"]);
+    assert_eq!(apart.len(), 4);
+}
+
+// The tasks of a flush run on the threads of the flushes, not on those of whoever spawns them, at most 4 at once, as the 4
+// worker threads of the dispatcher of the compactor of distributed Chroma.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flush_tasks_run_on_their_own_threads_at_most_four_at_once() {
+    let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let most = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut tasks = JoinSet::new();
+    for _ in 0..16 {
+        let (running, most) = (running.clone(), most.clone());
+        spawn_flush_task(&mut tasks, async move {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            running.fetch_sub(1, Ordering::SeqCst);
+            Ok(std::thread::current().name().map(str::to_string))
+        });
+    }
+    while let Some(thread) = next_flush_task(&mut tasks).await.unwrap() {
+        assert_eq!(thread.as_deref(), Some(FLUSH_THREAD_NAME));
+    }
+    let most = most.load(Ordering::SeqCst);
+    assert!(
+        (2..=FLUSH_THREADS).contains(&most),
+        "{most} tasks ran at once"
+    );
+}
+
+// A failed task ends the flush at once: its error comes while another task still runs, and the end of the tasks stops that
+// one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_flush_task_ends_the_others() {
+    let (running, stopped) = oneshot::channel::<()>();
+    let mut tasks = JoinSet::new();
+    spawn_flush_task(&mut tasks, async move {
+        let _running = running;
+        std::future::pending::<()>().await;
+        Ok(())
+    });
+    spawn_flush_task(&mut tasks, async {
+        Err(CompactionManagerError::SpannFlushPanicked)
+    });
+    let failed = tokio::time::timeout(Duration::from_secs(30), next_flush_task(&mut tasks))
+        .await
+        .expect("the error did not come in 30 s, the limit of the wait");
+    assert!(matches!(
+        failed,
+        Err(CompactionManagerError::SpannFlushPanicked)
+    ));
+    drop(tasks);
+    tokio::time::timeout(Duration::from_secs(30), stopped)
+        .await
+        .expect("the other task did not stop in 30 s, the limit of the wait")
+        .unwrap_err();
+}
+
+// The files of a flush of 30 records, in partitions of 7, of a SPANN collection with no files yet, with a stage that fails.
+async fn write_spann_failing_at(
+    fail_at: Option<FlushStage>,
+) -> Result<Option<SpannFlush>, CompactionManagerError> {
+    let f = Fixture::new().await;
+    let mut collection = f.collection.clone();
+    collection.schema = Some(Schema::new_default(KnnIndex::Spann));
+    let segment = |r#type, scope| Segment {
+        id: SegmentUuid::new(),
+        r#type,
+        scope,
+        collection: collection.collection_id,
+        metadata: None,
+        file_path: Default::default(),
+    };
+    let collection_and_segments = CollectionAndSegments {
+        metadata_segment: segment(SegmentType::Sqlite, SegmentScope::METADATA),
+        record_segment: segment(SegmentType::BlockfileRecord, SegmentScope::RECORD),
+        vector_segment: segment(SegmentType::Spann, SegmentScope::VECTOR),
+        collection: collection.clone(),
+    };
+    let flusher = SpannFlusher {
+        log: Log::Sqlite(f.log.clone()),
+        sqlite_db: f.db.clone(),
+        hnsw_segment_manager: f.manager.clone(),
+        sysdb: SysDb::Test(f.sysdb.clone()),
+        max_compaction_size: 50_000,
+        max_partition_size: 7,
+        stop: None,
+        fail_at,
+    };
+    let logs: Vec<LogRecord> = (0..30)
+        .map(|id| LogRecord {
+            log_offset: id as i64 + 1,
+            record: OperationRecord {
+                embedding: Some(vec![id as f32, 1.0, 2.0]),
+                ..operation(id)
+            },
+        })
+        .collect();
+    let flush =
+        Box::pin(flusher.write_spann(&collection_and_segments, 3, Chunk::new(logs.into()))).await;
+    f.stop().await;
+    flush
+}
+
+// A failure while the records are applied or the segments committed fails the flush. With the error lost, a flush that
+// failed would look done, and its records would be registered as flushed without being in its files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_fails_when_any_of_its_stages_fails() {
+    let done = write_spann_failing_at(None).await.unwrap().unwrap();
+    assert_eq!(done.log_position, 30);
+    for stage in [
+        FlushStage::RecordApply,
+        FlushStage::SpannApply,
+        FlushStage::RecordCommit,
+        FlushStage::SpannCommit,
+    ] {
+        let flush = write_spann_failing_at(Some(stage)).await;
+        assert!(
+            matches!(flush, Err(CompactionManagerError::SpannFlushPanicked)),
+            "{stage:?}: the flush did not fail"
+        );
+    }
 }

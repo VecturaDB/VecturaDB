@@ -1941,3 +1941,111 @@ async fn a_full_flush_is_followed_by_the_next_one_at_once_impl() {
         30
     );
 }
+
+// A flush of a SPANN collection runs on the threads of the flushes, apart from those that answer the reads.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_spann_flush_runs_on_threads_of_its_own() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        a_spann_flush_runs_on_threads_of_its_own_impl,
+    )
+}
+
+#[cfg(target_os = "linux")]
+async fn a_spann_flush_runs_on_threads_of_its_own_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann_registry(root.path(), true, &Registry::new()).await;
+    let collection_id = empty_spann_collection(&mut frontend, "threads").await;
+    add_numbers(&mut frontend, collection_id, 0..12).await;
+    flush_spann(&frontend, collection_id).await;
+    let threads = std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|task| std::fs::read_to_string(task.unwrap().path().join("comm")).ok())
+        .filter(|name| name.trim() == "spann-flush")
+        .count();
+    assert!(threads >= 4, "{threads} threads of the flushes");
+}
+
+// While the flush of a collection runs, the flush of another collection of the same round goes on and ends, as
+// max_concurrent_jobs of the compactor of distributed Chroma. One after the other, the second would wait for the first.
+#[test]
+fn two_spann_collections_flush_at_once() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        two_spann_collections_flush_at_once_impl,
+    )
+}
+
+async fn two_spann_collections_flush_at_once_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut frontend, stop) = frontend_with_a_stopped_flush(root.path()).await;
+    let first = empty_spann_collection(&mut frontend, "first").await;
+    let second = empty_spann_collection(&mut frontend, "second").await;
+    add_numbers(&mut frontend, first, 0..12).await;
+    add_numbers(&mut frontend, second, 0..12).await;
+    let round = a_round_that_stops(&frontend, &stop).await;
+    let one_flushed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while status(&mut frontend, first).await.2 < 12
+            && status(&mut frontend, second).await.2 < 12
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    stop.go_on();
+    assert!(
+        one_flushed.is_ok(),
+        "no collection flushed while the flush of the other one ran, up to 30 s"
+    );
+    round.await.unwrap().unwrap();
+    assert_eq!(status(&mut frontend, first).await.2, 12);
+    assert_eq!(status(&mut frontend, second).await.2, 12);
+}
+
+// A record that a partition cannot materialize fails the flush, which registers nothing: its records keep waiting in the log.
+#[test]
+fn a_record_that_cannot_be_materialized_fails_the_flush() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        a_record_that_cannot_be_materialized_fails_the_flush_impl,
+    )
+}
+
+async fn a_record_that_cannot_be_materialized_fails_the_flush_impl() {
+    use chroma_config::Configurable;
+    let root = tempfile::tempdir().unwrap();
+    let registry = Registry::new();
+    let mut frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+    let collection_id = empty_spann_collection(&mut frontend, "failed").await;
+    add_numbers(&mut frontend, collection_id, 0..3).await;
+    // A log of its own: an add with no vector, which the frontend refuses.
+    let mut log = chroma_log::Log::Sqlite(
+        chroma_log::sqlite_log::SqliteLog::try_from_config(&Default::default(), &registry)
+            .await
+            .unwrap(),
+    );
+    log.push_logs(
+        TENANT,
+        DatabaseName::new(DATABASE).unwrap(),
+        collection_id,
+        vec![chroma_types::OperationRecord {
+            id: "no vector".to_string(),
+            embedding: None,
+            encoding: None,
+            metadata: None,
+            document: None,
+            operation: chroma_types::Operation::Add,
+        }],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    add_numbers(&mut frontend, collection_id, 3..30).await;
+    assert!(local_executor(&frontend)
+        .flush_spann(collection_id)
+        .await
+        .is_err());
+    assert_eq!(status(&mut frontend, collection_id).await.2, 0);
+}
