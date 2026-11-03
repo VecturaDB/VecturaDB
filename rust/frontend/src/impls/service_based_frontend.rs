@@ -708,6 +708,7 @@ impl ServiceBasedFrontend {
             .collect();
         Ok(GetResult {
             pulled_log_bytes: total_pulled_log_bytes,
+            applied_log_offset: None,
             result: ProjectionOutput {
                 records: merged_records,
             },
@@ -3265,8 +3266,19 @@ impl ServiceBasedFrontend {
         .map_err(|err| Self::map_occ_read_executor_error(err, read_plan.stale_read_token))?;
         let return_bytes = get_result.size_bytes();
         let pulled_log_bytes = get_result.pulled_log_bytes;
+        // On the single node a conditional read takes as its token the record after the last one that the metadata
+        // segment had applied when the get read it, not the tail of the log, so a commit not yet applied falls after
+        // the token and its conflict check sees it (from the read itself, as log_upper_bound_offset).
+        let applied_log_offset = get_result.applied_log_offset;
         let mut get_response: GetResponse = (get_result, include).into();
         if let Some(read_token) = read_plan.response_read_token {
+            let read_token = match (&self.log_client, occ_read_mode, applied_log_offset) {
+                (Log::Sqlite(_), OccReadMode::Capture, Some(applied)) => {
+                    OccReadToken::try_new(applied + 1)
+                        .map_err(|err| QueryError::Other(Box::new(err)))?
+                }
+                _ => read_token,
+            };
             get_response.set_occ_read_token(read_token);
         }
 
@@ -4924,6 +4936,192 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending, 0);
+    }
+
+    // A conditional get of the record "c" with its metadata.
+    async fn conditional_get_of_c(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+    ) -> GetResponse {
+        let request = GetRequest::try_new(
+            TENANT.to_string(),
+            DATABASE.to_string(),
+            collection_id,
+            Some(vec!["c".to_string()]),
+            None,
+            None,
+            0,
+            chroma_types::IncludeList(vec![chroma_types::Include::Metadata]),
+        )
+        .unwrap()
+        .with_occ_read_token_generation();
+        frontend.get(request).await.unwrap()
+    }
+
+    // The record "c" with n = 0.
+    async fn add_c(frontend: &mut ServiceBasedFrontend, collection_id: CollectionUuid) {
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    vec!["c".to_string()],
+                    vec![vec![1.0, 2.0]],
+                    None,
+                    None,
+                    Some(vec![Some(chroma_types::Metadata::from([(
+                        "n".to_string(),
+                        MetadataValue::Int(0),
+                    )]))]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // In the log, a commit of n = 1 on the record "c" that the segments have not applied, as between push_logs and its
+    // backfill.
+    async fn commit_of_c_not_applied(db: &SqliteDb) {
+        sqlx::query(
+            "INSERT INTO embeddings_queue (operation, topic, id, vector, encoding, metadata) \
+             SELECT 1, topic, id, vector, encoding, '{\"n\": 1}' FROM embeddings_queue WHERE id = 'c'",
+        )
+        .execute(db.get_conn())
+        .await
+        .unwrap();
+    }
+
+    // A commit at the token of a read, which read the record "c" and adds the record "d": whether it was refused, and how.
+    async fn commit_after_reading_c(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        token: u64,
+    ) -> Result<(), String> {
+        frontend
+            .conditional_commit(
+                ConditionalCommitRequest {
+                    buffered_writes: vec![ConditionalBufferedWrite::Add(
+                        AddCollectionRecordsRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            vec!["d".to_string()],
+                            vec![vec![1.0, 2.0]],
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    )],
+                    observed_log_offset: Some(token as i64),
+                    read_ids: vec!["c".to_string()],
+                },
+                String::new(),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
+    // A conditional read sees every record before its token, or a commit at that token conflicts with the records it
+    // missed: as the log service of distributed Chroma (the lost update of the oracle of 01/11).
+    async fn a_commit_not_applied_is_seen_or_conflicts(
+        frontend: &mut ServiceBasedFrontend,
+        db: &SqliteDb,
+        collection_id: CollectionUuid,
+    ) {
+        add_c(frontend, collection_id).await;
+        conditional_get_of_c(frontend, collection_id).await;
+        commit_of_c_not_applied(db).await;
+        let read = conditional_get_of_c(frontend, collection_id).await;
+        let seen = read.metadatas.unwrap()[0].as_ref().unwrap()["n"].clone();
+        let token = read.occ_read_token.unwrap().log_upper_bound_offset();
+        let commit = commit_after_reading_c(frontend, collection_id, token).await;
+        assert!(
+            seen == MetadataValue::Int(1)
+                || commit
+                    .as_ref()
+                    .is_err_and(|err| err.contains("conditional write conflict")),
+            "the read saw n = {seen:?} at token {token} and its commit gave {commit:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conditional_read_sees_the_log_before_its_token_or_its_commit_conflicts() {
+        let registry = Registry::new();
+        let system = System::new();
+        let mut config = FrontendConfig::sqlite_in_memory();
+        config.enable_transactions = true;
+        config.enable_log_scouting = true;
+        let mut frontend = ServiceBasedFrontend::try_from_config(&(config, system), &registry)
+            .await
+            .unwrap();
+        let db = registry.get::<SqliteDb>().unwrap();
+        let collection_id = create_collection_for(&mut frontend, TENANT, DATABASE, "lost_update")
+            .await
+            .collection_id;
+        a_commit_not_applied_is_seen_or_conflicts(&mut frontend, &db, collection_id).await;
+    }
+
+    #[test]
+    fn a_conditional_read_of_spann_sees_the_log_before_its_token_or_its_commit_conflicts() {
+        on_a_large_stack(TestRuntime::CurrentThread, || async {
+            let root = tempfile::tempdir().unwrap();
+            let registry = Registry::new();
+            let mut frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+            let db = registry.get::<SqliteDb>().unwrap();
+            let collection_id =
+                spann_tail_tests::empty_spann_collection(&mut frontend, "lost_update").await;
+            a_commit_not_applied_is_seen_or_conflicts(&mut frontend, &db, collection_id).await;
+        })
+    }
+
+    // A conditional read whose own get applies the log takes a token past what it applied, so that its commit does not
+    // conflict with the records it read: as log_upper_bound_offset in distributed Chroma, the token of a read is the
+    // position it read at (the false conflicts of the oracle of 01/11). A new frontend on the data replays the log in its
+    // first get, which applies the row inserted by hand after the first frontend stopped.
+    async fn a_read_that_applies_the_log_commits_without_a_conflict(spann: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let collection_id = {
+            let mut frontend = frontend_with_spann(root.path(), spann).await;
+            let collection_id = if spann {
+                spann_tail_tests::empty_spann_collection(&mut frontend, "own_backfill").await
+            } else {
+                create_collection_for(&mut frontend, TENANT, DATABASE, "own_backfill")
+                    .await
+                    .collection_id
+            };
+            add_c(&mut frontend, collection_id).await;
+            collection_id
+        };
+        let registry = Registry::new();
+        let mut frontend = frontend_with_spann_registry(root.path(), spann, &registry).await;
+        commit_of_c_not_applied(&registry.get::<SqliteDb>().unwrap()).await;
+        let read = conditional_get_of_c(&mut frontend, collection_id).await;
+        assert_eq!(
+            read.metadatas.unwrap()[0].as_ref().unwrap()["n"],
+            MetadataValue::Int(1)
+        );
+        let token = read.occ_read_token.unwrap().log_upper_bound_offset();
+        let commit = commit_after_reading_c(&mut frontend, collection_id, token).await;
+        assert!(
+            commit.is_ok(),
+            "the read saw n = 1 at token {token} and its commit gave {commit:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conditional_read_that_applies_the_log_commits_without_a_conflict() {
+        a_read_that_applies_the_log_commits_without_a_conflict(false).await;
+    }
+
+    #[test]
+    fn a_conditional_read_of_spann_that_applies_the_log_commits_without_a_conflict() {
+        on_a_large_stack(TestRuntime::CurrentThread, || {
+            a_read_that_applies_the_log_commits_without_a_conflict(true)
+        })
     }
 
     #[tokio::test]

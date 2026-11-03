@@ -446,6 +446,7 @@ impl Handler<TaskResult<ProjectionOutput, ProjectionError>> for GetOrchestrator 
             Ok(GetResult {
                 pulled_log_bytes,
                 result: output,
+                applied_log_offset: None,
             }),
             ctx,
         )

@@ -408,6 +408,7 @@ impl TestReferenceSegment {
 
         Ok(GetResult {
             pulled_log_bytes: 0,
+            applied_log_offset: None,
             result: ProjectionOutput {
                 records: records
                     .into_iter()
