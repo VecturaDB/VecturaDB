@@ -3,7 +3,7 @@ use crate::grpc_log::{GrpcLog, GrpcPushLogsError, GrpcSealLogError, ScoutLogFrag
 use crate::in_memory_log::InMemoryLog;
 use crate::sqlite_log::{SqliteLog, SqlitePushLogsError};
 use crate::types::CollectionInfo;
-use chroma_api_types::CONDITIONAL_WRITE_CONFLICT_MESSAGE;
+use chroma_api_types::{StaleReadError, CONDITIONAL_WRITE_CONFLICT_MESSAGE};
 use chroma_error::{ChromaError, ErrorCodes};
 use chroma_memberlist::client_manager::ClientAssignmentError;
 use chroma_types::{
@@ -63,6 +63,9 @@ pub enum PushLogsError {
     /// The conditional write was rejected because the observed log state changed.
     #[error("conditional write conflict")]
     ConditionalWriteConflict,
+    /// The log can no longer check the conditional write: stale, as a read at its token.
+    #[error(transparent)]
+    StaleRead(#[from] StaleReadError),
     /// The record count cannot be represented by the log-service API.
     #[error("too many records in push_logs request: {0}")]
     RecordCountOutOfRange(usize),
@@ -78,6 +81,7 @@ impl ChromaError for PushLogsError {
             PushLogsError::BackoffCompaction { .. } => ErrorCodes::ResourceExhausted,
             PushLogsError::ConditionalWritesUnsupported(_) => ErrorCodes::Unimplemented,
             PushLogsError::ConditionalWriteConflict => ErrorCodes::AlreadyExists,
+            PushLogsError::StaleRead(e) => e.code(),
             PushLogsError::RecordCountOutOfRange(_) => ErrorCodes::InvalidArgument,
             PushLogsError::Other(e) => e.code(),
         }
@@ -267,6 +271,7 @@ impl Log {
                         SqlitePushLogsError::ConditionalWriteConflict => {
                             PushLogsError::ConditionalWriteConflict
                         }
+                        SqlitePushLogsError::StaleRead(err) => PushLogsError::StaleRead(err),
                         other => PushLogsError::Other(Box::new(other)),
                     })?;
                 Ok(PushLogsResult {

@@ -4,6 +4,7 @@ use crate::{
     LocalCompactionManager, PurgeLogsMessage,
 };
 use async_trait::async_trait;
+use chroma_api_types::StaleReadError;
 use chroma_config::Configurable;
 use chroma_error::{ChromaError, ErrorCodes, WrappedSqlxError};
 use chroma_sqlite::{db::SqliteDb, helpers::get_embeddings_queue_topic_name};
@@ -85,6 +86,9 @@ pub enum SqlitePushLogsError {
     ConditionalWriteConflict,
     #[error("{1}")]
     ConditionalWriteRefused(ErrorCodes, &'static str),
+    // A commit that the log can no longer check, stale as a read at its token, so that a client starts it again.
+    #[error("{0}")]
+    StaleRead(#[from] StaleReadError),
 }
 
 impl ChromaError for SqlitePushLogsError {
@@ -103,6 +107,7 @@ impl ChromaError for SqlitePushLogsError {
             SqlitePushLogsError::BackoffCompaction { .. } => ErrorCodes::ResourceExhausted,
             SqlitePushLogsError::ConditionalWriteConflict => ErrorCodes::Aborted,
             SqlitePushLogsError::ConditionalWriteRefused(code, _) => *code,
+            SqlitePushLogsError::StaleRead(err) => err.code(),
         }
     }
 }
@@ -592,10 +597,11 @@ impl SqliteLog {
                 .may_be_purged(&mut *tx, collection_id, observed)
                 .await?
         {
-            return Err(refused(
-                ErrorCodes::FailedPrecondition,
+            return Err(StaleReadError::version_purged(
+                observed as u64,
                 "observed_log_offset is before the readable log lower bound",
-            ));
+            )
+            .into());
         }
         let ids: Vec<String> =
             sqlx::query_scalar("SELECT id FROM embeddings_queue WHERE topic = ? AND seq_id >= ?")
@@ -1574,13 +1580,10 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(log.log_position(collection).await.unwrap(), 2);
-        assert_eq!(
-            refused(push_conditional(&mut log, collection, &["c"], &condition(1, &[])).await),
-            (
-                ErrorCodes::FailedPrecondition,
-                "observed_log_offset is before the readable log lower bound"
-            )
-        );
+        assert!(matches!(
+            push_conditional(&mut log, collection, &["c"], &condition(1, &[])).await,
+            Err(SqlitePushLogsError::StaleRead(_))
+        ));
         push_conditional(&mut log, collection, &["c"], &condition(2, &[]))
             .await
             .unwrap();
@@ -1649,10 +1652,7 @@ mod tests {
         assert_eq!(rows(&log).await, 2);
         assert!(matches!(
             push_conditional(&mut log, collection, &["e"], &condition(observed, &[])).await,
-            Err(SqlitePushLogsError::ConditionalWriteRefused(
-                ErrorCodes::FailedPrecondition,
-                _
-            ))
+            Err(SqlitePushLogsError::StaleRead(_))
         ));
     }
 
@@ -1711,10 +1711,7 @@ mod tests {
             assert!(
                 matches!(
                     push_conditional(&mut log, collection, &["e"], &condition(observed, &[])).await,
-                    Err(SqlitePushLogsError::ConditionalWriteRefused(
-                        ErrorCodes::FailedPrecondition,
-                        _
-                    ))
+                    Err(SqlitePushLogsError::StaleRead(_))
                 ),
                 "offset {observed}"
             );
@@ -1866,10 +1863,7 @@ mod tests {
         applied_up_to_for_the_tests(&log, collection, 3).await;
         assert!(matches!(
             push_conditional(&mut log, collection, &["d"], &condition(2, &[])).await,
-            Err(SqlitePushLogsError::ConditionalWriteRefused(
-                ErrorCodes::FailedPrecondition,
-                _
-            ))
+            Err(SqlitePushLogsError::StaleRead(_))
         ));
         // From the watermark on, nothing was purged.
         push_conditional(&mut log, collection, &["d"], &condition(3, &[]))
@@ -1907,10 +1901,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             push_conditional(&mut log, collection, &["c"], &condition(2, &[])).await,
-            Err(SqlitePushLogsError::ConditionalWriteRefused(
-                ErrorCodes::FailedPrecondition,
-                _
-            ))
+            Err(SqlitePushLogsError::StaleRead(_))
         ));
     }
 

@@ -2380,6 +2380,7 @@ impl ServiceBasedFrontend {
             Err(PushLogsError::Backoff | PushLogsError::BackoffCompaction { .. }) => {
                 Err(ConditionalCommitError::Backoff)
             }
+            Err(PushLogsError::StaleRead(err)) => Err(ConditionalCommitError::StaleRead(err)),
             Err(other) => Err(ConditionalCommitError::Other(Box::new(other))),
         }
     }
@@ -5423,6 +5424,59 @@ mod tests {
             .unwrap()
             .log_upper_bound_offset();
         assert_eq!(next, token + 2);
+    }
+
+    // A commit that the log can no longer check is stale, as a read at its token: the clients start it again on that name.
+    #[tokio::test]
+    async fn a_conditional_commit_below_the_readable_log_is_stale() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        let mut frontend = frontend_with_spann_registry(root.path(), false, &registry).await;
+        let collection_id = create_collection_for(&mut frontend, TENANT, DATABASE, "stale_commit")
+            .await
+            .collection_id;
+        add_c(&mut frontend, collection_id).await;
+        // The first use of the collection, past its first record: as after a restart.
+        sqlx::query(
+            "INSERT OR REPLACE INTO max_seq_id (segment_id, seq_id) \
+             SELECT id, 1 FROM segments WHERE collection = ?",
+        )
+        .bind(collection_id.0.to_string())
+        .execute(registry.get::<SqliteDb>().unwrap().get_conn())
+        .await
+        .unwrap();
+        let err = frontend
+            .conditional_commit(
+                ConditionalCommitRequest {
+                    buffered_writes: vec![ConditionalBufferedWrite::Add(
+                        AddCollectionRecordsRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            vec!["d".to_string()],
+                            vec![vec![1.0, 2.0]],
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    )],
+                    observed_log_offset: Some(0),
+                    read_ids: vec!["c".to_string()],
+                },
+                String::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), chroma_error::ErrorCodes::FailedPrecondition);
+        assert!(
+            chroma_error::source_chain_contains(&err, |source| source.is::<StaleReadError>()),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("readable log lower bound"),
+            "{err}"
+        );
     }
 
     // A conditional read of the record "c", or of a filter on n when `ids` is off, at a token.
