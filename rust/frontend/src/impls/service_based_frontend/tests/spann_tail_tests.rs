@@ -69,7 +69,10 @@ async fn vector_files(
 }
 
 // A SPANN collection with no record yet.
-async fn empty_spann_collection(frontend: &mut ServiceBasedFrontend, name: &str) -> CollectionUuid {
+pub(super) async fn empty_spann_collection(
+    frontend: &mut ServiceBasedFrontend,
+    name: &str,
+) -> CollectionUuid {
     frontend
         .create_collection(
             CreateCollectionRequest::try_new(
@@ -654,7 +657,7 @@ async fn reads_differ_from(
 }
 
 // The ids that a get of a collection answers, with the filter, the limit and the offset given.
-async fn get_ids(
+pub(super) async fn get_ids(
     frontend: &mut ServiceBasedFrontend,
     collection_id: CollectionUuid,
     where_clause: Option<chroma_types::Where>,
@@ -1804,4 +1807,245 @@ async fn a_stop_during_a_flush_waits_for_it_and_leaves_the_data_right_impl() {
         12
     );
     assert_eq!(status(&mut reopened, collection_id).await.2, 12);
+}
+
+// As the compaction manager of distributed Chroma, a round of the timer schedules the next one when it starts, not when
+// its flushes end: while the flush of one collection runs, the next round flushes another collection, and skips the one
+// still flushing. Before, no round started until the flushes of the last one had ended.
+#[test]
+fn a_round_starts_while_a_flush_of_the_last_one_runs() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        a_round_starts_while_a_flush_of_the_last_one_runs_impl,
+    )
+}
+
+async fn a_round_starts_while_a_flush_of_the_last_one_runs_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = Registry::new();
+    let stop = chroma_log::SpannFlushStop::default();
+    registry.register(stop.clone());
+    let executor = crate::executor::config::LocalExecutorConfig {
+        spann: true,
+        ..Default::default()
+    };
+    let flushes = chroma_log::LocalCompactionManagerConfig {
+        compaction_interval_sec: 1,
+        ..Default::default()
+    };
+    let mut frontend = frontend_with_flushes(root.path(), executor, flushes, &registry).await;
+    let held = empty_spann_collection(&mut frontend, "held").await;
+    add_numbers(&mut frontend, held, 0..12).await;
+    tokio::time::timeout(std::time::Duration::from_secs(60), stop.reached())
+        .await
+        .expect("no round of the timer flushed in 60 s, the limit of the wait");
+    let other = empty_spann_collection(&mut frontend, "other").await;
+    add_numbers(&mut frontend, other, 0..12).await;
+    let flushed_meanwhile = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while status(&mut frontend, other).await.2 < 12 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    stop.go_on();
+    assert!(
+        flushed_meanwhile.is_ok(),
+        "no round flushed the other collection while the first flush ran, up to 30 s"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while status(&mut frontend, held).await.2 < 12 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the held flush did not end in 60 s, the limit of the wait");
+}
+
+// A write to a SPANN collection checks that the files of its last flush can be read once for each flush, as the check of
+// an HNSW index loads it once: 20 writes with no flush between them open the files once, and the first write after a
+// flush opens the new ones. Before, every write opened them.
+#[test]
+fn a_write_checks_the_files_of_a_flush_once() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_write_checks_the_files_of_a_flush_once_impl,
+    )
+}
+
+async fn a_write_checks_the_files_of_a_flush_once_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let collection_id = empty_spann_collection(&mut frontend, "checked").await;
+    add_numbers(&mut frontend, collection_id, 0..12).await;
+    local_executor(&frontend)
+        .flush_spann(collection_id)
+        .await
+        .unwrap();
+    let before = local_executor(&frontend).spann_files_checked();
+    for n in 12..32 {
+        add_numbers(&mut frontend, collection_id, n..n + 1).await;
+    }
+    assert_eq!(local_executor(&frontend).spann_files_checked() - before, 1);
+    local_executor(&frontend)
+        .flush_spann(collection_id)
+        .await
+        .unwrap();
+    add_numbers(&mut frontend, collection_id, 32..33).await;
+    add_numbers(&mut frontend, collection_id, 33..34).await;
+    assert_eq!(local_executor(&frontend).spann_files_checked() - before, 2);
+    assert_eq!(
+        get_ids(&mut frontend, collection_id, None, None, 0)
+            .await
+            .len(),
+        34
+    );
+}
+
+// A flush that takes max_compaction_size records leaves more waiting, and the next flush of the collection starts as
+// soon as it ends, not a round later: a round of a collection with 3 flushes waiting flushes them all.
+#[test]
+fn a_full_flush_is_followed_by_the_next_one_at_once() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        a_full_flush_is_followed_by_the_next_one_at_once_impl,
+    )
+}
+
+async fn a_full_flush_is_followed_by_the_next_one_at_once_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let executor = crate::executor::config::LocalExecutorConfig {
+        spann: true,
+        ..Default::default()
+    };
+    let flushes = chroma_log::LocalCompactionManagerConfig {
+        compaction_interval_sec: 3600,
+        max_compaction_size: 10,
+        ..Default::default()
+    };
+    let mut frontend =
+        frontend_with_flushes(root.path(), executor, flushes, &Registry::new()).await;
+    let collection_id = empty_spann_collection(&mut frontend, "chained").await;
+    add_numbers(&mut frontend, collection_id, 0..30).await;
+    local_executor(&frontend).compaction_round().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while status(&mut frontend, collection_id).await.2 < 30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the 30 records were not all flushed by one round in 60 s, the limit of the wait");
+    assert_eq!(
+        get_ids(&mut frontend, collection_id, None, None, 0)
+            .await
+            .len(),
+        30
+    );
+}
+
+// A flush of a SPANN collection runs on the threads of the flushes, apart from those that answer the reads.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_spann_flush_runs_on_threads_of_its_own() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        a_spann_flush_runs_on_threads_of_its_own_impl,
+    )
+}
+
+#[cfg(target_os = "linux")]
+async fn a_spann_flush_runs_on_threads_of_its_own_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann_registry(root.path(), true, &Registry::new()).await;
+    let collection_id = empty_spann_collection(&mut frontend, "threads").await;
+    add_numbers(&mut frontend, collection_id, 0..12).await;
+    flush_spann(&frontend, collection_id).await;
+    let threads = std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|task| std::fs::read_to_string(task.unwrap().path().join("comm")).ok())
+        .filter(|name| name.trim() == "spann-flush")
+        .count();
+    assert!(threads >= 4, "{threads} threads of the flushes");
+}
+
+// While the flush of a collection runs, the flush of another collection of the same round goes on and ends, as
+// max_concurrent_jobs of the compactor of distributed Chroma. One after the other, the second would wait for the first.
+#[test]
+fn two_spann_collections_flush_at_once() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        two_spann_collections_flush_at_once_impl,
+    )
+}
+
+async fn two_spann_collections_flush_at_once_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut frontend, stop) = frontend_with_a_stopped_flush(root.path()).await;
+    let first = empty_spann_collection(&mut frontend, "first").await;
+    let second = empty_spann_collection(&mut frontend, "second").await;
+    add_numbers(&mut frontend, first, 0..12).await;
+    add_numbers(&mut frontend, second, 0..12).await;
+    let round = a_round_that_stops(&frontend, &stop).await;
+    let one_flushed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while status(&mut frontend, first).await.2 < 12
+            && status(&mut frontend, second).await.2 < 12
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    stop.go_on();
+    assert!(
+        one_flushed.is_ok(),
+        "no collection flushed while the flush of the other one ran, up to 30 s"
+    );
+    round.await.unwrap().unwrap();
+    assert_eq!(status(&mut frontend, first).await.2, 12);
+    assert_eq!(status(&mut frontend, second).await.2, 12);
+}
+
+// A record that a partition cannot materialize fails the flush, which registers nothing: its records keep waiting in the log.
+#[test]
+fn a_record_that_cannot_be_materialized_fails_the_flush() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        a_record_that_cannot_be_materialized_fails_the_flush_impl,
+    )
+}
+
+async fn a_record_that_cannot_be_materialized_fails_the_flush_impl() {
+    use chroma_config::Configurable;
+    let root = tempfile::tempdir().unwrap();
+    let registry = Registry::new();
+    let mut frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+    let collection_id = empty_spann_collection(&mut frontend, "failed").await;
+    add_numbers(&mut frontend, collection_id, 0..3).await;
+    // A log of its own: an add with no vector, which the frontend refuses.
+    let mut log = chroma_log::Log::Sqlite(
+        chroma_log::sqlite_log::SqliteLog::try_from_config(&Default::default(), &registry)
+            .await
+            .unwrap(),
+    );
+    log.push_logs(
+        TENANT,
+        DatabaseName::new(DATABASE).unwrap(),
+        collection_id,
+        vec![chroma_types::OperationRecord {
+            id: "no vector".to_string(),
+            embedding: None,
+            encoding: None,
+            metadata: None,
+            document: None,
+            operation: chroma_types::Operation::Add,
+        }],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    add_numbers(&mut frontend, collection_id, 3..30).await;
+    assert!(local_executor(&frontend)
+        .flush_spann(collection_id)
+        .await
+        .is_err());
+    assert_eq!(status(&mut frontend, collection_id).await.2, 0);
 }

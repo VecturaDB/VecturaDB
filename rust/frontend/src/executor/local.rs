@@ -19,7 +19,10 @@ use chroma_segment::{
     sqlite_metadata::{
         DenseVectorReader, MetadataSnapshot, SqliteMetadataError, SqliteMetadataReader,
     },
-    types::{materialize_logs, MaterializeLogsResult},
+    types::{
+        materialize_logs, materialize_logs_incrementally, LogMaterializerError,
+        MaterializeLogsResult,
+    },
 };
 use chroma_sqlite::db::SqliteDb;
 use chroma_system::ComponentHandle;
@@ -52,10 +55,21 @@ pub struct LocalExecutor {
     // The records of the log after the last flush that a count of a SPANN collection reads at IndexAndBoundedWal.
     bounded_wal_limit: u32,
     spann_warm_up: SpannWarmUp,
+    // The files of the last flush of each SPANN collection that a write found readable (validate_spann_index), so that
+    // the next writes open them again only once a flush has replaced them, as the check of an HNSW index loads it once.
+    validated_spann: ValidatedSpann,
+    // The tail of the log of each SPANN collection after its last flush, as a read last took it from SQLite, so that the
+    // next read takes only the records written since (snapshot_files).
+    recent_tails: RecentTails,
     /// Test switch: a search of a SPANN collection runs all in its snapshot of SQLite, as before spann_search took it
     /// in two moments, for the test that compares the answers of the two.
     #[cfg(test)]
     pub(crate) search_in_one_snapshot: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Test switch: a read of a SPANN collection takes its tail by the reference path, the whole tail read from the log,
+    /// materialized and searched by brute force, as today, for the oracle test that compares it with the default path.
+    /// Today the two are the same path; a faster tail (an index of the recent records) goes behind the default only.
+    #[cfg(test)]
+    pub(crate) spann_tail_reference: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LocalExecutor {
@@ -73,8 +87,12 @@ impl LocalExecutor {
             retry: RetryConfig::default(),
             bounded_wal_limit: LocalExecutorConfig::default().bounded_wal_limit,
             spann_warm_up: SpannWarmUp::default(),
+            validated_spann: ValidatedSpann::default(),
+            recent_tails: RecentTails::default(),
             #[cfg(test)]
             search_in_one_snapshot: Default::default(),
+            #[cfg(test)]
+            spann_tail_reference: Default::default(),
         }
     }
 
@@ -150,6 +168,9 @@ impl LocalExecutor {
         segments: &[Segment],
     ) -> Result<(), Box<dyn ChromaError>> {
         let (removed, failure) = self.remove_segment_files(segments).await;
+        for segment in segments {
+            self.recent_tails.forget(&segment.collection);
+        }
         self.forget_deleted_indexes(&removed).await?;
         failure.map_or(Ok(()), Err)
     }
@@ -484,23 +505,111 @@ impl LocalExecutor {
             ReadLevel::IndexOnly => Some(0),
             ReadLevel::IndexAndBoundedWal => Some(self.bounded_wal_limit),
         };
-        let tail = if applied > flushed && limit != Some(0) {
-            self.log
-                .as_ref()
-                .ok_or(ExecutorError::InconsistentData)?
-                .read_tail(
+        #[cfg(test)]
+        let reference = self
+            .spann_tail_reference
+            .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let reference = false;
+        let log = self.log.as_ref().ok_or(ExecutorError::InconsistentData);
+        let collection_id = collection_and_segments.collection.collection_id;
+        let tail = if applied <= flushed || limit == Some(0) {
+            Chunk::new(Vec::new().into())
+        } else if limit.is_none() && !reference {
+            // The whole tail: the records a read took before for the same flush, and from SQLite only those written since,
+            // all under the lock of the collection. A snapshot older than the last flush a read saw takes its own tail
+            // from SQLite and leaves them as they are.
+            let entry = self.recent_tails.entry(collection_id);
+            let mut tail = entry.lock().await;
+            if flushed < tail.flushed {
+                drop(tail);
+                Chunk::new(
+                    log?.read_tail(
+                        snapshot.connection(),
+                        collection_id,
+                        flushed as i64,
+                        applied as i64,
+                        None,
+                    )
+                    .await
+                    .map_err(|err| ExecutorError::Internal(err.boxed()))?
+                    .into(),
+                )
+            } else {
+                if flushed > tail.flushed {
+                    *tail = RecentTail {
+                        flushed,
+                        last: flushed,
+                        logs: None,
+                        materialized: None,
+                        next_offset_id: None,
+                    };
+                }
+                if tail.last < applied {
+                    let new = log?
+                        .read_tail(
+                            snapshot.connection(),
+                            collection_id,
+                            tail.last as i64,
+                            applied as i64,
+                            None,
+                        )
+                        .await
+                        .map_err(|err| ExecutorError::Internal(err.boxed()))?;
+                    #[cfg(test)]
+                    {
+                        self.recent_tails
+                            .reads
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.recent_tails
+                            .records_read
+                            .fetch_add(new.len(), std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // The tail is one chunk, shared with the reads and the cached materialization: the records are copied
+                    // once, when new ones arrive, not on every read.
+                    let old = tail.logs.take();
+                    let old_len = old.as_ref().map_or(0, |logs| logs.total_len());
+                    let mut logs = Vec::with_capacity(old_len + new.len());
+                    if let Some(old) = &old {
+                        logs.extend((0..old_len).filter_map(|index| old.get(index).cloned()));
+                    }
+                    logs.extend(new);
+                    tail.logs = Some(Chunk::new(logs.into()));
+                    tail.last = applied;
+                }
+                let logs = tail
+                    .logs
+                    .clone()
+                    .unwrap_or_else(|| Chunk::new(Vec::new().into()));
+                if tail.last > applied {
+                    // A snapshot older than the last read takes the records of its own moment only.
+                    Chunk::new(
+                        logs.iter()
+                            .map(|(record, _)| record)
+                            .take_while(|record| record.log_offset as u64 <= applied)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .into(),
+                    )
+                } else {
+                    logs
+                }
+            }
+        } else {
+            Chunk::new(
+                log?.read_tail(
                     snapshot.connection(),
-                    collection_and_segments.collection.collection_id,
+                    collection_id,
                     flushed as i64,
                     applied as i64,
                     limit,
                 )
                 .await
                 .map_err(|err| ExecutorError::Internal(err.boxed()))?
-        } else {
-            Vec::new()
+                .into(),
+            )
         };
-        Ok((snapshot, collection_and_segments, Chunk::new(tail.into())))
+        Ok((snapshot, collection_and_segments, tail))
     }
 
     /// The records of a SPANN collection in the files of its last flush, and the records of its log after that flush,
@@ -559,14 +668,27 @@ impl LocalExecutor {
         &self,
         collection_and_segments: &CollectionAndSegments,
     ) -> Result<(), Box<dyn ChromaError>> {
+        // Only the files: the records of the tail are in the log, which the write reaches anyway.
         let (_, collection_and_segments, _) = self
-            .snapshot_files(collection_and_segments, ReadLevel::IndexAndWal)
+            .snapshot_files(collection_and_segments, ReadLevel::IndexOnly)
             .await
             .map_err(|err| err.boxed())?;
-        // Only the files: the records of the tail are in the log, which the write reaches anyway.
+        let files = (
+            collection_and_segments.record_segment.file_path.clone(),
+            collection_and_segments.vector_segment.file_path.clone(),
+        );
+        let collection_id = collection_and_segments.collection.collection_id;
+        if self.validated_spann.lock().get(&collection_id) == Some(&files) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        self.validated_spann
+            .opened
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Box::pin(self.spann_view(&collection_and_segments, Chunk::new(Vec::new().into())))
             .await
             .map_err(|err| err.boxed())?;
+        self.validated_spann.lock().insert(collection_id, files);
         Ok(())
     }
 
@@ -936,6 +1058,96 @@ impl LocalExecutor {
     // The records of a SPANN collection at one moment: the SPANN index and the record segment at the files of its last
     // flush, none before its first flush, and the tail of the log after that flush, materialized on that record segment;
     // none for a collection without a dimension, which no write has reached yet.
+    // The tail of a SPANN collection materialized on the record segment of its flush, as distributed Chroma materializes
+    // the logs it fetches (rust/worker/src/execution/operators/knn_log.rs). When the tail is the one the cache of the
+    // collection holds, its materialization is kept there and the next read materializes again only the ids that the
+    // records written since touch (materialize_logs_incrementally); otherwise, as for an older snapshot or the reference
+    // path of the tests, the whole tail is materialized.
+    async fn materialize_tail(
+        &self,
+        collection_and_segments: &CollectionAndSegments,
+        records: &Option<RecordSegmentReaderShard<'_>>,
+        tail: Chunk<LogRecord>,
+    ) -> Result<MaterializeLogsResult, LogMaterializerError> {
+        let options = RecordSegmentReaderOptions::default();
+        #[cfg(test)]
+        let reference = self
+            .spann_tail_reference
+            .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let reference = false;
+        let (Some(first), Some(last)) = (tail.get(0), tail.get(tail.total_len().wrapping_sub(1)))
+        else {
+            return materialize_logs(records, tail, None, &options).await;
+        };
+        let (first, last, len) = (
+            first.log_offset as u64,
+            last.log_offset as u64,
+            tail.total_len(),
+        );
+        if reference {
+            return materialize_logs(records, tail, None, &options).await;
+        }
+        let entry = self
+            .recent_tails
+            .entry(collection_and_segments.collection.collection_id);
+        let mut cached = entry.lock().await;
+        // The tail of this read must be the cached one, from its first record.
+        let Some(logs) = cached.logs.clone() else {
+            drop(cached);
+            return materialize_logs(records, tail, None, &options).await;
+        };
+        let is_cached = logs.total_len() == len
+            && logs.get(0).map(|log| log.log_offset as u64) == Some(first)
+            && cached.last == last;
+        if !is_cached {
+            drop(cached);
+            return materialize_logs(records, tail, None, &options).await;
+        }
+        let next_offset_id = cached
+            .next_offset_id
+            .get_or_insert_with(|| {
+                let next = records
+                    .as_ref()
+                    .map(|reader| reader.get_max_offset_id() + 1)
+                    .unwrap_or(1);
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(next))
+            })
+            .clone();
+        let flushed = cached.flushed;
+        let previous = cached.materialized.clone();
+        if let Some((upto, previous)) = &previous {
+            if *upto == last {
+                return Ok(previous.clone());
+            }
+        }
+        // The materialization runs without the lock, so that the other reads of the collection do not wait for it: two
+        // reads may do the same work, and the newer result stays in the cache.
+        drop(cached);
+        #[cfg(test)]
+        self.recent_tails
+            .materializations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let materialized = match previous {
+            Some((upto, previous)) if upto < last => {
+                materialize_logs_incrementally(records, &previous, logs, next_offset_id, &options)
+                    .await?
+            }
+            _ => materialize_logs(records, tail, Some(next_offset_id), &options).await?,
+        };
+        #[cfg(test)]
+        self.recent_tails.wait_at_a_gate().await;
+        let mut cached = entry.lock().await;
+        let newer = cached
+            .materialized
+            .as_ref()
+            .is_some_and(|(upto, _)| *upto >= last);
+        if cached.flushed == flushed && !newer {
+            cached.materialized = Some((last, materialized.clone()));
+        }
+        Ok(materialized)
+    }
+
     async fn spann_view(
         &self,
         collection_and_segments: &CollectionAndSegments,
@@ -979,7 +1191,8 @@ impl LocalExecutor {
             .ok_or(ExecutorError::CollectionMissingHnswConfiguration)?;
         // As the operators of distributed Chroma materialize the logs they fetch on the record segment
         // (rust/worker/src/execution/operators/knn_log.rs, projection.rs).
-        let tail = materialize_logs(&records, tail, None, &RecordSegmentReaderOptions::default())
+        let tail = self
+            .materialize_tail(collection_and_segments, &records, tail)
             .await
             .map_err(|err| internal(err.boxed()))?;
         let mut tail_ids = HashMap::with_capacity(tail.len());
@@ -1264,6 +1477,7 @@ impl LocalExecutor {
     }
 
     pub async fn reset(&mut self) -> Result<(), Box<dyn ChromaError>> {
+        self.recent_tails.clear();
         self.hnsw_manager.reset().await.map_err(|err| err.boxed())?;
         Ok(())
     }
@@ -1278,6 +1492,120 @@ impl LocalExecutor {
 // is only logged. A read never waits for an opening, and opens what it does not find in memory, as before.
 // Distributed Chroma prefetches the record and the metadata segments at the start of each get instead
 // (rust/worker/src/execution/orchestration/get.rs), into a cache on disk: its compactor runs in another process.
+// The files of the record and the SPANN segments of the last flush of each collection that validate_spann_index read,
+// shared by the clones of the executor.
+type SegmentFiles = (
+    std::collections::HashMap<String, Vec<String>>,
+    std::collections::HashMap<String, Vec<String>>,
+);
+
+#[derive(Clone, Debug, Default)]
+struct RecentTail {
+    flushed: u64,
+    last: u64,
+    logs: Option<Chunk<LogRecord>>,
+    // The tail materialized on the record segment of the flush, up to its last log position, and the offset ids given to
+    // the new ids of the tail, so that the next read materializes again only the ids that later records touch.
+    materialized: Option<(u64, MaterializeLogsResult)>,
+    next_offset_id: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+}
+
+// The tails of the SPANN collections, each behind a lock of its own, so that a read of one collection that reads SQLite
+// does not hold the reads of the others. A tail holds at most the records a write can leave waiting before the
+// backpressure (num_records_before_backpressure, 100,000 by default), with their vectors: about 25 MB at 64 dimensions.
+// The tail of a deleted collection goes with its segments (delete_segments), and all of them at a reset.
+#[derive(Clone, Debug, Default)]
+struct RecentTails {
+    tails: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                chroma_types::CollectionUuid,
+                std::sync::Arc<tokio::sync::Mutex<RecentTail>>,
+            >,
+        >,
+    >,
+    /// For tests: the reads of the tail from SQLite on the default path, and the records they took.
+    #[cfg(test)]
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    records_read: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// For tests: the materializations of the cached tail that a read could not take from the cache.
+    #[cfg(test)]
+    materializations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// For tests: the next materialization stops before it stores its result, tells the first Notify, and goes on when
+    /// told by the second.
+    #[cfg(test)]
+    gates: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<TailGate>>>,
+}
+
+#[cfg(test)]
+type TailGate = (
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
+
+impl RecentTails {
+    #[cfg(test)]
+    async fn wait_at_a_gate(&self) {
+        let gate = self
+            .gates
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .pop_front();
+        if let Some((reached, go)) = gate {
+            reached.notify_one();
+            go.notified().await;
+        }
+    }
+
+    fn entry(
+        &self,
+        collection_id: chroma_types::CollectionUuid,
+    ) -> std::sync::Arc<tokio::sync::Mutex<RecentTail>> {
+        self.tails
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .entry(collection_id)
+            .or_default()
+            .clone()
+    }
+
+    fn forget(&self, collection_id: &chroma_types::CollectionUuid) {
+        self.tails
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(collection_id);
+    }
+
+    fn clear(&self) {
+        self.tails
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clear();
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ValidatedSpann {
+    files: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<chroma_types::CollectionUuid, SegmentFiles>>,
+    >,
+    /// For tests: how many times the check opened the files.
+    #[cfg(test)]
+    pub(crate) opened: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ValidatedSpann {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        std::collections::HashMap<chroma_types::CollectionUuid, SegmentFiles>,
+    > {
+        self.files.lock().unwrap_or_else(|err| err.into_inner())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 #[allow(clippy::type_complexity)]
 struct SpannWarmUp {
@@ -2101,6 +2429,53 @@ impl LocalExecutor {
     /// Whether the collection is marked as read since its last flush.
     pub(crate) fn spann_marked_read(&self, collection_id: chroma_types::CollectionUuid) -> bool {
         SpannWarmUp::lock(&self.spann_warm_up.read).contains(&collection_id)
+    }
+
+    /// For tests: how many times a read took the tail of a SPANN collection from SQLite on the default path, and the
+    /// records those reads took.
+    #[cfg(test)]
+    pub(crate) fn spann_tail_reads(&self) -> usize {
+        self.recent_tails
+            .reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spann_tail_materializations(&self) -> usize {
+        self.recent_tails
+            .materializations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// For tests: stops the next materialization of a tail before it stores its result. The first Notify says that it
+    /// stopped, the second lets it go on.
+    #[cfg(test)]
+    pub(crate) fn spann_tail_gate(&self) -> TailGate {
+        let gate = (
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        );
+        self.recent_tails
+            .gates
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push_back(gate.clone());
+        gate
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spann_tail_records_read(&self) -> usize {
+        self.recent_tails
+            .records_read
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// For tests: how many times the check of the files of a SPANN collection before a write opened them.
+    #[cfg(test)]
+    pub(crate) fn spann_files_checked(&self) -> usize {
+        self.validated_spann
+            .opened
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The manager of the segments, whose cleanup of SPANN files the tests call.

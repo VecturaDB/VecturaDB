@@ -186,6 +186,22 @@ pub struct MaterializedLogRecord {
     final_embedding_at_log_index: Option<usize>,
 }
 
+impl Clone for MaterializedLogRecord {
+    fn clone(&self) -> Self {
+        Self {
+            offset_id_exists_in_segment: self.offset_id_exists_in_segment,
+            offset_id: AtomicU32::new(self.offset_id.load(Ordering::SeqCst)),
+            user_id_at_log_index: self.user_id_at_log_index,
+            final_operation: self.final_operation,
+            operation_log_index: self.operation_log_index,
+            metadata_to_be_merged: self.metadata_to_be_merged.clone(),
+            metadata_to_be_deleted: self.metadata_to_be_deleted.clone(),
+            final_document_at_log_index: self.final_document_at_log_index,
+            final_embedding_at_log_index: self.final_embedding_at_log_index,
+        }
+    }
+}
+
 impl MaterializedLogRecord {
     fn from_segment_offset_id(offset_id: u32) -> Self {
         Self {
@@ -756,6 +772,62 @@ static TOTAL_LOGS_POST_MATERIALIZED: std::sync::LazyLock<opentelemetry::metrics:
             .with_description("The total number of log records materialized by materialize_logs()")
             .build()
     });
+
+/// materialize_logs of `logs`, whose first records are `previous.logs`, done again only for the user ids that the records
+/// after them touch: the materialized records of the other ids are kept from `previous`, as their indices in `logs` are
+/// the same. A materialized record depends only on the log records of its id and on the record segment, so the result
+/// answers as materialize_logs of all the logs, except for the offset ids given to new ids, which come from
+/// `next_offset_id` and may differ. For a single node that reads the same tail of the log again and again (the index of
+/// its recent records).
+pub async fn materialize_logs_incrementally(
+    record_segment_reader: &Option<RecordSegmentReaderShard<'_>>,
+    previous: &MaterializeLogsResult,
+    logs: Chunk<LogRecord>,
+    next_offset_id: Arc<AtomicU32>,
+    plan: &RecordSegmentReaderOptions,
+) -> Result<MaterializeLogsResult, LogMaterializerError> {
+    let old_len = previous.logs.total_len();
+    let touched = (old_len..logs.total_len())
+        .filter_map(|index| logs.get(index).map(|log| log.record.id.clone()))
+        .collect::<HashSet<_>>();
+    let mut touched_logs = logs.clone();
+    touched_logs.set_visibility(
+        (0..logs.total_len())
+            .map(|index| {
+                logs.get(index)
+                    .is_some_and(|log| touched.contains(&log.record.id))
+            })
+            .collect(),
+    );
+    let fresh = materialize_logs(
+        record_segment_reader,
+        touched_logs,
+        Some(next_offset_id),
+        plan,
+    )
+    .await?;
+    let mut materialized =
+        Vec::with_capacity(previous.materialized.len() + fresh.materialized.len());
+    for (record, _) in previous.materialized.iter() {
+        let user_id = record
+            .operation_log_index
+            .or(record.user_id_at_log_index)
+            .and_then(|index| previous.logs.get(index))
+            .map(|log| log.record.id.as_str());
+        if user_id.is_some_and(|id| touched.contains(id)) {
+            continue;
+        }
+        materialized.push(record.clone());
+    }
+    for (record, _) in fresh.materialized.iter() {
+        materialized.push(record.clone());
+    }
+    Ok(MaterializeLogsResult {
+        logs,
+        materialized: Chunk::new(materialized.into()),
+        has_backfill: previous.has_backfill || fresh.has_backfill,
+    })
+}
 
 /// Materializes a chunk of log records.
 /// - `record_segment_reader` can be `None` if the record segment is uninitialized.

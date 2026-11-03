@@ -304,7 +304,8 @@ mod tests {
     }
 
     // The timer of the flushes of SPANN collections reads local_compaction_manager, with the defaults of distributed
-    // Chroma for what it leaves out.
+    // Chroma for what it leaves out. max_compaction_size has a test of its own: its default is not that of distributed
+    // Chroma.
     #[test]
     fn local_compaction_manager_takes_the_defaults_of_distributed_chroma() {
         use figment::providers::{Format, Yaml};
@@ -316,17 +317,37 @@ mod tests {
             (
                 config.compaction_interval_sec,
                 config.min_compaction_size,
-                config.max_compaction_size,
                 config.timeout_us,
+                config.max_partition_size,
+                config.max_concurrent_jobs,
             )
         };
         assert_eq!(
             read("allow_reset: false\n"),
-            (10, 10, 10_000, 86_400_000_000)
+            (10, 10, 86_400_000_000, 5_000, 50)
         );
         assert_eq!(
-            read("local_compaction_manager:\n  compaction_interval_sec: 30\n  max_compaction_size: 500\n"),
-            (30, 10, 500, 86_400_000_000)
+            read("local_compaction_manager:\n  compaction_interval_sec: 30\n"),
+            (30, 10, 86_400_000_000, 5_000, 50)
+        );
+    }
+
+    // 50,000 records a flush is a choice of the single node, where a flush of the timer that takes them all is followed by
+    // the next at once; distributed Chroma takes 10,000 (rust/worker/chroma_config.yaml).
+    #[test]
+    fn local_compaction_manager_takes_50_000_records_a_flush_on_the_single_node() {
+        use figment::providers::{Format, Yaml};
+        let read = |yaml: &str| {
+            figment::Figment::from(Yaml::string(yaml))
+                .extract::<super::FrontendConfig>()
+                .unwrap()
+                .local_compaction_manager
+                .max_compaction_size
+        };
+        assert_eq!(read("allow_reset: false\n"), 50_000);
+        assert_eq!(
+            read("local_compaction_manager:\n  max_compaction_size: 500\n"),
+            500
         );
     }
 

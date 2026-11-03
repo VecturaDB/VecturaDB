@@ -4454,6 +4454,8 @@ mod tests {
     fn no_timer_flush() -> chroma_log::LocalCompactionManagerConfig {
         chroma_log::LocalCompactionManagerConfig {
             compaction_interval_sec: 3600,
+            // Small partitions, so that the small logs of the tests flush in several of them, at once.
+            max_partition_size: 7,
             ..Default::default()
         }
     }
@@ -6799,6 +6801,13 @@ mod tests {
     // The records of the log after the last flush of a SPANN collection, in its reads, its count and its indexing status,
     // and the timer that flushes them.
     mod spann_tail_tests;
+
+    // The reads of a SPANN collection by the default path of its tail against the reference path, under random writes
+    // and flushes: the oracle of a faster tail.
+    mod spann_oracle_tests;
+
+    // The index of the recent records of a SPANN collection: its tail read once across reads, and dropped by a flush.
+    mod spann_recent_tests;
 
     // A count of a SPANN collection counts the records of the record segment, as distributed Chroma does, at the flush of
     // its snapshot of SQLite: an add and its flush between that snapshot and its files leave its answer as it was.
