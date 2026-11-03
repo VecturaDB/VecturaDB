@@ -6800,6 +6800,13 @@ mod tests {
     // and the timer that flushes them.
     mod spann_tail_tests;
 
+    // The reads of a SPANN collection by the default path of its tail against the reference path, under random writes
+    // and flushes: the oracle of a faster tail.
+    mod spann_oracle_tests;
+
+    // The index of the recent records of a SPANN collection: its tail read once across reads, and dropped by a flush.
+    mod spann_recent_tests;
+
     // A count of a SPANN collection counts the records of the record segment, as distributed Chroma does, at the flush of
     // its snapshot of SQLite: an add and its flush between that snapshot and its files leave its answer as it was.
     #[test]

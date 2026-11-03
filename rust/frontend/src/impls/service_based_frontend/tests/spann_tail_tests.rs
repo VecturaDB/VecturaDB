@@ -69,7 +69,10 @@ async fn vector_files(
 }
 
 // A SPANN collection with no record yet.
-async fn empty_spann_collection(frontend: &mut ServiceBasedFrontend, name: &str) -> CollectionUuid {
+pub(super) async fn empty_spann_collection(
+    frontend: &mut ServiceBasedFrontend,
+    name: &str,
+) -> CollectionUuid {
     frontend
         .create_collection(
             CreateCollectionRequest::try_new(
@@ -654,7 +657,7 @@ async fn reads_differ_from(
 }
 
 // The ids that a get of a collection answers, with the filter, the limit and the offset given.
-async fn get_ids(
+pub(super) async fn get_ids(
     frontend: &mut ServiceBasedFrontend,
     collection_id: CollectionUuid,
     where_clause: Option<chroma_types::Where>,

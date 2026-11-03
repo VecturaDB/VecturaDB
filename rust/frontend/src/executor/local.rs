@@ -65,6 +65,11 @@ pub struct LocalExecutor {
     /// in two moments, for the test that compares the answers of the two.
     #[cfg(test)]
     pub(crate) search_in_one_snapshot: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Test switch: a read of a SPANN collection takes its tail by the reference path, the whole tail read from the log,
+    /// materialized and searched by brute force, as today, for the oracle test that compares it with the default path.
+    /// Today the two are the same path; a faster tail (an index of the recent records) goes behind the default only.
+    #[cfg(test)]
+    pub(crate) spann_tail_reference: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LocalExecutor {
@@ -86,6 +91,8 @@ impl LocalExecutor {
             recent_tails: RecentTails::default(),
             #[cfg(test)]
             search_in_one_snapshot: Default::default(),
+            #[cfg(test)]
+            spann_tail_reference: Default::default(),
         }
     }
 
@@ -1117,6 +1124,10 @@ impl LocalExecutor {
         // The materialization runs without the lock, so that the other reads of the collection do not wait for it: two
         // reads may do the same work, and the newer result stays in the cache.
         drop(cached);
+        #[cfg(test)]
+        self.recent_tails
+            .materializations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let materialized = match previous {
             Some((upto, previous)) if upto < last => {
                 materialize_logs_incrementally(records, &previous, logs, next_offset_id, &options)
@@ -1124,6 +1135,8 @@ impl LocalExecutor {
             }
             _ => materialize_logs(records, tail, Some(next_offset_id), &options).await?,
         };
+        #[cfg(test)]
+        self.recent_tails.wait_at_a_gate().await;
         let mut cached = entry.lock().await;
         let newer = cached
             .materialized
@@ -1516,9 +1529,35 @@ struct RecentTails {
     reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     records_read: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// For tests: the materializations of the cached tail that a read could not take from the cache.
+    #[cfg(test)]
+    materializations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// For tests: the next materialization stops before it stores its result, tells the first Notify, and goes on when
+    /// told by the second.
+    #[cfg(test)]
+    gates: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<TailGate>>>,
 }
 
+#[cfg(test)]
+type TailGate = (
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
+
 impl RecentTails {
+    #[cfg(test)]
+    async fn wait_at_a_gate(&self) {
+        let gate = self
+            .gates
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .pop_front();
+        if let Some((reached, go)) = gate {
+            reached.notify_one();
+            go.notified().await;
+        }
+    }
+
     fn entry(
         &self,
         collection_id: chroma_types::CollectionUuid,
@@ -2399,6 +2438,29 @@ impl LocalExecutor {
         self.recent_tails
             .reads
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spann_tail_materializations(&self) -> usize {
+        self.recent_tails
+            .materializations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// For tests: stops the next materialization of a tail before it stores its result. The first Notify says that it
+    /// stopped, the second lets it go on.
+    #[cfg(test)]
+    pub(crate) fn spann_tail_gate(&self) -> TailGate {
+        let gate = (
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        );
+        self.recent_tails
+            .gates
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push_back(gate.clone());
+        gate
     }
 
     #[cfg(test)]
