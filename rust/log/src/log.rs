@@ -255,7 +255,8 @@ impl Log {
         match self {
             Log::Sqlite(log) => {
                 // A log too full answers as the log service of distributed Chroma, through the frontend.
-                log.push_logs_with_condition(collection_id, records, condition.as_ref())
+                let first_inserted_record_offset = log
+                    .push_logs_with_condition(collection_id, records, condition.as_ref())
                     .await
                     .map_err(|e| match e {
                         SqlitePushLogsError::BackoffCompaction { retry_after } => {
@@ -270,7 +271,7 @@ impl Log {
                     })?;
                 Ok(PushLogsResult {
                     record_count,
-                    first_inserted_record_offset: None,
+                    first_inserted_record_offset,
                 })
             }
             Log::Grpc(log) => log

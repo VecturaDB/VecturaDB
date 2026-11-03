@@ -170,7 +170,9 @@ def test_rust_bindings_take_conditional_transactions(
     txn = collection.conditional()
     assert txn.get(ids="new-id")["ids"] == []
     txn.add(ids="new-id", embeddings=[1.0, 2.0])
-    assert txn.commit()["record_count"] == 1
+    committed = txn.commit()
+    assert committed["record_count"] == 1
+    assert isinstance(committed["first_inserted_record_offset"], int)
     assert collection.get(ids="new-id")["ids"] == ["new-id"]
 
 

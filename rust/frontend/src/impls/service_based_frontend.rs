@@ -5336,6 +5336,54 @@ mod tests {
         })
     }
 
+    // As Chroma Cloud: a commit answers the position of its first record, here the token of its read, and the next read
+    // goes on after its records.
+    #[tokio::test]
+    async fn a_conditional_commit_answers_the_position_of_its_first_record() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), false).await;
+        let collection_id = create_collection_for(&mut frontend, TENANT, DATABASE, "first_record")
+            .await
+            .collection_id;
+        add_c(&mut frontend, collection_id).await;
+        let token = conditional_get_of_c(&mut frontend, collection_id)
+            .await
+            .occ_read_token
+            .unwrap()
+            .log_upper_bound_offset();
+        let committed = frontend
+            .conditional_commit(
+                ConditionalCommitRequest {
+                    buffered_writes: vec![ConditionalBufferedWrite::Add(
+                        AddCollectionRecordsRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            vec!["d".to_string(), "e".to_string()],
+                            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    )],
+                    observed_log_offset: Some(token as i64),
+                    read_ids: vec!["c".to_string()],
+                },
+                String::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed.record_count, 2);
+        assert_eq!(committed.first_inserted_record_offset, Some(token as i64));
+        let next = conditional_get_of_c(&mut frontend, collection_id)
+            .await
+            .occ_read_token
+            .unwrap()
+            .log_upper_bound_offset();
+        assert_eq!(next, token + 2);
+    }
+
     #[tokio::test]
     async fn committed_deletion_succeeds_when_cleanup_fails() {
         for delete_database in [false, true] {

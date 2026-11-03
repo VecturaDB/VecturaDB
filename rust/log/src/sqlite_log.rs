@@ -710,17 +710,19 @@ impl SqliteLog {
     ) -> Result<(), SqlitePushLogsError> {
         self.push_logs_with_condition(collection_id, records, None)
             .await
+            .map(|_| ())
     }
 
-    // A write to the log; with a condition, the conditional write of distributed Chroma.
+    // A write to the log; with a condition, the conditional write of distributed Chroma, which answers the position of its
+    // first record.
     pub(super) async fn push_logs_with_condition(
         &mut self,
         collection_id: CollectionUuid,
         records: Vec<OperationRecord>,
         condition: Option<&PushLogsCondition>,
-    ) -> Result<(), SqlitePushLogsError> {
+    ) -> Result<Option<i64>, SqlitePushLogsError> {
         if records.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let write_ids: HashSet<String> = records.iter().map(|record| record.id.clone()).collect();
         self.check_for_backpressure(collection_id).await?;
@@ -794,6 +796,7 @@ impl SqliteLog {
             )
             .await?;
         }
+        let mut first_inserted_record_offset = None;
         for batch in records_and_serialized_metadatas.chunks(max_batch_size) {
             let mut query_builder = QueryBuilder::new(
                 "INSERT INTO embeddings_queue (topic, id, operation, vector, encoding, metadata) ",
@@ -811,8 +814,19 @@ impl SqliteLog {
                 builder.push_bind(record.encoding.as_ref().map(String::from));
                 builder.push_bind(serialized_metadata);
             });
-            let query = query_builder.build();
-            query.execute(&mut *tx).await.map_err(WrappedSqlxError)?;
+            if condition.is_some() {
+                query_builder.push(" RETURNING seq_id");
+                let seq_ids = query_builder
+                    .build_query_scalar::<i64>()
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(WrappedSqlxError)?;
+                first_inserted_record_offset =
+                    first_inserted_record_offset.or(seq_ids.into_iter().min());
+            } else {
+                let query = query_builder.build();
+                query.execute(&mut *tx).await.map_err(WrappedSqlxError)?;
+            }
         }
         tx.commit().await.map_err(WrappedSqlxError)?;
 
@@ -838,7 +852,7 @@ impl SqliteLog {
             purge_result?;
         }
 
-        Ok(())
+        Ok(first_inserted_record_offset)
     }
 
     pub(super) async fn get_collections_with_new_data(
@@ -1295,7 +1309,7 @@ mod tests {
         collection: CollectionUuid,
         ids: &[&str],
         condition: &PushLogsCondition,
-    ) -> Result<(), SqlitePushLogsError> {
+    ) -> Result<Option<i64>, SqlitePushLogsError> {
         log.push_logs_with_condition(
             collection,
             ids.iter().map(|id| conditional_record(id)).collect(),
@@ -1340,6 +1354,34 @@ mod tests {
         assert_eq!(log.scout_logs(collection, 0).await.unwrap(), 5);
     }
 
+    // As the log service of distributed Chroma, a conditional write answers the position of its first record, whatever the
+    // batches it takes.
+    #[tokio::test]
+    async fn a_conditional_write_answers_the_position_of_its_first_record() {
+        let mut log = setup_sqlite_log().await;
+        log.init_max_batch_size(2).unwrap();
+        let collection = CollectionUuid::new();
+        log.push_logs(collection, vec![conditional_record("a")])
+            .await
+            .unwrap();
+        let observed = log.scout_logs(collection, 0).await.unwrap() as i64;
+        assert_eq!(
+            push_conditional(
+                &mut log,
+                collection,
+                &["b", "c", "d"],
+                &condition(observed, &["a"])
+            )
+            .await
+            .unwrap(),
+            Some(observed)
+        );
+        assert_eq!(
+            log.scout_logs(collection, 0).await.unwrap() as i64,
+            observed + 3
+        );
+    }
+
     // The bounds of the log service of distributed Chroma: an offset that is negative or beyond the tail, or empty ids,
     // are invalid; an offset below what the compactor applied, so that the log may be purged, cannot be checked and is
     // refused, not passed.
@@ -1355,7 +1397,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let refused = |result: Result<(), SqlitePushLogsError>| match result {
+        let refused = |result: Result<Option<i64>, SqlitePushLogsError>| match result {
             Err(SqlitePushLogsError::ConditionalWriteRefused(code, message)) => (code, message),
             other => panic!("not refused: {other:?}"),
         };
