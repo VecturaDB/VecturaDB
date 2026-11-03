@@ -806,3 +806,499 @@ async fn a_spann_search_with_a_log_answers_as_after_its_flush_impl() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+// One search at a read level, in two moments.
+async fn search_at(
+    frontend: &mut ServiceBasedFrontend,
+    collection_id: CollectionUuid,
+    payload: SearchPayload,
+    read_level: chroma_types::plan::ReadLevel,
+) -> Result<SearchResponse, String> {
+    frontend
+        .search(
+            SearchRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                vec![payload],
+                read_level,
+            )
+            .map_err(|err| format!("request: {err}"))?,
+        )
+        .await
+        .map_err(|err| format!("search: {err}"))
+}
+
+async fn add_to_the_log(
+    frontend: &mut ServiceBasedFrontend,
+    numbers: &mut Numbers,
+    collection_id: CollectionUuid,
+    records: std::ops::Range<usize>,
+) {
+    let records: Vec<usize> = records.collect();
+    frontend
+        .add(
+            AddCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                records.iter().map(|i| format!("r{i}")).collect(),
+                records.iter().map(|_| numbers.dense()).collect(),
+                Some(
+                    records
+                        .iter()
+                        .map(|i| Some(format!("document r{i}")))
+                        .collect(),
+                ),
+                None,
+                Some(
+                    records
+                        .iter()
+                        .map(|&i| Some(metadata_of(i, numbers)))
+                        .collect(),
+                ),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+// As distributed Chroma, a search reads the log as its read level asks: every search of the collection, with a dense, sparse or
+// hybrid rank, a filter, a group by or no rank, at IndexOnly answers as before the records of the log were written, and at
+// IndexAndBoundedWal as when the log held only the records of its bound; at IndexAndWal it sees them all.
+#[test]
+fn a_spann_search_reads_the_log_as_its_read_level_asks() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        a_spann_search_reads_the_log_as_its_read_level_asks_impl,
+    )
+}
+
+async fn a_spann_search_reads_the_log_as_its_read_level_asks_impl() {
+    use chroma_types::plan::ReadLevel;
+    const BOUND: usize = 30;
+    let root = tempfile::tempdir().unwrap();
+    let executor = crate::executor::config::LocalExecutorConfig {
+        spann: true,
+        bounded_wal_limit: BOUND as u32,
+        ..Default::default()
+    };
+    let mut frontend = frontend_with_local_executor(root.path(), executor, &Registry::new()).await;
+    let mut numbers = Numbers(0x5eed_1234_abcd_ef01);
+    let collection_id = collection_to_search(&mut frontend, &mut numbers, RECORDS, false).await;
+    let payloads = searches(&mut numbers);
+    let mut flushed = Vec::new();
+    for (_, payload) in &payloads {
+        flushed.push(
+            search_at(
+                &mut frontend,
+                collection_id,
+                payload.clone(),
+                ReadLevel::IndexAndWal,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    add_to_the_log(
+        &mut frontend,
+        &mut numbers,
+        collection_id,
+        RECORDS..RECORDS + BOUND,
+    )
+    .await;
+    let mut within_the_bound = Vec::new();
+    for (_, payload) in &payloads {
+        within_the_bound.push(
+            search_at(
+                &mut frontend,
+                collection_id,
+                payload.clone(),
+                ReadLevel::IndexAndWal,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    add_to_the_log(
+        &mut frontend,
+        &mut numbers,
+        collection_id,
+        RECORDS + BOUND..RECORDS + 2 * BOUND,
+    )
+    .await;
+    let mut wrong = Vec::new();
+    let mut sees_the_log = false;
+    for (((name, payload), flushed), within_the_bound) in
+        payloads.into_iter().zip(flushed).zip(within_the_bound)
+    {
+        match search_at(
+            &mut frontend,
+            collection_id,
+            payload.clone(),
+            ReadLevel::IndexOnly,
+        )
+        .await
+        {
+            Ok(answer) => wrong.extend(differences(
+                &format!("{name}, IndexOnly"),
+                &flushed,
+                &answer,
+            )),
+            Err(err) => wrong.push(format!("{name}, IndexOnly: {err}")),
+        }
+        match search_at(
+            &mut frontend,
+            collection_id,
+            payload.clone(),
+            ReadLevel::IndexAndBoundedWal,
+        )
+        .await
+        {
+            Ok(answer) => wrong.extend(differences(
+                &format!("{name}, IndexAndBoundedWal"),
+                &within_the_bound,
+                &answer,
+            )),
+            Err(err) => wrong.push(format!("{name}, IndexAndBoundedWal: {err}")),
+        }
+        let whole = search_at(
+            &mut frontend,
+            collection_id,
+            payload,
+            ReadLevel::IndexAndWal,
+        )
+        .await
+        .unwrap();
+        sees_the_log |= !differences("", &flushed, &whole).is_empty();
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert!(sees_the_log, "no search at IndexAndWal saw the log");
+}
+
+// Below IndexAndWal a sparse leaf asks SQLite for more rows than its limit, as those of the log that the read does not see are left
+// out, and for no more than one for each record after the flush; at IndexAndWal, for its limit.
+#[test]
+fn the_extra_rows_of_a_sparse_leaf_stop_at_the_records_after_the_flush() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        the_extra_rows_of_a_sparse_leaf_stop_at_the_records_after_the_flush_impl,
+    )
+}
+
+async fn the_extra_rows_of_a_sparse_leaf_stop_at_the_records_after_the_flush_impl() {
+    use chroma_types::plan::ReadLevel;
+    const AFTER_THE_FLUSH: usize = 60;
+    const LIMIT: u32 = 5;
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let mut numbers = Numbers(0x5eed_1234_abcd_ef01);
+    let collection_id = collection_to_search(&mut frontend, &mut numbers, RECORDS, false).await;
+    // Every record has some of the 40 dimensions of the query, so that SQLite has more rows than any limit.
+    let query = SparseVector::from_pairs((0..40).map(|index| (index, 1.0)));
+    let payload = SearchPayload {
+        rank: Rank {
+            expr: Some(knn(
+                QueryVector::Sparse(query),
+                Key::MetadataField(SPARSE_KEY.to_string()),
+                LIMIT,
+                false,
+            )),
+        },
+        // A page larger than the limit of the leaf: the leaf alone cuts the answer to its limit.
+        limit: Limit {
+            offset: 0,
+            limit: Some(4 * LIMIT),
+        },
+        select: select(&[Key::Score]),
+        ..Default::default()
+    };
+    let flushed = search_at(
+        &mut frontend,
+        collection_id,
+        payload.clone(),
+        ReadLevel::IndexAndWal,
+    )
+    .await
+    .unwrap();
+    add_to_the_log(
+        &mut frontend,
+        &mut numbers,
+        collection_id,
+        RECORDS..RECORDS + AFTER_THE_FLUSH,
+    )
+    .await;
+    let rows = |frontend: &ServiceBasedFrontend| {
+        local_executor(frontend)
+            .search_sparse_rows
+            .load(Ordering::SeqCst)
+    };
+    for (level, expected) in [
+        (ReadLevel::IndexAndWal, LIMIT as usize),
+        (ReadLevel::IndexOnly, LIMIT as usize + AFTER_THE_FLUSH),
+        (
+            ReadLevel::IndexAndBoundedWal,
+            LIMIT as usize + AFTER_THE_FLUSH,
+        ),
+    ] {
+        let answer = search_at(&mut frontend, collection_id, payload.clone(), level)
+            .await
+            .unwrap();
+        assert_eq!(answer.ids[0].len(), LIMIT as usize, "{level:?}");
+        assert_eq!(rows(&frontend), expected, "{level:?}");
+        if level == ReadLevel::IndexOnly {
+            assert_eq!(answer.ids, flushed.ids, "the answer of before the log");
+        }
+    }
+}
+
+// At IndexOnly a search answers what the last flush holds: the old version of a record updated after it, and a record deleted after
+// it. One difference from distributed Chroma, whose metadata stops at its last compaction: a filter reads the current data of
+// the records in SQLite, so it judges an updated record by its new metadata, and leaves a deleted record out.
+#[test]
+fn a_spann_search_at_index_only_answers_what_the_last_flush_holds() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        a_spann_search_at_index_only_answers_what_the_last_flush_holds_impl,
+    )
+}
+
+async fn a_spann_search_at_index_only_answers_what_the_last_flush_holds_impl() {
+    use chroma_types::plan::ReadLevel;
+    const NEW_GROUP: i64 = 7;
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let mut numbers = Numbers(0x5eed_1234_abcd_ef01);
+    let collection_id = collection_to_search(&mut frontend, &mut numbers, RECORDS, false).await;
+    let no_rank = |filter: Filter| SearchPayload {
+        filter,
+        limit: Limit {
+            offset: 0,
+            limit: Some(RECORDS as u32),
+        },
+        select: select(&[Key::Document, Key::Embedding, Key::Metadata]),
+        ..Default::default()
+    };
+    let by_id = |id: &str| {
+        no_rank(Filter {
+            query_ids: Some(vec![id.to_string()]),
+            where_clause: None,
+        })
+    };
+    let by_group = |group: i64| {
+        no_rank(Filter {
+            query_ids: None,
+            where_clause: Some(group_is(group)),
+        })
+    };
+    let nearest = |vector: Vec<f32>| SearchPayload {
+        rank: Rank {
+            expr: Some(knn(QueryVector::Dense(vector), Key::Embedding, 5, false)),
+        },
+        limit: Limit {
+            offset: 0,
+            limit: Some(5),
+        },
+        select: select(&[Key::Score]),
+        ..Default::default()
+    };
+    let deleted_vector = search_at(
+        &mut frontend,
+        collection_id,
+        by_id("r20"),
+        ReadLevel::IndexAndWal,
+    )
+    .await
+    .unwrap()
+    .embeddings[0]
+        .as_ref()
+        .unwrap()[0]
+        .clone()
+        .unwrap();
+    let mut update = update_metadata_of(10, &mut numbers);
+    update.insert("group".to_string(), UpdateMetadataValue::Int(NEW_GROUP));
+    frontend
+        .upsert(
+            UpsertCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                vec!["r10".to_string()],
+                vec![numbers.dense()],
+                Some(vec![Some("document r10 changed".to_string())]),
+                None,
+                Some(vec![Some(update)]),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    frontend
+        .delete(
+            DeleteCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                Some(vec!["r20".to_string()]),
+                None,
+                None,
+            )
+            .unwrap(),
+            String::new(),
+        )
+        .await
+        .unwrap();
+    let document = |answer: &SearchResponse| answer.documents[0].as_ref().unwrap()[0].clone();
+    // The updated record: its old version at IndexOnly, its new one at IndexAndWal.
+    let flushed = search_at(
+        &mut frontend,
+        collection_id,
+        by_id("r10"),
+        ReadLevel::IndexOnly,
+    )
+    .await
+    .unwrap();
+    assert_eq!(document(&flushed).as_deref(), Some("document r10"));
+    let current = search_at(
+        &mut frontend,
+        collection_id,
+        by_id("r10"),
+        ReadLevel::IndexAndWal,
+    )
+    .await
+    .unwrap();
+    assert_eq!(document(&current).as_deref(), Some("document r10 changed"));
+    // The filter reads the current metadata, and the record answers with the metadata of the flush.
+    let moved = search_at(
+        &mut frontend,
+        collection_id,
+        by_group(NEW_GROUP),
+        ReadLevel::IndexOnly,
+    )
+    .await
+    .unwrap();
+    assert_eq!(moved.ids[0], ["r10"]);
+    assert_eq!(
+        moved.metadatas[0].as_ref().unwrap()[0]
+            .as_ref()
+            .unwrap()
+            .get("group"),
+        Some(&MetadataValue::Int(0))
+    );
+    let old_group = search_at(
+        &mut frontend,
+        collection_id,
+        by_group(0),
+        ReadLevel::IndexOnly,
+    )
+    .await
+    .unwrap();
+    assert!(!old_group.ids[0].iter().any(|id| id == "r10"));
+    // The deleted record: found without a filter at IndexOnly, not at IndexAndWal, not through a filter.
+    let found = search_at(
+        &mut frontend,
+        collection_id,
+        nearest(deleted_vector.clone()),
+        ReadLevel::IndexOnly,
+    )
+    .await
+    .unwrap();
+    assert_eq!(found.ids[0][0], "r20");
+    let gone = search_at(
+        &mut frontend,
+        collection_id,
+        nearest(deleted_vector),
+        ReadLevel::IndexAndWal,
+    )
+    .await
+    .unwrap();
+    assert!(!gone.ids[0].iter().any(|id| id == "r20"));
+    let filtered = search_at(
+        &mut frontend,
+        collection_id,
+        by_id("r20"),
+        ReadLevel::IndexOnly,
+    )
+    .await
+    .unwrap();
+    assert!(filtered.ids[0].is_empty());
+}
+
+// Before the first flush, at IndexOnly, a search answers no records and no error.
+#[test]
+fn a_spann_search_at_index_only_before_the_first_flush_answers_no_records() {
+    on_a_large_stack(
+        TestRuntime::FourWorkers,
+        a_spann_search_at_index_only_before_the_first_flush_answers_no_records_impl,
+    )
+}
+
+async fn a_spann_search_at_index_only_before_the_first_flush_answers_no_records_impl() {
+    use chroma_types::plan::ReadLevel;
+    let root = tempfile::tempdir().unwrap();
+    let mut frontend = frontend_with_spann(root.path(), true).await;
+    let mut numbers = Numbers(0x5eed_1234_abcd_ef01);
+    let collection_id =
+        super::spann_tail_tests::empty_spann_collection(&mut frontend, "no-flush").await;
+    frontend
+        .add(
+            AddCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                (0..20).map(|i| format!("r{i}")).collect(),
+                (0..20).map(|_| numbers.dense()).collect(),
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let dense = SearchPayload {
+        rank: Rank {
+            expr: Some(knn(
+                QueryVector::Dense(numbers.dense()),
+                Key::Embedding,
+                5,
+                false,
+            )),
+        },
+        limit: Limit {
+            offset: 0,
+            limit: Some(5),
+        },
+        select: select(&[Key::Score]),
+        ..Default::default()
+    };
+    let no_rank = SearchPayload {
+        limit: Limit {
+            offset: 0,
+            limit: Some(5),
+        },
+        select: select(&[Key::Document]),
+        ..Default::default()
+    };
+    for payload in [dense, no_rank] {
+        let flushed = search_at(
+            &mut frontend,
+            collection_id,
+            payload.clone(),
+            ReadLevel::IndexOnly,
+        )
+        .await
+        .unwrap();
+        assert!(flushed.ids[0].is_empty(), "{:?}", flushed.ids);
+        let whole = search_at(
+            &mut frontend,
+            collection_id,
+            payload,
+            ReadLevel::IndexAndWal,
+        )
+        .await
+        .unwrap();
+        assert_eq!(whole.ids[0].len(), 5);
+    }
+}
