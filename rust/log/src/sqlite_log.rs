@@ -477,6 +477,72 @@ impl SqliteLog {
         Self::applied_up_to(&mut conn, collection_id).await
     }
 
+    // A use of the collection keeps its records for the cutoff, from the watermark at its start: below that, or below
+    // the watermark with a record older than the cutoff before the window, the window may have lost records. seq_id
+    // grows with time, so every record after the one before the window, of any collection, is as new as it. That
+    // record is one lookup in the primary key, where the first record within the cutoff would be a walk over those a
+    // purge has yet to remove, in the write lock.
+    async fn may_be_purged(
+        &self,
+        conn: &mut SqliteConnection,
+        collection_id: CollectionUuid,
+        observed: i64,
+    ) -> Result<bool, WrappedSqlxError> {
+        let kept_from = self
+            .conditional_uses
+            .lock()
+            .unwrap()
+            .get(&collection_id)
+            .map_or(i64::MAX, |used| used.kept_from);
+        Ok(observed < kept_from
+            || (observed < Self::applied_up_to(&mut *conn, collection_id).await?
+                && sqlx::query_scalar::<_, bool>(
+                    "SELECT COALESCE((SELECT created_at <= datetime('now', ?) FROM embeddings_queue \
+                     WHERE seq_id <= ? ORDER BY seq_id DESC LIMIT 1), 1)",
+                )
+                .bind(format!("-{} seconds", self.purge_cutoff_time_seconds))
+                .bind(observed)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(WrappedSqlxError)?))
+    }
+
+    // Whether a later read of a transaction, on segments that applied the log up to `applied`, answers what its records held
+    // at its token. The segments hold only the current state, so it does when the log shows that no record at or after the
+    // token, up to what they applied, touched them. A token past what they applied, or a window the log may have lost, cannot
+    // be checked and does not stand.
+    pub async fn read_stands_at_token(
+        &mut self,
+        collection_id: CollectionUuid,
+        token: i64,
+        applied: i64,
+        read_ids: &HashSet<&str>,
+    ) -> Result<bool, WrappedSqlxError> {
+        if token > applied + 1 {
+            return Ok(false);
+        }
+        let purged = self
+            .get_legacy_embeddings_queue_config()
+            .await
+            .map_or(true, |config| config.automatically_purge);
+        let topic =
+            get_embeddings_queue_topic_name(&self.tenant_id, &self.topic_namespace, collection_id);
+        let mut tx = self.db.get_conn().begin().await.map_err(WrappedSqlxError)?;
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM embeddings_queue WHERE topic = ? AND seq_id >= ? AND seq_id <= ?",
+        )
+        .bind(topic)
+        .bind(token)
+        .bind(applied)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(WrappedSqlxError)?;
+        if purged && self.may_be_purged(&mut tx, collection_id, token).await? {
+            return Ok(false);
+        }
+        Ok(!ids.iter().any(|id| read_ids.contains(id.as_str())))
+    }
+
     // As validate_conditional_log_bounds and the scan of the committed log of the log service of distributed Chroma, in
     // the transaction of the write: the window goes from the observed offset to the tail; the readable lower bound is
     // the watermark up to which the compactor may have purged the log of the collection (the lower of the watermarks of
@@ -521,35 +587,15 @@ impl SqliteLog {
                 "observed_log_offset is beyond the current log tail",
             ));
         }
-        // A use of the collection keeps its records for the cutoff, from the watermark at its start: below that, or below
-        // the watermark with a record older than the cutoff before the window, the window may have lost records. seq_id
-        // grows with time, so every record after the one before the window, of any collection, is as new as it. That
-        // record is one lookup in the primary key, where the first record within the cutoff would be a walk over those a
-        // purge has yet to remove, in the write lock.
-        if purged {
-            let kept_from = self
-                .conditional_uses
-                .lock()
-                .unwrap()
-                .get(&collection_id)
-                .map_or(i64::MAX, |used| used.kept_from);
-            let may_be_purged = observed < kept_from
-                || (observed < Self::applied_up_to(&mut *tx, collection_id).await?
-                    && sqlx::query_scalar::<_, bool>(
-                        "SELECT COALESCE((SELECT created_at <= datetime('now', ?) FROM embeddings_queue \
-                         WHERE seq_id <= ? ORDER BY seq_id DESC LIMIT 1), 1)",
-                    )
-                    .bind(format!("-{} seconds", self.purge_cutoff_time_seconds))
-                    .bind(observed)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(WrappedSqlxError)?);
-            if may_be_purged {
-                return Err(refused(
-                    ErrorCodes::FailedPrecondition,
-                    "observed_log_offset is before the readable log lower bound",
-                ));
-            }
+        if purged
+            && self
+                .may_be_purged(&mut *tx, collection_id, observed)
+                .await?
+        {
+            return Err(refused(
+                ErrorCodes::FailedPrecondition,
+                "observed_log_offset is before the readable log lower bound",
+            ));
         }
         let ids: Vec<String> =
             sqlx::query_scalar("SELECT id FROM embeddings_queue WHERE topic = ? AND seq_id >= ?")
@@ -1403,6 +1449,65 @@ mod tests {
             log.scout_logs(collection, 0).await.unwrap() as i64,
             observed + 3
         );
+    }
+
+    // A later read stands when the log shows that no record at or after its token, up to what the segments applied, touched
+    // what it read. A token past what they applied, or a window the log may have lost, does not stand.
+    #[tokio::test]
+    async fn a_later_read_stands_when_the_log_shows_its_records_did_not_change() {
+        let mut log = setup_sqlite_log()
+            .await
+            .with_purge_cutoff_time_seconds(3_600);
+        // As a server that starts on an empty log, which purges it.
+        log.get_legacy_embeddings_queue_config().await.unwrap();
+        let collection = CollectionUuid::new();
+        log.note_conditional_use(collection).await.unwrap();
+        log.push_logs(
+            collection,
+            vec![
+                conditional_record("a"),
+                conditional_record("b"),
+                conditional_record("c"),
+            ],
+        )
+        .await
+        .unwrap();
+        let cases: &[(i64, i64, &[&str], bool)] = &[
+            (2, 3, &["a"], true),
+            (2, 3, &["a", "b"], false),
+            (2, 3, &["c"], false),
+            // A record past what the segments applied does not count; a token past them cannot be read.
+            (2, 2, &["c"], true),
+            (3, 2, &["c"], true),
+            (4, 2, &["a"], false),
+        ];
+        for (token, applied, ids, stands) in cases {
+            let read_ids = ids.iter().copied().collect();
+            assert_eq!(
+                log.read_stands_at_token(collection, *token, *applied, &read_ids)
+                    .await
+                    .unwrap(),
+                *stands,
+                "token {token}, applied {applied}, ids {ids:?}"
+            );
+        }
+        // Below the watermark, with a record older than the cutoff at the start of the window, the log may have lost records.
+        let read_ids = ["a"].into_iter().collect();
+        sqlx::query(
+            "UPDATE embeddings_queue SET created_at = datetime('now', '-7200 seconds') WHERE seq_id = 2",
+        )
+        .execute(log.db.get_conn())
+        .await
+        .unwrap();
+        assert!(log
+            .read_stands_at_token(collection, 2, 3, &read_ids)
+            .await
+            .unwrap());
+        applied_up_to_for_the_tests(&log, collection, 3).await;
+        assert!(!log
+            .read_stands_at_token(collection, 2, 3, &read_ids)
+            .await
+            .unwrap());
     }
 
     // The bounds of the log service of distributed Chroma: an offset that is negative or beyond the tail, or empty ids,

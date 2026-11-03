@@ -175,6 +175,27 @@ def test_rust_bindings_take_conditional_transactions(
     assert isinstance(committed["first_inserted_record_offset"], int)
     assert collection.get(ids="new-id")["ids"] == ["new-id"]
 
+    # A later read answers the record as it was at the first read, or is stale when it changed after it.
+    txn = collection.conditional()
+    assert txn.get(ids="new-id")["ids"] == ["new-id"]
+    assert txn.get(ids="new-id")["ids"] == ["new-id"]
+    collection.update(ids="new-id", metadatas={"v": 2})
+    with pytest.raises(StaleReadError):
+        txn.get(ids="new-id")
+
+    # And run starts it again.
+    attempts: List[Any] = []
+
+    def read_twice(txn: Any) -> None:
+        attempts.append(txn)
+        assert txn.get(ids="new-id")["ids"] == ["new-id"]
+        if len(attempts) == 1:
+            collection.update(ids="new-id", metadatas={"v": 3})
+        assert txn.get(ids="new-id")["ids"] == ["new-id"]
+
+    collection.conditional().run(read_twice, max_retries=1)
+    assert len(attempts) == 2
+
 
 def test_async_conditional_transaction_routes_to_internal_hooks() -> None:
     async def run() -> None:

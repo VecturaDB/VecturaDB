@@ -3253,6 +3253,10 @@ impl ServiceBasedFrontend {
             };
             Self::validate_occ_read_snapshot(log_position, read_token)?;
         }
+        let ids_at_token = match occ_read_mode {
+            OccReadMode::AtToken(_) => ids.clone(),
+            _ => None,
+        };
         let get_result = Box::pin(self.fan_out_get(
             tenant_id,
             Get {
@@ -3279,6 +3283,43 @@ impl ServiceBasedFrontend {
         ))
         .await
         .map_err(|err| Self::map_occ_read_executor_error(err, read_plan.stale_read_token))?;
+        // A later read of a transaction answers the state at its token in distributed Chroma, which reads a version and
+        // the log up to the token. The segments of the single node hold only the current state: the read stands when what
+        // it read did not change after the token, and otherwise it is stale, as a version that can no longer be read.
+        if let (Log::Sqlite(log), OccReadMode::AtToken(read_token), Some(applied)) = (
+            &mut self.log_client,
+            occ_read_mode,
+            get_result.applied_log_offset,
+        ) {
+            let read_ids = ids_at_token
+                .iter()
+                .flatten()
+                .map(String::as_str)
+                .chain(
+                    get_result
+                        .result
+                        .records
+                        .iter()
+                        .map(|record| record.id.as_str()),
+                )
+                .collect();
+            let stands = log
+                .read_stands_at_token(
+                    collection_id,
+                    read_token.log_upper_bound_offset() as i64,
+                    applied as i64,
+                    &read_ids,
+                )
+                .await
+                .map_err(|err| QueryError::Other(Box::new(err)))?;
+            if !stands {
+                return Err(StaleReadError::version_purged(
+                    read_token.log_upper_bound_offset(),
+                    "the log does not show that the records it reads are as they were at the read token",
+                )
+                .into());
+            }
+        }
         let return_bytes = get_result.size_bytes();
         let pulled_log_bytes = get_result.pulled_log_bytes;
         // On the single node a conditional read takes as its token the record after the last one that the metadata
@@ -5382,6 +5423,212 @@ mod tests {
             .unwrap()
             .log_upper_bound_offset();
         assert_eq!(next, token + 2);
+    }
+
+    // A conditional read of the record "c", or of a filter on n when `ids` is off, at a token.
+    async fn read_at_token(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        token: u64,
+        ids: bool,
+    ) -> Result<GetResponse, QueryError> {
+        let request = GetRequest::try_new(
+            TENANT.to_string(),
+            DATABASE.to_string(),
+            collection_id,
+            ids.then(|| vec!["c".to_string()]),
+            (!ids).then(|| {
+                chroma_types::Where::Metadata(chroma_types::MetadataExpression {
+                    key: "n".to_string(),
+                    comparison: chroma_types::MetadataComparison::Primitive(
+                        chroma_types::PrimitiveOperator::GreaterThanOrEqual,
+                        MetadataValue::Int(0),
+                    ),
+                })
+            }),
+            None,
+            0,
+            chroma_types::IncludeList(vec![chroma_types::Include::Metadata]),
+        )
+        .unwrap()
+        .with_occ_read_token(OccReadToken::try_new(token).unwrap());
+        frontend.get(request).await
+    }
+
+    // A record written with the frontend, with n given when there is one.
+    async fn write_record(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        id: &str,
+        n: Option<i64>,
+    ) {
+        frontend
+            .upsert(
+                chroma_types::UpsertCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    vec![id.to_string()],
+                    vec![vec![1.0, 2.0]],
+                    None,
+                    None,
+                    Some(vec![n.map(|n| {
+                        chroma_types::UpdateMetadata::from([(
+                            "n".to_string(),
+                            chroma_types::UpdateMetadataValue::Int(n),
+                        )])
+                    })]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn assert_stale(read: Result<GetResponse, QueryError>) {
+        assert!(
+            matches!(
+                read,
+                Err(QueryError::StaleRead(StaleReadError::VersionPurged { .. }))
+            ),
+            "{read:?}"
+        );
+        // The clients start a transaction again on the name of the error, which goes by its chain of sources.
+        assert!(chroma_error::source_chain_contains(
+            &read.unwrap_err(),
+            |source| source.is::<StaleReadError>()
+        ));
+    }
+
+    // A later read of a transaction: the records it reads as they were at the token, or stale when one changed after it.
+    async fn a_later_read_answers_the_state_at_its_token_or_is_stale(spann: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        let mut frontend = frontend_with_spann_registry(root.path(), spann, &registry).await;
+        let collection_id = if spann {
+            spann_tail_tests::empty_spann_collection(&mut frontend, "later_read").await
+        } else {
+            create_collection_for(&mut frontend, TENANT, DATABASE, "later_read")
+                .await
+                .collection_id
+        };
+        add_c(&mut frontend, collection_id).await;
+        let token = conditional_get_of_c(&mut frontend, collection_id)
+            .await
+            .occ_read_token
+            .unwrap()
+            .log_upper_bound_offset();
+        // Nothing changed: both reads stand.
+        for ids in [true, false] {
+            let read = read_at_token(&mut frontend, collection_id, token, ids)
+                .await
+                .unwrap();
+            assert_eq!(read.ids, vec!["c".to_string()]);
+        }
+        // A record without n changes neither: it is not read.
+        write_record(&mut frontend, collection_id, "other", None).await;
+        for ids in [true, false] {
+            let read = read_at_token(&mut frontend, collection_id, token, ids)
+                .await
+                .unwrap();
+            assert_eq!(read.ids, vec!["c".to_string()]);
+        }
+        // A token past what the segments applied cannot be read.
+        assert_stale(read_at_token(&mut frontend, collection_id, token + 100, true).await);
+        // A record that the filter finds now was written after the token: only the read of the filter is stale.
+        write_record(&mut frontend, collection_id, "new", Some(1)).await;
+        assert_stale(read_at_token(&mut frontend, collection_id, token, false).await);
+        read_at_token(&mut frontend, collection_id, token, true)
+            .await
+            .unwrap();
+        // The record read changed after the token: both are stale, and a new read goes on from a new token.
+        write_record(&mut frontend, collection_id, "c", Some(5)).await;
+        assert_stale(read_at_token(&mut frontend, collection_id, token, true).await);
+        assert_stale(read_at_token(&mut frontend, collection_id, token, false).await);
+        let next = conditional_get_of_c(&mut frontend, collection_id).await;
+        assert_eq!(
+            next.metadatas.unwrap()[0].as_ref().unwrap()["n"],
+            MetadataValue::Int(5)
+        );
+        let token = next.occ_read_token.unwrap().log_upper_bound_offset();
+        read_at_token(&mut frontend, collection_id, token, true)
+            .await
+            .unwrap();
+        // A commit in the log that the segments have not applied changes nothing the read sees.
+        commit_of_c_not_applied(&registry.get::<SqliteDb>().unwrap()).await;
+        let read = read_at_token(&mut frontend, collection_id, token, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            read.metadatas.unwrap()[0].as_ref().unwrap()["n"],
+            MetadataValue::Int(5)
+        );
+        // The record read went after the token: the read finds nothing, and is stale.
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    Some(vec!["c".to_string()]),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        assert_stale(read_at_token(&mut frontend, collection_id, token, true).await);
+    }
+
+    #[tokio::test]
+    async fn a_later_conditional_read_answers_the_state_at_its_token_or_is_stale() {
+        a_later_read_answers_the_state_at_its_token_or_is_stale(false).await;
+    }
+
+    #[test]
+    fn a_later_conditional_read_of_spann_answers_the_state_at_its_token_or_is_stale() {
+        on_a_large_stack(TestRuntime::CurrentThread, || {
+            a_later_read_answers_the_state_at_its_token_or_is_stale(true)
+        })
+    }
+
+    // As distributed Chroma, a read at a token that the position of the collection has passed is too old.
+    #[tokio::test]
+    async fn a_later_conditional_read_past_the_position_of_the_collection_is_too_old() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        let mut frontend = frontend_with_spann_registry(root.path(), false, &registry).await;
+        let collection_id = create_collection_for(&mut frontend, TENANT, DATABASE, "too_old")
+            .await
+            .collection_id;
+        add_c(&mut frontend, collection_id).await;
+        let token = conditional_get_of_c(&mut frontend, collection_id)
+            .await
+            .occ_read_token
+            .unwrap()
+            .log_upper_bound_offset();
+        read_at_token(&mut frontend, collection_id, token, true)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT OR REPLACE INTO max_seq_id (segment_id, seq_id) \
+             SELECT id, ? FROM segments WHERE collection = ?",
+        )
+        .bind(token as i64)
+        .bind(collection_id.0.to_string())
+        .execute(registry.get::<SqliteDb>().unwrap().get_conn())
+        .await
+        .unwrap();
+        let read = read_at_token(&mut frontend, collection_id, token, true).await;
+        assert!(
+            matches!(
+                read,
+                Err(QueryError::StaleRead(StaleReadError::VersionTooOld { .. }))
+            ),
+            "{read:?}"
+        );
     }
 
     #[tokio::test]

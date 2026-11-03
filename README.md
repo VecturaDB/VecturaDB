@@ -148,7 +148,7 @@ docker run -p 127.0.0.1:8000:8000 -v ./data:/data -e CHROMA_EXECUTOR__LOCAL__SPA
 
 ## Conditional transactions
 
-The conditional transactions of distributed Chroma work on the single node, on by default as on Chroma Cloud, with the same API and the same answers as Chroma Cloud: `collection.conditional()` reads records, buffers writes, and commits them only if no record it read or writes changed after its reads; otherwise the commit fails with `ConditionalWriteConflictError` (409), and the client retries with a new transaction. They work over HTTP and in process, with the Rust bindings.
+The conditional transactions of distributed Chroma work on the single node, on by default as on Chroma Cloud, with the same API and, except for the differences below, the same answers as Chroma Cloud: `collection.conditional()` reads records, buffers writes, and commits them only if no record it read or writes changed after its reads; otherwise the commit fails with `ConditionalWriteConflictError` (409), and the client retries with a new transaction. They work over HTTP and in process, with the Rust bindings.
 
 Reads and writes outside a transaction do not look at the log, and a collection that never uses them works as on Chroma 1.5.9. To turn them off:
 
@@ -159,7 +159,15 @@ enable_log_scouting: false
 
 With Docker, `-e CHROMA_ENABLE_TRANSACTIONS=false -e CHROMA_ENABLE_LOG_SCOUTING=false`.
 
-A commit checks the records written after its reads in the log of the collection. From its first conditional read or write, a collection keeps them for `log: sqlite: purge_cutoff_time_seconds` after they are written, by default 43,200 (12 hours), as distributed Chroma keeps its log, and purges them every `local_compaction_manager: purge_interval_sec`, by default 7,200 (2 hours). A collection that has used no transaction for that long, or since the server started, purges what it applied at once, as Chroma 1.5.9. A transaction whose reads are older than the cutoff or than a restart of the server may be refused, and the client starts it again. A lower cutoff keeps the database file smaller.
+A commit checks the records written after its reads in the log of the collection. From its first conditional read or write, a collection keeps them for `log: sqlite: purge_cutoff_time_seconds` after they are written, by default 43,200 (12 hours), as distributed Chroma keeps its log, and purges them every `local_compaction_manager: purge_interval_sec`, by default 7,200 (2 hours). A collection that has used no transaction for that long, or since the server started, purges what it applied at once, as Chroma 1.5.9. A lower cutoff keeps the database file smaller.
+
+Differences from Chroma Cloud:
+
+- A later read of a transaction answers its records as they were at its first read, or fails with `StaleReadError` (412) when one changed after it, and the client starts again, as `collection.conditional().run()` does. Chroma Cloud answers them as they were.
+- A record that a filter found at the first read and no longer finds is not in the later read, where Chroma Cloud answers it, so its commit does not check that record.
+- A transaction whose reads are older than a restart of the server may fail at its commit with `StaleReadError` (412), as one older than the cutoff, and the client starts it again.
+- A stale read names its error `StaleReadError`, the name the clients go by, where Chroma Cloud answers 412 with the name `ChromaError`.
+- The positions in the log, the read token and `first_inserted_record_offset`, count the records of the whole server, not those of the collection.
 
 ## Clients
 
