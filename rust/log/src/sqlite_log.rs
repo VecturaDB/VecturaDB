@@ -722,6 +722,13 @@ impl SqliteLog {
         condition: Option<&PushLogsCondition>,
     ) -> Result<Option<i64>, SqlitePushLogsError> {
         if records.is_empty() {
+            // As the log service of distributed Chroma: a commit of a delete with a filter has no records.
+            if condition.is_some() {
+                return Err(SqlitePushLogsError::ConditionalWriteRefused(
+                    ErrorCodes::InvalidArgument,
+                    "Too few records",
+                ));
+            }
             return Ok(None);
         }
         let write_ids: HashSet<String> = records.iter().map(|record| record.id.clone()).collect();
@@ -1352,6 +1359,22 @@ mod tests {
             .unwrap();
         // The refused writes wrote nothing: b, then d.
         assert_eq!(log.scout_logs(collection, 0).await.unwrap(), 5);
+    }
+
+    // As the log service of distributed Chroma, a conditional write of no records is refused, as it would change nothing that
+    // the client asked; a write without a condition of no records has nothing to do.
+    #[tokio::test]
+    async fn a_conditional_write_of_no_records_is_refused() {
+        let mut log = setup_sqlite_log().await;
+        let collection = CollectionUuid::new();
+        assert!(matches!(
+            push_conditional(&mut log, collection, &[], &condition(1, &[])).await,
+            Err(SqlitePushLogsError::ConditionalWriteRefused(
+                ErrorCodes::InvalidArgument,
+                "Too few records"
+            ))
+        ));
+        log.push_logs(collection, Vec::new()).await.unwrap();
     }
 
     // As the log service of distributed Chroma, a conditional write answers the position of its first record, whatever the
