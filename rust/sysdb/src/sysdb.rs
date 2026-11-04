@@ -611,7 +611,7 @@ impl SysDb {
     ) -> Result<Vec<(String, uuid::Uuid)>, Box<dyn std::error::Error>> {
         match self {
             SysDb::Grpc(grpc) => grpc.get_all_functions().await,
-            SysDb::Sqlite(_) => unimplemented!("get_all_functions not implemented for sqlite"),
+            SysDb::Sqlite(sqlite) => Ok(sqlite.get_all_functions().await?),
             SysDb::Test(_) => unimplemented!("get_all_functions not implemented for test"),
         }
     }
@@ -727,7 +727,26 @@ impl SysDb {
                 grpc.flush_compaction_and_attached_function(collections, attached_function_update)
                     .await
             }
-            SysDb::Sqlite(_) => todo!(),
+            SysDb::Sqlite(sqlite) => {
+                if !collections.is_empty() {
+                    return Err(FlushCompactionError::FailedToFlushCompaction(
+                        tonic::Status::unimplemented(
+                            "the single node writes the output of an attached function to the log of its output collection",
+                        ),
+                    ));
+                }
+                sqlite
+                    .update_attached_function_completion_offset(
+                        attached_function_update.attached_function_id,
+                        attached_function_update.completion_offset,
+                    )
+                    .await
+                    .map_err(FlushCompactionError::FailedToFlushCompaction)?;
+                Ok(FlushCompactionAndAttachedFunctionResponse {
+                    collections: Vec::new(),
+                    completion_offset: attached_function_update.completion_offset,
+                })
+            }
             SysDb::Test(_) => todo!(),
         }
     }
@@ -830,7 +849,17 @@ impl SysDb {
                 )
                 .await
             }
-            SysDb::Sqlite(_) => unimplemented!(),
+            SysDb::Sqlite(sqlite) => sqlite
+                .finish_create_attached_function(
+                    attached_function_id,
+                    output_collection_schema_str,
+                    local_output_segments,
+                )
+                .await
+                .map_err(|e| match e.code() {
+                    Code::NotFound => FinishCreateAttachedFunctionError::AttachedFunctionNotFound,
+                    _ => FinishCreateAttachedFunctionError::FailedToFinishCreateAttachedFunction(e),
+                }),
             SysDb::Test(test) => test.finish_create_attached_function(
                 attached_function_id,
                 output_collection_schema_str,
@@ -2460,17 +2489,7 @@ impl GrpcSysDb {
             .client
             .attach_function(req)
             .await
-            .map_err(|e| match e.code() {
-                Code::AlreadyExists => AttachFunctionError::AlreadyExists(e.message().to_string()),
-                Code::FailedPrecondition => {
-                    AttachFunctionError::CollectionAlreadyHasFunction(e.message().to_string())
-                }
-                Code::InvalidArgument => {
-                    AttachFunctionError::InvalidArgument(e.message().to_string())
-                }
-                Code::NotFound => AttachFunctionError::FunctionNotFound(e.message().to_string()),
-                _ => AttachFunctionError::InternalError(e),
-            })?
+            .map_err(attach_function_error_from_status)?
             .into_inner();
         // Parse the returned attached_function_id - this should always succeed since the server generated it
         // If this fails, it indicates a serious server bug or protocol corruption
@@ -2506,17 +2525,7 @@ impl GrpcSysDb {
             .client
             .add_attached_function_input(req)
             .await
-            .map_err(|e| match e.code() {
-                Code::AlreadyExists => AttachFunctionError::AlreadyExists(e.message().to_string()),
-                Code::FailedPrecondition => {
-                    AttachFunctionError::CollectionAlreadyHasFunction(e.message().to_string())
-                }
-                Code::InvalidArgument => {
-                    AttachFunctionError::InvalidArgument(e.message().to_string())
-                }
-                Code::NotFound => AttachFunctionError::FunctionNotFound(e.message().to_string()),
-                _ => AttachFunctionError::InternalError(e),
-            })?
+            .map_err(attach_function_error_from_status)?
             .into_inner();
 
         let attached_function = response.attached_function.ok_or_else(|| {
@@ -2912,6 +2921,41 @@ impl ChromaError for IncrementCompactionFailureCountError {
 
 //////////////////////////  Attached Function Operations //////////////////////////
 
+// The errors of an attach as the sysdb answers them, the gRPC one and the SQLite one, which answers as it.
+fn attach_function_error_from_status(e: tonic::Status) -> AttachFunctionError {
+    match e.code() {
+        Code::AlreadyExists => AttachFunctionError::AlreadyExists(e.message().to_string()),
+        Code::FailedPrecondition => {
+            AttachFunctionError::CollectionAlreadyHasFunction(e.message().to_string())
+        }
+        Code::InvalidArgument => AttachFunctionError::InvalidArgument(e.message().to_string()),
+        Code::NotFound => AttachFunctionError::FunctionNotFound(e.message().to_string()),
+        _ => AttachFunctionError::InternalError(e),
+    }
+}
+
+// The segments of the output collection of an attached function on the single node: those of a collection of HNSW,
+// the index that distributed Chroma gives the output collections too.
+fn local_output_segments(collection: CollectionUuid) -> Vec<Segment> {
+    [
+        (
+            chroma_types::SegmentType::HnswLocalPersisted,
+            SegmentScope::VECTOR,
+        ),
+        (chroma_types::SegmentType::Sqlite, SegmentScope::METADATA),
+    ]
+    .into_iter()
+    .map(|(r#type, scope)| Segment {
+        id: SegmentUuid::new(),
+        r#type,
+        scope,
+        collection,
+        metadata: None,
+        file_path: Default::default(),
+    })
+    .collect()
+}
+
 impl SysDb {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_attached_function(
@@ -2939,20 +2983,19 @@ impl SysDb {
                 )
                 .await
             }
-            SysDb::Sqlite(sqlite) => {
-                sqlite
-                    .create_attached_function(
-                        name,
-                        operator_name,
-                        input_collection_id,
-                        output_collection_name,
-                        params,
-                        tenant_name,
-                        database_name,
-                        min_records_for_invocation,
-                    )
-                    .await
-            }
+            SysDb::Sqlite(sqlite) => sqlite
+                .create_attached_function(
+                    name,
+                    operator_name,
+                    input_collection_id,
+                    output_collection_name,
+                    params,
+                    tenant_name,
+                    database_name,
+                    min_records_for_invocation,
+                )
+                .await
+                .map_err(attach_function_error_from_status),
             SysDb::Test(test_sysdb) => {
                 // Generate a new ID for the attached function
                 let attached_function_id = chroma_types::AttachedFunctionUuid::new();
@@ -2997,11 +3040,10 @@ impl SysDb {
                 grpc.add_attached_function_input(attached_function_id, input_collection_id)
                     .await
             }
-            SysDb::Sqlite(_) => Err(AttachFunctionError::InternalError(
-                tonic::Status::unimplemented(
-                    "add_attached_function_input is not supported in SqliteSysDb",
-                ),
-            )),
+            SysDb::Sqlite(sqlite) => sqlite
+                .add_attached_function_input(attached_function_id, input_collection_id)
+                .await
+                .map_err(attach_function_error_from_status),
             SysDb::Test(test) => {
                 test.add_attached_function_input(attached_function_id, input_collection_id)
             }
@@ -3033,10 +3075,10 @@ impl SysDb {
                 grpc.get_attached_functions(name, input_collection_id, ids, only_ready)
                     .await
             }
-            SysDb::Sqlite(_) => {
-                // TODO: Implement for Sqlite
-                Ok(vec![])
-            }
+            SysDb::Sqlite(sqlite) => sqlite
+                .get_attached_functions(name, input_collection_id, ids, only_ready)
+                .await
+                .map_err(GetAttachedFunctionError::FailedToGetAttachedFunction),
             SysDb::Test(test) => {
                 test.get_attached_functions(name, input_collection_id, ids, only_ready)
             }
@@ -3054,7 +3096,16 @@ impl SysDb {
                 grpc.soft_delete_attached_function(name, input_collection_id, delete_output)
                     .await
             }
-            SysDb::Sqlite(_) => Err(DeleteAttachedFunctionError::NotImplemented),
+            SysDb::Sqlite(sqlite) => sqlite
+                .soft_delete_attached_function(name, input_collection_id, delete_output)
+                .await
+                .map_err(|status| {
+                    if status.code() == tonic::Code::NotFound {
+                        DeleteAttachedFunctionError::NotFound
+                    } else {
+                        DeleteAttachedFunctionError::FailedToDeleteAttachedFunction(status)
+                    }
+                }),
             SysDb::Test(_) => Err(DeleteAttachedFunctionError::NotImplemented),
         }
     }
@@ -3105,7 +3156,10 @@ impl SysDb {
                     .try_finish_async_attached_function_invocation(request)
                     .await
             }
-            SysDb::Sqlite(_) => unimplemented!(),
+            SysDb::Sqlite(sqlite) => sqlite
+                .try_finish_async_attached_function_invocation(request)
+                .await
+                .map(tonic::Response::new),
             SysDb::Test(test) => {
                 test.try_finish_async_attached_function_invocation(request)
                     .await
@@ -3119,9 +3173,15 @@ impl SysDb {
     ) -> Result<i32, tonic::Status> {
         match self {
             SysDb::Grpc(grpc) => grpc.fail_attached_function(request).await,
-            SysDb::Sqlite(_) => Err(tonic::Status::unimplemented(
-                "fail_attached_function is not supported for SqliteSysDb",
-            )),
+            SysDb::Sqlite(sqlite) => {
+                sqlite
+                    .change_attached_function_failure_count(
+                        &request.attached_function_id,
+                        &request.collection_id,
+                        None,
+                    )
+                    .await
+            }
             SysDb::Test(test) => test.fail_attached_function(request).await,
         }
     }
@@ -3132,9 +3192,15 @@ impl SysDb {
     ) -> Result<i32, tonic::Status> {
         match self {
             SysDb::Grpc(grpc) => grpc.set_attached_function_failure_count(request).await,
-            SysDb::Sqlite(_) => Err(tonic::Status::unimplemented(
-                "set_attached_function_failure_count is not supported for SqliteSysDb",
-            )),
+            SysDb::Sqlite(sqlite) => {
+                sqlite
+                    .change_attached_function_failure_count(
+                        &request.attached_function_id,
+                        &request.collection_id,
+                        Some(request.failure_count),
+                    )
+                    .await
+            }
             SysDb::Test(test) => test.set_attached_function_failure_count(request).await,
         }
     }
@@ -3148,7 +3214,10 @@ impl SysDb {
     > {
         match self {
             SysDb::Grpc(grpc) => grpc.client.clone().check_invocation_status(request).await,
-            SysDb::Sqlite(_) => unimplemented!(),
+            SysDb::Sqlite(sqlite) => sqlite
+                .check_invocation_status(request)
+                .await
+                .map(tonic::Response::new),
             SysDb::Test(_) => unimplemented!(),
         }
     }
@@ -3164,7 +3233,11 @@ impl SysDb {
                 .finalize_async_attached_function_repair(request)
                 .await
                 .map(|_| ()),
-            SysDb::Sqlite(_) => unimplemented!(),
+            SysDb::Sqlite(sqlite) => {
+                sqlite
+                    .finalize_async_attached_function_repair(request)
+                    .await
+            }
             SysDb::Test(_) => unimplemented!(),
         }
     }

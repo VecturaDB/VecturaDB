@@ -27,7 +27,9 @@ chroma-tracing = { workspace = true, features = ["grpc"] }
 chroma-api-types = { workspace = true }
 chroma-config = { workspace = true }
 chroma-error = { workspace = true, features = ["sqlx"] }
+chroma-blockstore = { workspace = true }
 chroma-segment = { workspace = true }
+chroma-storage = { workspace = true }
 chroma-system = { workspace = true }
 chroma-sysdb = { workspace = true }
 chroma-types = { workspace = true }

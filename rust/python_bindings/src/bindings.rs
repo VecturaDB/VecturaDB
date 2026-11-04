@@ -781,6 +781,124 @@ impl Bindings {
         Ok(collection)
     }
 
+    ////////////////////////////// Attached functions //////////////////////////////
+    // As the routes of the server (rust/frontend/src/server.rs): each returns the JSON of its HTTP response, which the
+    // Python client reads as the HTTP client reads it.
+
+    #[pyo3(signature = (collection_id, name, function_id, output_collection, params = None, tenant = DEFAULT_TENANT.to_string(), database = DEFAULT_DATABASE.to_string()))]
+    #[allow(clippy::too_many_arguments)]
+    fn attach_function(
+        &self,
+        py: Python<'_>,
+        collection_id: String,
+        name: String,
+        function_id: String,
+        output_collection: String,
+        params: Option<String>,
+        tenant: String,
+        database: String,
+    ) -> ChromaPyResult<String> {
+        let database = attached_function_database(database)?;
+        let params: Option<serde_json::Value> = params
+            .map(|params| serde_json::from_str(&params))
+            .transpose()
+            .map_err(WrappedSerdeJsonError::SerdeJsonError)?;
+        let request: chroma_types::AttachFunctionRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "function_id": function_id,
+                "output_collection": output_collection,
+                "params": params,
+            }))
+            .map_err(WrappedSerdeJsonError::SerdeJsonError)?;
+        let mut frontend = self.frontend.clone();
+        let response = py.allow_threads(move || {
+            self.runtime.block_on(async {
+                frontend
+                    .attach_function(tenant, database, collection_id, request)
+                    .await
+            })
+        })?;
+        Ok(serde_json::to_string(&response).map_err(WrappedSerdeJsonError::SerdeJsonError)?)
+    }
+
+    #[pyo3(signature = (collection_id, name, tenant = DEFAULT_TENANT.to_string(), database = DEFAULT_DATABASE.to_string()))]
+    fn get_attached_function(
+        &self,
+        py: Python<'_>,
+        collection_id: String,
+        name: String,
+        tenant: String,
+        database: String,
+    ) -> ChromaPyResult<String> {
+        let database = attached_function_database(database)?;
+        let mut frontend = self.frontend.clone();
+        let attached_function = py.allow_threads(move || {
+            self.runtime.block_on(async {
+                frontend
+                    .get_attached_function(tenant, database, collection_id, name)
+                    .await
+            })
+        })?;
+        let response = chroma_types::GetAttachedFunctionResponse {
+            attached_function: chroma_types::AttachedFunctionApiResponse::from_attached_function(
+                attached_function,
+            )?,
+        };
+        Ok(serde_json::to_string(&response).map_err(WrappedSerdeJsonError::SerdeJsonError)?)
+    }
+
+    #[pyo3(signature = (collection_id, name, input_collection_id, tenant = DEFAULT_TENANT.to_string(), database = DEFAULT_DATABASE.to_string()))]
+    fn add_attached_function_input(
+        &self,
+        py: Python<'_>,
+        collection_id: String,
+        name: String,
+        input_collection_id: String,
+        tenant: String,
+        database: String,
+    ) -> ChromaPyResult<String> {
+        let database = attached_function_database(database)?;
+        let request: chroma_types::AddAttachedFunctionInputRequest = serde_json::from_value(
+            serde_json::json!({ "input_collection_id": input_collection_id }),
+        )
+        .map_err(WrappedSerdeJsonError::SerdeJsonError)?;
+        let mut frontend = self.frontend.clone();
+        let response = py.allow_threads(move || {
+            self.runtime.block_on(async {
+                frontend
+                    .add_attached_function_input(tenant, database, collection_id, name, request)
+                    .await
+            })
+        })?;
+        Ok(serde_json::to_string(&response).map_err(WrappedSerdeJsonError::SerdeJsonError)?)
+    }
+
+    #[pyo3(signature = (collection_id, name, delete_output = false, tenant = DEFAULT_TENANT.to_string(), database = DEFAULT_DATABASE.to_string()))]
+    fn detach_function(
+        &self,
+        py: Python<'_>,
+        collection_id: String,
+        name: String,
+        delete_output: bool,
+        tenant: String,
+        database: String,
+    ) -> ChromaPyResult<String> {
+        let database = attached_function_database(database)?;
+        let request: chroma_types::DetachFunctionRequest =
+            serde_json::from_value(serde_json::json!({ "delete_output": delete_output }))
+                .map_err(WrappedSerdeJsonError::SerdeJsonError)?;
+        let mut frontend = self.frontend.clone();
+        let response = py.allow_threads(move || {
+            self.runtime.block_on(async {
+                frontend
+                    .detach_function(tenant, database, collection_id, name, request)
+                    .await
+            })
+        })?;
+        Ok(serde_json::to_string(&response).map_err(WrappedSerdeJsonError::SerdeJsonError)?)
+    }
+
     #[pyo3(signature = (collection_id, tenant = DEFAULT_TENANT.to_string(), database = DEFAULT_DATABASE.to_string()))]
     fn count_forks(
         &self,
@@ -1528,6 +1646,13 @@ impl Drop for Bindings {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+// The database of a route of the attached functions, checked as the server checks it.
+fn attached_function_database(database: String) -> Result<DatabaseName, InvalidDatabaseNameError> {
+    DatabaseName::new(database).ok_or_else(|| {
+        InvalidDatabaseNameError("database name must be at least 3 characters".to_string())
+    })
 }
 
 #[cfg(test)]

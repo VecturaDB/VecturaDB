@@ -873,6 +873,8 @@ class RustBindingsAPI(ServerAPI):
     def get_max_batch_size(self) -> int:
         return self.bindings.get_max_batch_size()
 
+    # The attached functions of the single node, as FastAPI calls the routes of the server: the bindings return the
+    # JSON of the HTTP responses, read here as FastAPI reads them.
     @override
     def attach_function(
         self,
@@ -884,11 +886,32 @@ class RustBindingsAPI(ServerAPI):
         tenant: str = DEFAULT_TENANT,
         database: str = DEFAULT_DATABASE,
     ) -> Tuple["AttachedFunction", bool]:
-        """Attached functions are not supported in the Rust bindings (local embedded mode)."""
-        raise NotImplementedError(
-            "Attached functions are only supported when connecting to a Chroma server via HttpClient. "
-            "The Rust bindings (embedded mode) do not support attached function operations."
+        from chromadb.api.models.AttachedFunction import AttachedFunction
+
+        resp_json = json.loads(
+            self.bindings.attach_function(
+                str(input_collection_id),
+                name,
+                function_id,
+                output_collection,
+                json.dumps(params) if params is not None else None,
+                tenant,
+                database,
+            )
         )
+        attached_function = AttachedFunction(
+            client=self,
+            id=UUID(resp_json["attached_function"]["id"]),
+            name=resp_json["attached_function"]["name"],
+            function_name=resp_json["attached_function"]["function_name"],
+            input_collection_id=input_collection_id,
+            output_collection=output_collection,
+            params=params,
+            tenant=tenant,
+            database=database,
+        )
+        created = resp_json.get("created", True)
+        return (attached_function, created)
 
     @override
     def get_attached_function(
@@ -898,10 +921,24 @@ class RustBindingsAPI(ServerAPI):
         tenant: str = DEFAULT_TENANT,
         database: str = DEFAULT_DATABASE,
     ) -> "AttachedFunction":
-        """Attached functions are not supported in the Rust bindings (local embedded mode)."""
-        raise NotImplementedError(
-            "Attached functions are only supported when connecting to a Chroma server via HttpClient. "
-            "The Rust bindings (embedded mode) do not support attached function operations."
+        from chromadb.api.models.AttachedFunction import AttachedFunction
+
+        resp_json = json.loads(
+            self.bindings.get_attached_function(
+                str(input_collection_id), name, tenant, database
+            )
+        )
+        af = resp_json["attached_function"]
+        return AttachedFunction(
+            client=self,
+            id=UUID(af["id"]),
+            name=af["name"],
+            function_name=af["function_name"],
+            input_collection_id=input_collection_id,
+            output_collection=af["output_collection"],
+            params=af.get("params"),
+            tenant=tenant,
+            database=database,
         )
 
     @override
@@ -913,11 +950,30 @@ class RustBindingsAPI(ServerAPI):
         tenant: str = DEFAULT_TENANT,
         database: str = DEFAULT_DATABASE,
     ) -> Tuple["AttachedFunction", bool]:
-        """Attached functions are not supported in the Rust bindings (local embedded mode)."""
-        raise NotImplementedError(
-            "Attached functions are only supported when connecting to a Chroma server via HttpClient. "
-            "The Rust bindings (embedded mode) do not support attached function operations."
+        from chromadb.api.models.AttachedFunction import AttachedFunction
+
+        resp_json = json.loads(
+            self.bindings.add_attached_function_input(
+                str(existing_input_collection_id),
+                name,
+                str(new_input_collection_id),
+                tenant,
+                database,
+            )
         )
+        attached_function = AttachedFunction(
+            client=self,
+            id=UUID(resp_json["attached_function"]["id"]),
+            name=resp_json["attached_function"]["name"],
+            function_name=resp_json["attached_function"]["function_name"],
+            input_collection_id=new_input_collection_id,
+            output_collection=resp_json["attached_function"]["output_collection"],
+            params=resp_json["attached_function"].get("params"),
+            tenant=tenant,
+            database=database,
+        )
+        created = resp_json.get("created", True)
+        return (attached_function, created)
 
     @override
     def detach_function(
@@ -928,11 +984,12 @@ class RustBindingsAPI(ServerAPI):
         tenant: str = DEFAULT_TENANT,
         database: str = DEFAULT_DATABASE,
     ) -> bool:
-        """Attached functions are not supported in the Rust bindings (local embedded mode)."""
-        raise NotImplementedError(
-            "Attached functions are only supported when connecting to a Chroma server via HttpClient. "
-            "The Rust bindings (embedded mode) do not support attached function operations."
+        resp_json = json.loads(
+            self.bindings.detach_function(
+                str(input_collection_id), name, delete_output, tenant, database
+            )
         )
+        return cast(bool, resp_json["success"])
 
     # TODO: Remove this if it's not planned to be used
     @override

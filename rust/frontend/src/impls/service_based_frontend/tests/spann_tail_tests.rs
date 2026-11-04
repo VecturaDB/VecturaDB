@@ -502,6 +502,42 @@ async fn a_round_of_the_timer_flushes_the_spann_collections_over_its_thresholds_
     assert_eq!(status(&mut frontend, waited).await, (1.0, 0, 1, 1));
 }
 
+// As a compaction of distributed Chroma, a flush of a SPANN collection is one more version of it.
+#[test]
+fn a_spann_flush_is_one_more_version() {
+    on_a_large_stack(
+        TestRuntime::CurrentThread,
+        a_spann_flush_is_one_more_version_impl,
+    )
+}
+
+async fn a_spann_flush_is_one_more_version_impl() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = Registry::new();
+    let mut frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+    let collection_id = empty_spann_collection(&mut frontend, "versioned").await;
+    let version = |frontend: &ServiceBasedFrontend| {
+        let frontend = frontend.clone();
+        async move {
+            frontend
+                .sysdb_client
+                .clone()
+                .get_collections(GetCollectionsOptions {
+                    collection_id: Some(collection_id),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()[0]
+                .version
+        }
+    };
+    add_numbers(&mut frontend, collection_id, 0..10).await;
+    let before = version(&frontend).await;
+    local_executor(&frontend).compaction_round().await.unwrap();
+    assert!(!vector_files(&mut frontend, collection_id).await.is_empty());
+    assert_eq!(version(&frontend).await, before + 1);
+}
+
 // A flush takes at most max_compaction_size records of the log, as the fetch of the logs of a compaction of distributed
 // Chroma: the next flushes take the rest, and the reads answer every record meanwhile.
 #[test]

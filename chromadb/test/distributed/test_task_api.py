@@ -5,9 +5,11 @@ Tests the task creation, execution, and removal functionality
 for automatically processing collections.
 """
 
+import contextlib
 import functools
-import io
 import json
+import os
+import sqlite3
 import pytest
 import time
 import urllib.parse
@@ -128,26 +130,35 @@ def _wait_for_wqs_failure_count(
     expected_failure_count: int,
     timeout_seconds: float = 180.0,
 ) -> None:
-    parquet = pytest.importorskip("pyarrow.parquet")
+    # VecturaDB keeps the queue of the asynchronous functions in the rows of
+    # attached_functions of its SQLite database, not in workqueue_state.parquet as
+    # distributed Chroma: the failure count is read from the database of the server
+    # under test, given by VECTURADB_SQLITE_PATH.
+    path = os.environ.get("VECTURADB_SQLITE_PATH")
+    if not path:
+        pytest.fail(
+            "VECTURADB_SQLITE_PATH must give the SQLite database of the server under test"
+        )
 
     deadline = time.monotonic() + timeout_seconds
     last_failure_count = None
     while time.monotonic() < deadline:
-        body = _minio_get_object(MINIO_BUCKET, "workqueue_state.parquet")
-        if body is not None:
-            rows = parquet.read_table(io.BytesIO(body)).to_pylist()
-            for row in rows:
-                if (
-                    row["fn_id"] == function_id
-                    and row["input_coll_id"] == input_collection_id
-                ):
-                    last_failure_count = row["failure_count"]
-                    if last_failure_count >= expected_failure_count:
-                        return
+        with contextlib.closing(
+            sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        ) as conn:
+            row = conn.execute(
+                "SELECT failure_count FROM attached_functions "
+                "WHERE id = ? AND input_collection_id = ?",
+                (function_id, input_collection_id),
+            ).fetchone()
+        if row is not None:
+            last_failure_count = row[0]
+            if last_failure_count >= expected_failure_count:
+                return
         sleep(5)
 
     pytest.fail(
-        "Timed out waiting for WQS failure count "
+        "Timed out waiting for the failure count "
         f"for function={function_id}, input_collection={input_collection_id}. "
         f"Expected at least {expected_failure_count}, observed {last_failure_count!r}"
     )

@@ -7,13 +7,15 @@ use chroma_error::{ChromaError, ErrorCodes, WrappedSqlxError};
 use chroma_sqlite::db::SqliteDb;
 use chroma_sqlite::helpers::{delete_metadata, get_embeddings_queue_topic_name, update_metadata};
 use chroma_sqlite::table;
+use chroma_types::chroma_proto;
 use chroma_types::{
-    Collection, CollectionAndSegments, CollectionMetadataUpdate, CollectionUuid, CountForksError,
-    CreateCollectionError, CreateCollectionResponse, CreateDatabaseError, CreateDatabaseResponse,
-    CreateTenantError, CreateTenantResponse, Database, DatabaseUuid, DeleteCollectionError,
-    DeleteDatabaseError, DeleteDatabaseResponse, FlushCompactionResponse, ForkCollectionError,
-    GetCollectionByCrnError, GetCollectionWithSegmentsError, GetCollectionsError, GetDatabaseError,
-    GetSegmentsError, GetTenantError, GetTenantResponse, InternalCollectionConfiguration,
+    AttachedFunctionUuid, Collection, CollectionAndSegments, CollectionMetadataUpdate,
+    CollectionUuid, CountForksError, CreateCollectionError, CreateCollectionResponse,
+    CreateDatabaseError, CreateDatabaseResponse, CreateTenantError, CreateTenantResponse, Database,
+    DatabaseUuid, DeleteCollectionError, DeleteDatabaseError, DeleteDatabaseResponse,
+    FlushCompactionResponse, ForkCollectionError, GetCollectionByCrnError,
+    GetCollectionWithSegmentsError, GetCollectionsError, GetDatabaseError, GetSegmentsError,
+    GetTenantError, GetTenantResponse, InternalCollectionConfiguration,
     InternalUpdateCollectionConfiguration, ListDatabasesError, Metadata, MetadataValue, ResetError,
     ResetResponse, Schema, SchemaError, Segment, SegmentFlushInfo, SegmentScope, SegmentType,
     SegmentUuid, UpdateCollectionError, UpdateTenantError, UpdateTenantResponse,
@@ -36,7 +38,7 @@ use sea_query_binder::SqlxBinder;
 use sqlx::error::ErrorKind;
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -914,7 +916,15 @@ impl SqliteSysDb {
             .map_err(|e| ForkCollectionError::Internal(e.into()))?;
 
         let source = self
-            .get_collections_with_conn(&mut *tx, Some(source_collection_id), None, None, None, None, 0)
+            .get_collections_with_conn(
+                &mut *tx,
+                Some(source_collection_id),
+                None,
+                None,
+                None,
+                None,
+                0,
+            )
             .await
             .map_err(|e| ForkCollectionError::Internal(e.boxed()))?
             .pop()
@@ -1044,12 +1054,13 @@ impl SqliteSysDb {
         if !exists(root_collection_id.clone()).await? {
             return Err(CountForksError::NotFound(collection_id.to_string()));
         }
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM collection_forks WHERE root_collection_id = $1")
-                .bind(root_collection_id)
-                .fetch_one(self.db.get_conn())
-                .await
-                .map_err(|e| CountForksError::Internal(e.into()))?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM collection_forks WHERE root_collection_id = $1",
+        )
+        .bind(root_collection_id)
+        .fetch_one(self.db.get_conn())
+        .await
+        .map_err(|e| CountForksError::Internal(e.into()))?;
         Ok(count as usize)
     }
 
@@ -1058,24 +1069,696 @@ impl SqliteSysDb {
         Ok(ResetResponse {})
     }
 
+    // AttachFunction of the coordinator of distributed Chroma (go/pkg/sysdb/coordinator/task.go), with the status that
+    // its gRPC server answers (go/pkg/sysdb/grpc/task_service.go): the errors it does not map keep their message with
+    // the code Unknown, as gRPC sends them. The transaction takes the write lock of SQLite at its start, so it stands for
+    // the locks of the graph that the coordinator takes, and the checks it repeats under them find what they found.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_attached_function(
         &self,
-        _name: String,
-        _operator_id: String,
-        _input_collection_id: chroma_types::CollectionUuid,
-        _output_collection_name: String,
-        _params: serde_json::Value,
-        _tenant_id: String,
-        _database_id: String,
-        _min_records_for_attached_function: u64,
-    ) -> Result<(chroma_types::AttachedFunctionUuid, bool), crate::AttachFunctionError> {
-        // TODO: Implement this when attached function support is added to SqliteSysDb
-        Err(crate::AttachFunctionError::InternalError(
-            tonic::Status::unimplemented(
-                " Attached Function operations not yet implemented in SqliteSysDb",
-            ),
-        ))
+        name: String,
+        function_name: String,
+        input_collection_id: CollectionUuid,
+        output_collection_name: String,
+        params: serde_json::Value,
+        tenant_id: String,
+        database_name: String,
+        min_records_for_invocation: u64,
+    ) -> Result<(AttachedFunctionUuid, bool), tonic::Status> {
+        if name.starts_with("_deleted_") {
+            return Err(tonic::Status::unknown(ERR_INVALID_ATTACHED_FUNCTION_NAME));
+        }
+        // As the gRPC sysdb sends the params: a JSON object, or none, which the coordinator stores as {}.
+        let params_json = match params {
+            serde_json::Value::Object(map) if !map.is_empty() => {
+                serde_json::to_string(&map).map_err(|e| tonic::Status::internal(e.to_string()))?
+            }
+            serde_json::Value::Object(_) | serde_json::Value::Null => "{}".to_string(),
+            _ => {
+                return Err(tonic::Status::invalid_argument(
+                    "params must be a json object",
+                ))
+            }
+        };
+        let input = input_collection_id.to_string();
+
+        let mut tx = self.db.get_conn().begin().await.map_err(internal)?;
+        self.db.begin_immediate(&mut *tx).await.map_err(internal)?;
+
+        let function = function_by_name(&mut tx, &function_name)
+            .await?
+            .ok_or_else(|| tonic::Status::not_found(ERR_FUNCTION_NOT_FOUND))?;
+
+        let existing =
+            attached_function_rows(&mut tx, AttachedFunctionFilter::input(&input), false).await?;
+        let functions = functions_by_id(&mut tx, &existing).await?;
+        let database_id = database_id(&mut tx, &tenant_id, &database_name).await?;
+        for attached_function in &existing {
+            if attached_function.name == name
+                && attached_function.tenant_id == tenant_id
+                && attached_function.output_collection_name == output_collection_name
+                && attached_function.min_records_for_invocation == min_records_for_invocation as i64
+            {
+                let existing_function =
+                    functions
+                        .get(&attached_function.function_id)
+                        .ok_or_else(|| {
+                            tonic::Status::unknown(format!(
+                                "unknown function ID: {}",
+                                attached_function.function_id
+                            ))
+                        })?;
+                if existing_function.name == function_name {
+                    let database_id = database_id
+                        .as_ref()
+                        .ok_or_else(|| tonic::Status::unknown(ERR_DATABASE_NOT_FOUND))?;
+                    if &attached_function.database_id == database_id {
+                        return Ok((
+                            AttachedFunctionUuid(attached_function.id),
+                            !attached_function.is_ready,
+                        ));
+                    }
+                }
+            }
+            let existing_function = functions
+                .get(&attached_function.function_id)
+                .ok_or_else(|| tonic::Status::unknown(ERR_FUNCTION_NOT_FOUND))?;
+            if existing_function.is_async == function.is_async {
+                return Err(tonic::Status::already_exists(format!(
+                    "collection already has an attached function with the same execution mode (pre-lock validation): name={}, function={}, output_collection={}",
+                    attached_function.name, existing_function.name, attached_function.output_collection_name
+                )));
+            }
+        }
+
+        let database_id =
+            database_id.ok_or_else(|| tonic::Status::unknown(ERR_DATABASE_NOT_FOUND))?;
+        let collections = collection_ids_by_name(&mut tx, &tenant_id, &database_name).await?;
+        if !collections.values().any(|id| id == &input) {
+            return Err(tonic::Status::unknown(ERR_COLLECTION_NOT_FOUND));
+        }
+        let existing_output = collections.get(&output_collection_name).cloned();
+
+        let graph = AttachedFunctionGraph {
+            attached_functions: attached_function_rows(
+                &mut tx,
+                AttachedFunctionFilter::default(),
+                false,
+            )
+            .await?,
+            collections,
+        };
+
+        // The input collection can take another upstream edge only from asynchronous functions.
+        let upstream = graph.incoming(&input);
+        let upstream_functions = functions_by_id(&mut tx, &upstream).await?;
+        for attached_function in &upstream {
+            let existing_function = upstream_functions
+                .get(&attached_function.function_id)
+                .ok_or_else(|| tonic::Status::unknown(ERR_FUNCTION_NOT_FOUND))?;
+            if !existing_function.is_async {
+                return Err(tonic::Status::unknown(
+                    ERR_CANNOT_ATTACH_TO_OUTPUT_COLLECTION,
+                ));
+            }
+        }
+
+        let mut output_tail_depth = 0;
+        if let Some(output) = &existing_output {
+            if graph.reaches(output, &input) {
+                return Err(tonic::Status::unknown(
+                    ERR_CANNOT_ATTACH_TO_OUTPUT_COLLECTION,
+                ));
+            }
+            output_tail_depth = graph.max_path_length(
+                output,
+                &mut HashMap::new(),
+                &mut HashSet::new(),
+                "attached function cycle detected while computing downstream depth",
+                &|id| graph.outgoing_collection_ids(id),
+            )?;
+        }
+        let input_depth = graph.max_path_length(
+            &input,
+            &mut HashMap::new(),
+            &mut HashSet::new(),
+            "attached function cycle detected while computing depth",
+            &|id| graph.incoming_collection_ids(id),
+        )?;
+        if input_depth + 1 + output_tail_depth > MAX_ATTACHED_FUNCTION_DEPTH {
+            return Err(tonic::Status::invalid_argument(format!(
+                "attached function depth exceeds maximum of {MAX_ATTACHED_FUNCTION_DEPTH}"
+            )));
+        }
+
+        let attached_function_id = Uuid::new_v4();
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO attached_functions
+                (id, name, tenant_id, database_id, input_collection_id, output_collection_name, function_id,
+                 function_params, min_records_for_invocation, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, strftime('%Y-%m-%d %H:%M:%f', 'now'),
+                    strftime('%Y-%m-%d %H:%M:%f', 'now'))
+            "#,
+        )
+        .bind(attached_function_id.to_string())
+        .bind(&name)
+        .bind(&tenant_id)
+        .bind(&database_id)
+        .bind(&input)
+        .bind(&output_collection_name)
+        .bind(function.id.to_string())
+        .bind(&params_json)
+        .bind(min_records_for_invocation as i64)
+        .execute(&mut *tx)
+        .await;
+        match inserted {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(e)) if e.kind() == ErrorKind::UniqueViolation => {
+                return Err(tonic::Status::already_exists(
+                    ERR_ATTACHED_FUNCTION_ALREADY_EXISTS,
+                ));
+            }
+            Err(e) => return Err(internal(e)),
+        }
+
+        tx.commit().await.map_err(internal)?;
+        Ok((AttachedFunctionUuid(attached_function_id), true))
+    }
+
+    // FinishCreateAttachedFunction of the coordinator: the output collection, created if none has its name, then the
+    // attached function ready with it. Where the coordinator gives the output collection the segments of distributed
+    // Chroma, those of the single node (output_segments), as HNSW is the index of both.
+    pub(crate) async fn finish_create_attached_function(
+        &self,
+        attached_function_id: AttachedFunctionUuid,
+        output_collection_schema_str: String,
+        output_segments: impl FnOnce(CollectionUuid) -> Vec<Segment>,
+    ) -> Result<bool, tonic::Status> {
+        let id = attached_function_id.0.to_string();
+        let mut tx = self.db.get_conn().begin().await.map_err(internal)?;
+        self.db.begin_immediate(&mut *tx).await.map_err(internal)?;
+
+        let rows = attached_function_rows(&mut tx, AttachedFunctionFilter::id(&id), false).await?;
+        let Some(attached_function) = rows.first() else {
+            return Err(tonic::Status::not_found("attached function not found"));
+        };
+        if let Some(ready) = rows.iter().find(|row| row.is_ready) {
+            mark_ready(&mut tx, &id, ready.output_collection_id.as_deref()).await?;
+            tx.commit().await.map_err(internal)?;
+            return Ok(false);
+        }
+
+        let database_name: Option<String> =
+            sqlx::query_scalar("SELECT name FROM databases WHERE id = $1")
+                .bind(&attached_function.database_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(internal)?;
+        let database_name =
+            database_name.ok_or_else(|| tonic::Status::internal(ERR_DATABASE_NOT_FOUND))?;
+
+        let collections =
+            collection_ids_by_name(&mut tx, &attached_function.tenant_id, &database_name).await?;
+        let (output_collection_id, created) = match collections
+            .get(&attached_function.output_collection_name)
+        {
+            Some(output) => (output.clone(), false),
+            None => {
+                let collection_id = CollectionUuid::new();
+                sqlx::query(
+                        r#"
+                        INSERT INTO collections (id, name, config_json_str, schema_str, dimension, database_id)
+                        VALUES ($1, $2, '{}', $3, 1, $4)
+                        "#,
+                    )
+                    .bind(collection_id.to_string())
+                    .bind(&attached_function.output_collection_name)
+                    .bind(&output_collection_schema_str)
+                    .bind(&attached_function.database_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| match e {
+                        sqlx::Error::Database(e) if e.kind() == ErrorKind::UniqueViolation => {
+                            tonic::Status::already_exists(format!(
+                                "output collection '{}' already exists",
+                                attached_function.output_collection_name
+                            ))
+                        }
+                        e => internal(e),
+                    })?;
+                for segment in output_segments(collection_id) {
+                    self.create_segment_with_tx(&mut *tx, segment)
+                        .await
+                        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+                }
+                (collection_id.to_string(), true)
+            }
+        };
+        mark_ready(&mut tx, &id, Some(&output_collection_id)).await?;
+
+        // At most one ready synchronous function and one ready asynchronous function on a collection.
+        let ready = attached_function_rows(
+            &mut tx,
+            AttachedFunctionFilter::input(&attached_function.input_collection_id),
+            true,
+        )
+        .await?;
+        let functions = functions_by_id(&mut tx, &ready).await?;
+        let (mut sync, mut r#async) = (0, 0);
+        for row in &ready {
+            match functions.get(&row.function_id) {
+                Some(function) if function.is_async => r#async += 1,
+                Some(_) => sync += 1,
+                None => return Err(tonic::Status::internal(ERR_FUNCTION_NOT_FOUND)),
+            }
+        }
+        if sync > 1 || r#async > 1 {
+            return Err(tonic::Status::internal(
+                ERR_ATTACHED_FUNCTION_ALREADY_EXISTS,
+            ));
+        }
+
+        tx.commit().await.map_err(internal)?;
+        Ok(created)
+    }
+
+    // AddAttachedFunctionInput of the coordinator, with insertAttachedFunctionForInputCollection: one more input
+    // collection of an asynchronous attached function, a row of the same id; the row of the same id already there is
+    // the same input, created while it is not ready.
+    pub(crate) async fn add_attached_function_input(
+        &self,
+        attached_function_id: AttachedFunctionUuid,
+        input_collection_id: CollectionUuid,
+    ) -> Result<(AttachedFunctionUuid, bool), tonic::Status> {
+        let id = attached_function_id.0.to_string();
+        let input = input_collection_id.to_string();
+        let mut tx = self.db.get_conn().begin().await.map_err(internal)?;
+        self.db.begin_immediate(&mut *tx).await.map_err(internal)?;
+
+        let rows = attached_function_rows(&mut tx, AttachedFunctionFilter::id(&id), false).await?;
+        let Some(base) = rows.first() else {
+            return Err(tonic::Status::not_found(ERR_ATTACHED_FUNCTION_NOT_FOUND));
+        };
+        let functions = functions_by_id(&mut tx, std::slice::from_ref(base)).await?;
+        let function = functions
+            .get(&base.function_id)
+            .ok_or_else(|| tonic::Status::not_found(ERR_FUNCTION_NOT_FOUND))?;
+        if !function.is_async {
+            return Err(tonic::Status::invalid_argument(
+                "multiple input collections are only supported for async attached functions",
+            ));
+        }
+        let database_name: Option<String> =
+            sqlx::query_scalar("SELECT name FROM databases WHERE id = $1")
+                .bind(&base.database_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(internal)?;
+        let database_name =
+            database_name.ok_or_else(|| tonic::Status::unknown(ERR_DATABASE_NOT_FOUND))?;
+
+        let existing =
+            attached_function_rows(&mut tx, AttachedFunctionFilter::input(&input), false).await?;
+        let existing_functions = functions_by_id(&mut tx, &existing).await?;
+        for attached_function in &existing {
+            if attached_function.id == base.id {
+                return Ok((attached_function_id, !attached_function.is_ready));
+            }
+            let existing_function = existing_functions
+                .get(&attached_function.function_id)
+                .ok_or_else(|| tonic::Status::not_found(ERR_FUNCTION_NOT_FOUND))?;
+            if existing_function.is_async == function.is_async {
+                return Err(tonic::Status::already_exists(format!(
+                    "collection already has an attached function with the same execution mode (post-lock validation): name={}, function={}, output_collection={}",
+                    attached_function.name, existing_function.name, attached_function.output_collection_name
+                )));
+            }
+        }
+        let collections = collection_ids_by_name(&mut tx, &base.tenant_id, &database_name).await?;
+        if !collections.values().any(|id| id == &input) {
+            return Err(tonic::Status::unknown(ERR_COLLECTION_NOT_FOUND));
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO attached_functions
+                (id, name, tenant_id, database_id, input_collection_id, output_collection_name, function_id,
+                 function_params, min_records_for_invocation, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, strftime('%Y-%m-%d %H:%M:%f', 'now'),
+                    strftime('%Y-%m-%d %H:%M:%f', 'now'))
+            "#,
+        )
+        .bind(&id)
+        .bind(&base.name)
+        .bind(&base.tenant_id)
+        .bind(&base.database_id)
+        .bind(&input)
+        .bind(&base.output_collection_name)
+        .bind(base.function_id.to_string())
+        .bind(&base.function_params)
+        .bind(base.min_records_for_invocation)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(e) if e.kind() == ErrorKind::UniqueViolation => {
+                tonic::Status::already_exists(ERR_ATTACHED_FUNCTION_ALREADY_EXISTS)
+            }
+            e => internal(e),
+        })?;
+        tx.commit().await.map_err(internal)?;
+        Ok((attached_function_id, true))
+    }
+
+    // The update of the completion offset of FlushCollectionCompactionsAndAttachedFunction of the coordinator (its
+    // Update of the store, go/pkg/sysdb/metastore/db/dao/task.go): the rows of the attached function, of every input, not
+    // deleted; none is ErrAttachedFunctionNotFound. The single node flushes no collection with it: the output of a
+    // function goes through the log of its output collection.
+    pub(crate) async fn update_attached_function_completion_offset(
+        &self,
+        attached_function_id: AttachedFunctionUuid,
+        completion_offset: u64,
+    ) -> Result<(), tonic::Status> {
+        let updated = sqlx::query(
+            "UPDATE attached_functions SET completion_offset = $1, updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+             WHERE id = $2 AND is_deleted = FALSE",
+        )
+        .bind(completion_offset as i64)
+        .bind(attached_function_id.0.to_string())
+        .execute(self.db.get_conn())
+        .await
+        .map_err(internal)?;
+        if updated.rows_affected() == 0 {
+            return Err(tonic::Status::unknown(ERR_ATTACHED_FUNCTION_NOT_FOUND));
+        }
+        Ok(())
+    }
+
+    // TryFinishAsyncAttachedFunctionInvocation of the coordinator: the completion offset of an asynchronous function
+    // for one input, moved forward only, with heap_entry_pending set when it is behind the log position of the input,
+    // which a collection of the single node answers as the lowest max_seq_id of its segments.
+    pub(crate) async fn try_finish_async_attached_function_invocation(
+        &self,
+        request: chroma_proto::TryFinishAsyncAttachedFunctionInvocationRequest,
+    ) -> Result<chroma_proto::TryFinishAsyncAttachedFunctionInvocationResponse, tonic::Status> {
+        let id = Uuid::parse_str(&request.attached_function_id).map_err(|e| {
+            tonic::Status::invalid_argument(format!("invalid attached_function_id: {e}"))
+        })?;
+        let collection_id = CollectionUuid::from_str(&request.collection_id)
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid collection_id: {e}")))?;
+        let new_offset = request.new_completion_offset as i64;
+        let id_str = id.to_string();
+        let mut tx = self.db.get_conn().begin().await.map_err(internal)?;
+        self.db.begin_immediate(&mut *tx).await.map_err(internal)?;
+        let rows =
+            attached_function_rows(&mut tx, AttachedFunctionFilter::id(&id_str), true).await?;
+        if rows.is_empty() {
+            return Err(tonic::Status::not_found("attached function not found"));
+        }
+        let Some(row) = rows
+            .iter()
+            .find(|row| row.input_collection_id == request.collection_id)
+        else {
+            return Err(tonic::Status::not_found(
+                "attached function not found for collection",
+            ));
+        };
+        let functions = functions_by_id(&mut tx, std::slice::from_ref(row)).await?;
+        if !functions.get(&row.function_id).is_some_and(|f| f.is_async) {
+            return Err(tonic::Status::invalid_argument(
+                "attached function is not async",
+            ));
+        }
+        let log_position: Option<i64> = sqlx::query_scalar(
+            "SELECT (SELECT COALESCE(MIN(COALESCE(CAST(max_seq_id.seq_id AS INTEGER), 0)), 0) FROM segments \
+             LEFT JOIN max_seq_id ON max_seq_id.segment_id = segments.id WHERE segments.collection = collections.id) \
+             FROM collections WHERE id = $1",
+        )
+        .bind(collection_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?;
+        let Some(witnessed_log_offset) = log_position else {
+            return Err(tonic::Status::not_found("collection not found"));
+        };
+        // UpdateCompletionOffsetAndHeapEntry of the store: forward only, the failure count reset.
+        let updated = sqlx::query(
+            "UPDATE attached_functions SET completion_offset = $1, heap_entry_pending = ($1 < $2), failure_count = 0, \
+             updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+             WHERE id = $3 AND input_collection_id = $4 AND is_deleted = FALSE AND completion_offset <= $1",
+        )
+        .bind(new_offset)
+        .bind(witnessed_log_offset)
+        .bind(&id_str)
+        .bind(&request.collection_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+        if updated.rows_affected() == 0 {
+            return Err(tonic::Status::unknown(
+                "completion offset cannot move backwards",
+            ));
+        }
+        tx.commit().await.map_err(internal)?;
+        use chroma_proto::try_finish_async_attached_function_invocation_response::Result as FinishResult;
+        Ok(
+            chroma_proto::TryFinishAsyncAttachedFunctionInvocationResponse {
+                result: Some(if new_offset < witnessed_log_offset {
+                    FinishResult::NeedsRepair(chroma_proto::FinishAsyncNeedsRepair {
+                        current_collection_log_offset: witnessed_log_offset as u64,
+                    })
+                } else {
+                    FinishResult::Success(chroma_proto::FinishAsyncSuccess {
+                        updated_completion_offset: request.new_completion_offset,
+                    })
+                }),
+            },
+        )
+    }
+
+    // FailAttachedFunction (no count given: one more) and SetAttachedFunctionFailureCount (the count given) of the
+    // coordinator, with IncrementFailureCount and SetFailureCount of its store: the failure count of an asynchronous
+    // function for one input.
+    pub(crate) async fn change_attached_function_failure_count(
+        &self,
+        attached_function_id: &str,
+        collection_id: &str,
+        failure_count: Option<i32>,
+    ) -> Result<i32, tonic::Status> {
+        if failure_count.is_some_and(|count| count < 0) {
+            return Err(tonic::Status::invalid_argument(
+                "failure_count must be non-negative",
+            ));
+        }
+        let id = Uuid::parse_str(attached_function_id).map_err(|e| {
+            tonic::Status::invalid_argument(format!("invalid attached_function_id: {e}"))
+        })?;
+        CollectionUuid::from_str(collection_id)
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid collection_id: {e}")))?;
+        let updated: Option<i32> = sqlx::query_scalar(
+            "UPDATE attached_functions SET failure_count = COALESCE($1, failure_count + 1), \
+             updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+             WHERE id = $2 AND input_collection_id = $3 AND is_deleted = FALSE RETURNING failure_count",
+        )
+        .bind(failure_count)
+        .bind(id.to_string())
+        .bind(collection_id)
+        .fetch_optional(self.db.get_conn())
+        .await
+        .map_err(internal)?;
+        updated.ok_or_else(|| tonic::Status::not_found("attached function not found"))
+    }
+
+    // FinalizeAsyncAttachedFunctionRepair of the coordinator, with UpdateHeapEntryPending of its store:
+    // heap_entry_pending back to false.
+    pub(crate) async fn finalize_async_attached_function_repair(
+        &self,
+        request: chroma_proto::FinalizeAsyncAttachedFunctionRepairRequest,
+    ) -> Result<(), tonic::Status> {
+        let id = Uuid::parse_str(&request.attached_function_id).map_err(|e| {
+            tonic::Status::invalid_argument(format!("invalid attached_function_id: {e}"))
+        })?;
+        CollectionUuid::from_str(&request.collection_id)
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid collection_id: {e}")))?;
+        let updated = sqlx::query(
+            "UPDATE attached_functions SET heap_entry_pending = FALSE, \
+             updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+             WHERE id = $1 AND input_collection_id = $2 AND is_deleted = FALSE",
+        )
+        .bind(id.to_string())
+        .bind(&request.collection_id)
+        .execute(self.db.get_conn())
+        .await
+        .map_err(internal)?;
+        if updated.rows_affected() == 0 {
+            return Err(tonic::Status::unknown(ERR_ATTACHED_FUNCTION_NOT_FOUND));
+        }
+        Ok(())
+    }
+
+    // CheckInvocationStatus of the coordinator, with the query of its store: for each item, DONE when the attached
+    // function is gone or deleted, or past the offset given and not pending; NEEDS_REPAIR when past it and pending;
+    // NOT_DONE otherwise.
+    pub(crate) async fn check_invocation_status(
+        &self,
+        request: chroma_proto::CheckInvocationStatusRequest,
+    ) -> Result<chroma_proto::CheckInvocationStatusResponse, tonic::Status> {
+        let mut results = Vec::with_capacity(request.items.len());
+        for (index, item) in request.items.iter().enumerate() {
+            Uuid::parse_str(&item.function_id).map_err(|e| {
+                tonic::Status::invalid_argument(format!(
+                    "invalid function_id at index {index}: {e}"
+                ))
+            })?;
+            Uuid::parse_str(&item.input_collection_id).map_err(|e| {
+                tonic::Status::invalid_argument(format!(
+                    "invalid input_collection_id at index {index}: {e}"
+                ))
+            })?;
+            let row: Option<(bool, i64, bool)> = sqlx::query_as(
+                "SELECT is_deleted, completion_offset, heap_entry_pending FROM attached_functions \
+                 WHERE id = $1 AND input_collection_id = $2",
+            )
+            .bind(&item.function_id)
+            .bind(&item.input_collection_id)
+            .fetch_optional(self.db.get_conn())
+            .await
+            .map_err(internal)?;
+            let (status, current) = match row {
+                None => (chroma_proto::InvocationStatus::Done, item.completion_offset),
+                Some((true, offset, _)) => (chroma_proto::InvocationStatus::Done, offset),
+                Some((false, offset, true)) if offset > item.completion_offset => {
+                    (chroma_proto::InvocationStatus::NeedsRepair, offset)
+                }
+                Some((false, offset, false)) if offset > item.completion_offset => {
+                    (chroma_proto::InvocationStatus::Done, offset)
+                }
+                Some((false, offset, _)) => (chroma_proto::InvocationStatus::NotDone, offset),
+            };
+            results.push(chroma_proto::InvocationStatusResult {
+                status: status as i32,
+                current_completion_offset: current,
+            });
+        }
+        Ok(chroma_proto::CheckInvocationStatusResponse { results })
+    }
+
+    // GetAttachedFunctions of the coordinator, with the attached functions as the gRPC sysdb reads them.
+    pub(crate) async fn get_attached_functions(
+        &self,
+        name: Option<String>,
+        input_collection_id: Option<CollectionUuid>,
+        ids: Vec<AttachedFunctionUuid>,
+        only_ready: bool,
+    ) -> Result<Vec<chroma_types::AttachedFunction>, tonic::Status> {
+        let ids = ids.iter().map(|id| id.0.to_string()).collect::<Vec<_>>();
+        let input = input_collection_id.map(|id| id.to_string());
+        let mut conn = self.db.get_conn().acquire().await.map_err(internal)?;
+        let rows = attached_function_rows(
+            &mut conn,
+            AttachedFunctionFilter {
+                ids: &ids,
+                name: name.as_deref(),
+                input: input.as_deref(),
+                output: None,
+            },
+            only_ready,
+        )
+        .await?;
+        let functions = functions_by_id(&mut conn, &rows).await?;
+        rows.into_iter()
+            .map(|row| {
+                let function = functions
+                    .get(&row.function_id)
+                    .ok_or_else(|| tonic::Status::unknown(ERR_FUNCTION_NOT_FOUND))?;
+                row.into_attached_function(function)
+            })
+            .collect()
+    }
+
+    // DetachFunction of the coordinator: the attached function deleted, renamed as it does, and its output collection
+    // with it when asked, in one transaction.
+    pub(crate) async fn soft_delete_attached_function(
+        &self,
+        name: String,
+        input_collection_id: CollectionUuid,
+        delete_output: bool,
+    ) -> Result<(), tonic::Status> {
+        let input = input_collection_id.to_string();
+        let mut tx = self.db.get_conn().begin().await.map_err(internal)?;
+        self.db.begin_immediate(&mut *tx).await.map_err(internal)?;
+        let rows = attached_function_rows(
+            &mut tx,
+            AttachedFunctionFilter {
+                name: Some(&name),
+                input: Some(&input),
+                ..Default::default()
+            },
+            true,
+        )
+        .await?;
+        let Some(attached_function) = rows.first() else {
+            return Err(tonic::Status::not_found(ERR_ATTACHED_FUNCTION_NOT_FOUND));
+        };
+        if delete_output {
+            if let Some(output) = attached_function
+                .output_collection_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+            {
+                let output = CollectionUuid::from_str(output).map_err(|e| {
+                    tonic::Status::invalid_argument(format!("invalid output_collection_id: {e}"))
+                })?;
+                let database_name: Option<String> =
+                    sqlx::query_scalar("SELECT name FROM databases WHERE id = $1")
+                        .bind(&attached_function.database_id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(internal)?;
+                // A missing output collection, already deleted, leaves the attached function to delete.
+                if let Some(database_name) = database_name {
+                    self.delete_collection_with_conn(
+                        &mut *tx,
+                        attached_function.tenant_id.clone(),
+                        database_name,
+                        output,
+                        Vec::new(),
+                    )
+                    .await
+                    .map_err(|e| tonic::Status::internal(e.to_string()))?;
+                }
+            }
+        }
+        sqlx::query(
+            r#"
+            UPDATE attached_functions
+            SET name = '_deleted_' || name || '_' || id, is_deleted = TRUE,
+                updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
+            WHERE input_collection_id = $1 AND name = $2 AND is_deleted = FALSE
+            "#,
+        )
+        .bind(&input)
+        .bind(&name)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+        tx.commit().await.map_err(internal)?;
+        Ok(())
+    }
+
+    // GetFunctions of the coordinator, as the gRPC sysdb lists them.
+    pub(crate) async fn get_all_functions(&self) -> Result<Vec<(String, Uuid)>, tonic::Status> {
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT name, id FROM functions")
+            .fetch_all(self.db.get_conn())
+            .await
+            .map_err(internal)?;
+        rows.into_iter()
+            .map(|(name, id)| {
+                Uuid::parse_str(&id)
+                    .map(|id| (name, id))
+                    .map_err(|e| tonic::Status::internal(e.to_string()))
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1101,6 +1784,7 @@ impl SqliteSysDb {
             .column((table::Collections::Table, table::Collections::Dimension))
             .column((table::Collections::Table, table::Collections::DatabaseId))
             .column((table::Collections::Table, table::Collections::SchemaStr))
+            .column((table::Collections::Table, table::Collections::Version))
             .inner_join(
                 table::Databases::Table,
                 sea_query::Expr::col((table::Databases::Table, table::Databases::Id))
@@ -1173,6 +1857,8 @@ impl SqliteSysDb {
                 ),
                 sea_query::Alias::new("log_position"),
             )
+            // As the version of distributed Chroma, which each flush moves (00016).
+            .column((table::Collections::Table, table::Collections::Version))
             .build_sqlx(sea_query::SqliteQueryBuilder);
 
         let mut rows = sqlx::query_with(&sql, values).fetch(conn);
@@ -1238,7 +1924,7 @@ impl SqliteSysDb {
                     schema,
                     metadata,
                     total_records_post_compaction: 0,
-                    version: 0,
+                    version: first_row.get::<i32, _>("version"),
                     log_position: first_row.get("log_position"),
                     dimension: first_row.get(3),
                     name: first_row.get(1),
@@ -1514,6 +2200,21 @@ impl SqliteSysDb {
         .execute(&mut *conn)
         .await?;
 
+        // As SoftDeleteCollection of the coordinator of distributed Chroma: the ready attached functions that read the
+        // collection, and those that write into it, deleted with it.
+        sqlx::query(
+            r#"
+            UPDATE attached_functions
+            SET name = '_deleted_' || name || '_' || id, is_deleted = TRUE,
+                updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
+            WHERE (input_collection_id = $1 OR output_collection_id = $1) AND is_ready = TRUE
+              AND is_deleted = FALSE
+            "#,
+        )
+        .bind(collection_id.to_string())
+        .execute(&mut *conn)
+        .await?;
+
         let deleted_rows = sqlx::query(
             r#"
             DELETE FROM collections
@@ -1587,7 +2288,7 @@ pub async fn flush_compaction_in(
     conn: &mut sqlx::SqliteConnection,
     collection_id: CollectionUuid,
     log_position: i64,
-    collection_version: i32,
+    _collection_version: i32,
     segment_flush_info: &[SegmentFlushInfo],
     schema: Option<Schema>,
 ) -> Result<FlushCompactionResponse, FlushCompactionError> {
@@ -1598,17 +2299,17 @@ pub async fn flush_compaction_in(
         .map(|schema| serde_json::to_string(&schema))
         .transpose()
         .map_err(|e| internal(e.to_string()))?;
-    let found =
-        sqlx::query("UPDATE collections SET schema_str = COALESCE($1, schema_str) WHERE id = $2")
-            .bind(schema_str)
-            .bind(collection_id.to_string())
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| internal(e.to_string()))?
-            .rows_affected();
-    if found == 0 {
-        return Err(FlushCompactionError::CollectionNotFound);
-    }
+    // As a flush of distributed Chroma, one more version of the collection.
+    let collection_version: i32 = sqlx::query_scalar(
+        "UPDATE collections SET schema_str = COALESCE($1, schema_str), version = version + 1 WHERE id = $2 \
+         RETURNING version",
+    )
+    .bind(schema_str)
+    .bind(collection_id.to_string())
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| internal(e.to_string()))?
+    .ok_or(FlushCompactionError::CollectionNotFound)?;
     for info in segment_flush_info.iter() {
         // As the version check of distributed Chroma: a flush older than the last one of the segment would put back
         // files without the records after it, so the whole flush fails.
@@ -1660,6 +2361,394 @@ pub async fn flush_compaction_in(
         collection_version,
         last_compaction_time,
     })
+}
+
+// The attached functions of the single node: the errors and the limit of the coordinator of distributed Chroma
+// (go/pkg/common/errors.go and go/pkg/sysdb/coordinator/task.go), and its queries of the tables of 00015.
+const MAX_ATTACHED_FUNCTION_DEPTH: usize = 5;
+const ERR_DATABASE_NOT_FOUND: &str = "database not found";
+const ERR_COLLECTION_NOT_FOUND: &str = "collection not found";
+const ERR_FUNCTION_NOT_FOUND: &str = "function not found";
+const ERR_ATTACHED_FUNCTION_ALREADY_EXISTS: &str =
+    "the attached function that was being created already exists for this collection";
+const ERR_ATTACHED_FUNCTION_NOT_FOUND: &str = "the requested attached function was not found";
+const ERR_INVALID_ATTACHED_FUNCTION_NAME: &str =
+    "attached function name cannot start with reserved prefix '_deleted_'";
+const ERR_CANNOT_ATTACH_TO_OUTPUT_COLLECTION: &str =
+    "cannot attach function to an output collection";
+
+fn internal(e: sqlx::Error) -> tonic::Status {
+    tonic::Status::internal(e.to_string())
+}
+
+struct FunctionRow {
+    id: Uuid,
+    name: String,
+    is_async: bool,
+}
+
+#[derive(Clone)]
+struct AttachedFunctionRow {
+    id: Uuid,
+    name: String,
+    tenant_id: String,
+    database_id: String,
+    input_collection_id: String,
+    output_collection_name: String,
+    output_collection_id: Option<String>,
+    function_id: Uuid,
+    function_params: String,
+    completion_offset: i64,
+    min_records_for_invocation: i64,
+    is_ready: bool,
+    created_at_micros: i64,
+    updated_at_micros: i64,
+    failure_count: i32,
+}
+
+impl AttachedFunctionRow {
+    fn from_row(row: &SqliteRow) -> Result<Self, tonic::Status> {
+        let uuid = |column: &str| {
+            Uuid::parse_str(row.get::<&str, _>(column))
+                .map_err(|e| tonic::Status::internal(format!("invalid {column}: {e}")))
+        };
+        Ok(Self {
+            id: uuid("id")?,
+            name: row.get("name"),
+            tenant_id: row.get("tenant_id"),
+            database_id: row.get("database_id"),
+            input_collection_id: row.get("input_collection_id"),
+            output_collection_name: row.get("output_collection_name"),
+            output_collection_id: row.get("output_collection_id"),
+            function_id: uuid("function_id")?,
+            function_params: row.get("function_params"),
+            completion_offset: row.get("completion_offset"),
+            min_records_for_invocation: row.get("min_records_for_invocation"),
+            is_ready: row.get("is_ready"),
+            created_at_micros: row.get("created_at_micros"),
+            updated_at_micros: row.get("updated_at_micros"),
+            failure_count: row.get("failure_count"),
+        })
+    }
+
+    // As attachedFunctionToProto of the coordinator, then attached_function_from_proto of the gRPC sysdb.
+    fn into_attached_function(
+        self,
+        function: &FunctionRow,
+    ) -> Result<chroma_types::AttachedFunction, tonic::Status> {
+        if self.completion_offset < 0 {
+            return Err(tonic::Status::internal(format!(
+                "attached function has invalid completion_offset: {}",
+                self.completion_offset
+            )));
+        }
+        if !self.is_ready {
+            return Err(tonic::Status::internal(
+                "serialized attached function is not ready",
+            ));
+        }
+        let input_collection_id = CollectionUuid::from_str(&self.input_collection_id)
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        let output_collection_id = self
+            .output_collection_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(CollectionUuid::from_str)
+            .transpose()
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        let params = (!self.function_params.is_empty())
+            .then(|| {
+                serde_json::from_str::<serde_json::Value>(&self.function_params)
+                    .and_then(|value| serde_json::to_string(&value))
+            })
+            .transpose()
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        let at = |micros: i64| {
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(micros.max(0) as u64)
+        };
+        Ok(chroma_types::AttachedFunction {
+            id: AttachedFunctionUuid(self.id),
+            name: self.name,
+            function_id: function.id,
+            input_collection_id,
+            output_collection_name: self.output_collection_name,
+            output_collection_id,
+            params,
+            tenant_id: self.tenant_id,
+            database_id: self.database_id,
+            last_run: None,
+            completion_offset: self.completion_offset as u64,
+            min_records_for_invocation: self.min_records_for_invocation as u64,
+            is_deleted: false,
+            is_async: function.is_async,
+            failure_count: self.failure_count,
+            created_at: at(self.created_at_micros),
+            updated_at: at(self.updated_at_micros),
+        })
+    }
+}
+
+// The filters of GetAttachedFunctions of the store of the coordinator (go/pkg/sysdb/metastore/db/dao/task.go): none
+// filters on a field left out.
+#[derive(Default)]
+struct AttachedFunctionFilter<'a> {
+    ids: &'a [String],
+    name: Option<&'a str>,
+    input: Option<&'a str>,
+    output: Option<&'a str>,
+}
+
+impl<'a> AttachedFunctionFilter<'a> {
+    fn input(input: &'a str) -> Self {
+        Self {
+            input: Some(input),
+            ..Default::default()
+        }
+    }
+
+    fn id(id: &'a String) -> Self {
+        Self {
+            ids: std::slice::from_ref(id),
+            ..Default::default()
+        }
+    }
+}
+
+async fn attached_function_rows(
+    conn: &mut sqlx::SqliteConnection,
+    filter: AttachedFunctionFilter<'_>,
+    only_ready: bool,
+) -> Result<Vec<AttachedFunctionRow>, tonic::Status> {
+    let mut sql = String::from(
+        "SELECT id, name, tenant_id, database_id, input_collection_id, output_collection_name, output_collection_id, \
+         function_id, function_params, completion_offset, min_records_for_invocation, is_ready, failure_count, \
+         CAST((julianday(created_at) - 2440587.5) * 86400000000 AS INTEGER) AS created_at_micros, \
+         CAST((julianday(updated_at) - 2440587.5) * 86400000000 AS INTEGER) AS updated_at_micros \
+         FROM attached_functions WHERE is_deleted = FALSE",
+    );
+    if !filter.ids.is_empty() {
+        sql.push_str(&format!(
+            " AND id IN ({})",
+            vec!["?"; filter.ids.len()].join(", ")
+        ));
+    }
+    for (value, column) in [
+        (filter.name, "name"),
+        (filter.input, "input_collection_id"),
+        (filter.output, "output_collection_id"),
+    ] {
+        if value.is_some() {
+            sql.push_str(&format!(" AND {column} = ?"));
+        }
+    }
+    if only_ready {
+        sql.push_str(" AND is_ready = TRUE");
+    }
+    let mut query = sqlx::query(&sql);
+    for id in filter.ids {
+        query = query.bind(id);
+    }
+    for value in [filter.name, filter.input, filter.output]
+        .into_iter()
+        .flatten()
+    {
+        query = query.bind(value);
+    }
+    query
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(internal)?
+        .iter()
+        .map(AttachedFunctionRow::from_row)
+        .collect()
+}
+
+fn function_from_row(row: &SqliteRow) -> Result<FunctionRow, tonic::Status> {
+    Ok(FunctionRow {
+        id: Uuid::parse_str(row.get::<&str, _>("id"))
+            .map_err(|e| tonic::Status::internal(e.to_string()))?,
+        name: row.get("name"),
+        is_async: row.get("is_async"),
+    })
+}
+
+async fn function_by_name(
+    conn: &mut sqlx::SqliteConnection,
+    name: &str,
+) -> Result<Option<FunctionRow>, tonic::Status> {
+    sqlx::query("SELECT id, name, is_async FROM functions WHERE name = $1")
+        .bind(name)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(internal)?
+        .as_ref()
+        .map(function_from_row)
+        .transpose()
+}
+
+async fn functions_by_id(
+    conn: &mut sqlx::SqliteConnection,
+    attached_functions: &[AttachedFunctionRow],
+) -> Result<HashMap<Uuid, FunctionRow>, tonic::Status> {
+    let mut functions = HashMap::new();
+    for row in sqlx::query("SELECT id, name, is_async FROM functions")
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(internal)?
+    {
+        let function = function_from_row(&row)?;
+        if attached_functions
+            .iter()
+            .any(|attached_function| attached_function.function_id == function.id)
+        {
+            functions.insert(function.id, function);
+        }
+    }
+    Ok(functions)
+}
+
+async fn database_id(
+    conn: &mut sqlx::SqliteConnection,
+    tenant: &str,
+    database: &str,
+) -> Result<Option<String>, tonic::Status> {
+    sqlx::query_scalar("SELECT id FROM databases WHERE name = $1 AND tenant_id = $2")
+        .bind(database)
+        .bind(tenant)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(internal)
+}
+
+// The collections of a database, by name.
+async fn collection_ids_by_name(
+    conn: &mut sqlx::SqliteConnection,
+    tenant: &str,
+    database: &str,
+) -> Result<HashMap<String, String>, tonic::Status> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT collections.name, collections.id FROM collections \
+         JOIN databases ON collections.database_id = databases.id \
+         WHERE databases.name = $1 AND databases.tenant_id = $2",
+    )
+    .bind(database)
+    .bind(tenant)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(internal)?;
+    Ok(rows.into_iter().collect())
+}
+
+// Update of the coordinator, as FinishCreateAttachedFunction calls it: every row of the attached function, of every
+// input, ready with its output collection; none updated is ErrAttachedFunctionNotFound.
+async fn mark_ready(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    output_collection_id: Option<&str>,
+) -> Result<(), tonic::Status> {
+    let updated = sqlx::query(
+        "UPDATE attached_functions SET output_collection_id = COALESCE($1, output_collection_id), is_ready = TRUE, \
+         updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') WHERE id = $2 AND is_deleted = FALSE",
+    )
+    .bind(output_collection_id)
+    .bind(id)
+    .execute(&mut *conn)
+    .await
+    .map_err(internal)?;
+    if updated.rows_affected() == 0 {
+        return Err(tonic::Status::internal(ERR_ATTACHED_FUNCTION_NOT_FOUND));
+    }
+    Ok(())
+}
+
+// The graph of attachedFunctionGraphState of the coordinator, read whole in the transaction of the attach: its edges
+// go from the input collection of an attached function to its output collection, by id, or by name in the database
+// of the attach while the output collection is not created yet.
+struct AttachedFunctionGraph {
+    attached_functions: Vec<AttachedFunctionRow>,
+    collections: HashMap<String, String>,
+}
+
+impl AttachedFunctionGraph {
+    fn incoming(&self, collection_id: &str) -> Vec<AttachedFunctionRow> {
+        self.attached_functions
+            .iter()
+            .filter(|row| row.output_collection_id.as_deref() == Some(collection_id))
+            .cloned()
+            .collect()
+    }
+
+    fn output_collection_id(&self, row: &AttachedFunctionRow) -> Option<String> {
+        row.output_collection_id
+            .clone()
+            .or_else(|| self.collections.get(&row.output_collection_name).cloned())
+    }
+
+    fn incoming_collection_ids(&self, collection_id: &str) -> Vec<String> {
+        self.attached_functions
+            .iter()
+            .filter(|row| row.output_collection_id.as_deref() == Some(collection_id))
+            .map(|row| row.input_collection_id.clone())
+            .collect()
+    }
+
+    fn outgoing_collection_ids(&self, collection_id: &str) -> Vec<String> {
+        self.attached_functions
+            .iter()
+            .filter(|row| row.input_collection_id == collection_id)
+            .filter_map(|row| self.output_collection_id(row))
+            .collect()
+    }
+
+    fn max_path_length(
+        &self,
+        collection_id: &str,
+        memo: &mut HashMap<String, usize>,
+        visiting: &mut HashSet<String>,
+        cycle_message: &str,
+        neighbors: &dyn Fn(&str) -> Vec<String>,
+    ) -> Result<usize, tonic::Status> {
+        if let Some(depth) = memo.get(collection_id) {
+            return Ok(*depth);
+        }
+        if !visiting.insert(collection_id.to_string()) {
+            return Err(tonic::Status::failed_precondition(cycle_message));
+        }
+        let mut max_depth = 0;
+        for next in neighbors(collection_id) {
+            let depth = self.max_path_length(&next, memo, visiting, cycle_message, neighbors);
+            let depth = match depth {
+                Ok(depth) => depth,
+                Err(e) => {
+                    visiting.remove(collection_id);
+                    return Err(e);
+                }
+            };
+            max_depth = max_depth.max(depth + 1);
+        }
+        visiting.remove(collection_id);
+        memo.insert(collection_id.to_string(), max_depth);
+        Ok(max_depth)
+    }
+
+    fn reaches(&self, start: &str, target: &str) -> bool {
+        if start == target {
+            return true;
+        }
+        let mut queue = std::collections::VecDeque::from([start.to_string()]);
+        let mut visited = HashSet::from([start.to_string()]);
+        while let Some(current) = queue.pop_front() {
+            for output in self.outgoing_collection_ids(&current) {
+                if output == target {
+                    return true;
+                }
+                if visited.insert(output.clone()) {
+                    queue.push_back(output);
+                }
+            }
+        }
+        false
+    }
 }
 
 #[cfg(test)]
@@ -2079,6 +3168,7 @@ mod tests {
             .unwrap();
         assert_eq!(created.record_segment.id, record.id);
         assert!(created.vector_segment.file_path.is_empty());
+        assert_eq!(created.collection.version, 0);
 
         let files = |name: &str| {
             HashMap::from([(name.to_string(), vec![format!("{name}/{}", Uuid::new_v4())])])
@@ -2103,11 +3193,13 @@ mod tests {
                 None,
             )
         };
-        flush(vector.id, 7).await.unwrap();
+        // As a flush of distributed Chroma, one more version of the collection.
+        assert_eq!(flush(vector.id, 7).await.unwrap().collection_version, 1);
         let flushed = sysdb
             .get_collection_with_segments(collection_id)
             .await
             .unwrap();
+        assert_eq!(flushed.collection.version, 1);
         assert_eq!(flushed.record_segment.file_path, record_files);
         assert_eq!(flushed.vector_segment.file_path, vector_files);
         let seq_id = |segment_id: SegmentUuid| {
@@ -2662,5 +3754,460 @@ mod tests {
             collection.config,
             InternalCollectionConfiguration::default_hnsw()
         );
+    }
+
+    // The attached functions of the single node answer as the coordinator of distributed Chroma.
+    async fn function_collection(sysdb: &SqliteSysDb, name: &str) -> CollectionUuid {
+        let collection_id = CollectionUuid::new();
+        sysdb
+            .create_collection(
+                "default_tenant".to_string(),
+                "default_database".to_string(),
+                collection_id,
+                name.to_string(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        collection_id
+    }
+
+    async fn attach(
+        sysdb: &SqliteSysDb,
+        name: &str,
+        function: &str,
+        input: CollectionUuid,
+        output: &str,
+    ) -> Result<(AttachedFunctionUuid, bool), tonic::Status> {
+        sysdb
+            .create_attached_function(
+                name.to_string(),
+                function.to_string(),
+                input,
+                output.to_string(),
+                serde_json::Value::Null,
+                "default_tenant".to_string(),
+                "default_database".to_string(),
+                100,
+            )
+            .await
+    }
+
+    async fn finish(sysdb: &SqliteSysDb, id: AttachedFunctionUuid) -> bool {
+        sysdb
+            .finish_create_attached_function(id, "{}".to_string(), |collection| {
+                vec![Segment {
+                    id: SegmentUuid::new(),
+                    r#type: SegmentType::Sqlite,
+                    scope: SegmentScope::METADATA,
+                    collection,
+                    metadata: None,
+                    file_path: HashMap::new(),
+                }]
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_attached_function_is_created_ready_read_and_detached() {
+        let sysdb = SqliteSysDb::new(
+            get_new_sqlite_db().await,
+            "default".into(),
+            "default".into(),
+        );
+        let input = function_collection(&sysdb, "input").await;
+        let (id, created) = attach(&sysdb, "counter", "record_counter", input, "counts")
+            .await
+            .unwrap();
+        assert!(created);
+        // Not ready before its output collection: get with only_ready finds nothing.
+        assert!(sysdb
+            .get_attached_functions(Some("counter".into()), Some(input), vec![], true)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(finish(&sysdb, id).await);
+        let got = sysdb
+            .get_attached_functions(Some("counter".into()), Some(input), vec![], true)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, id);
+        assert_eq!(got[0].function_id, chroma_types::FUNCTION_RECORD_COUNTER_ID);
+        assert_eq!(got[0].completion_offset, 0);
+        assert_eq!(got[0].params.as_deref(), Some("{}"));
+        let output = got[0].output_collection_id.unwrap();
+        assert_eq!(
+            sysdb
+                .get_segments(None, None, None, output)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // The same request again is the same attached function, already created.
+        assert_eq!(
+            attach(&sysdb, "counter", "record_counter", input, "counts")
+                .await
+                .unwrap(),
+            (id, false)
+        );
+        sysdb
+            .soft_delete_attached_function("counter".into(), input, true)
+            .await
+            .unwrap();
+        assert!(sysdb
+            .get_attached_functions(None, Some(input), vec![], false)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(sysdb
+            .get_segments(None, None, None, output)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            sysdb
+                .soft_delete_attached_function("counter".into(), input, false)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attach_is_refused_as_the_coordinator_refuses_it() {
+        let sysdb = SqliteSysDb::new(
+            get_new_sqlite_db().await,
+            "default".into(),
+            "default".into(),
+        );
+        let input = function_collection(&sysdb, "input").await;
+        let err = attach(&sysdb, "f", "no_such_function", input, "out")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (err.code(), err.message()),
+            (tonic::Code::NotFound, "function not found")
+        );
+        let err = attach(&sysdb, "_deleted_f", "record_counter", input, "out")
+            .await
+            .unwrap_err();
+        assert_eq!(err.message(), ERR_INVALID_ATTACHED_FUNCTION_NAME);
+        let err = attach(&sysdb, "f", "record_counter", CollectionUuid::new(), "out")
+            .await
+            .unwrap_err();
+        assert_eq!(err.message(), ERR_COLLECTION_NOT_FOUND);
+
+        let (id, _) = attach(&sysdb, "f", "record_counter", input, "out")
+            .await
+            .unwrap();
+        finish(&sysdb, id).await;
+        // A second synchronous function on the same collection.
+        let err = attach(&sysdb, "g", "statistics", input, "stats")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        assert!(err
+            .message()
+            .contains("same execution mode (pre-lock validation)"));
+        // A function on the output collection of a synchronous function.
+        let output = sysdb
+            .get_attached_functions(None, Some(input), vec![], true)
+            .await
+            .unwrap()[0]
+            .output_collection_id
+            .unwrap();
+        let err = attach(&sysdb, "h", "record_counter", output, "out2")
+            .await
+            .unwrap_err();
+        assert_eq!(err.message(), ERR_CANNOT_ATTACH_TO_OUTPUT_COLLECTION);
+        // More inputs only for an asynchronous function.
+        let other = function_collection(&sysdb, "other").await;
+        let err = sysdb
+            .add_attached_function_input(id, other)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // As CreateAttachedFunction of the coordinator: an attach whose output collection reaches its input is refused, and
+    // so is one past MAX_ATTACHED_FUNCTION_DEPTH functions in a chain, both on chains of asynchronous functions, which
+    // the output collection of a function can take as input.
+    #[tokio::test]
+    async fn an_attach_that_closes_a_cycle_or_passes_the_maximum_depth_is_refused() {
+        let sysdb = SqliteSysDb::new(
+            get_new_sqlite_db().await,
+            "default".into(),
+            "default".into(),
+        );
+        let mut input = function_collection(&sysdb, "c0").await;
+        for depth in 1..=MAX_ATTACHED_FUNCTION_DEPTH {
+            let (id, _) = attach(&sysdb, "f", "dummy_async", input, &format!("c{depth}"))
+                .await
+                .unwrap();
+            finish(&sysdb, id).await;
+            input = sysdb
+                .get_attached_functions(None, Some(input), vec![], true)
+                .await
+                .unwrap()[0]
+                .output_collection_id
+                .unwrap();
+        }
+        // c0 -> c1 -> ... -> c5: writing into c0 from c5 closes a cycle.
+        let err = attach(&sysdb, "f", "dummy_async", input, "c0")
+            .await
+            .unwrap_err();
+        assert_eq!(err.message(), ERR_CANNOT_ATTACH_TO_OUTPUT_COLLECTION);
+        // A sixth function after the chain of five.
+        let err = attach(&sysdb, "f", "dummy_async", input, "c6")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("depth exceeds maximum"));
+    }
+
+    #[test]
+    fn the_graph_of_the_attached_functions_counts_depth_and_reach_as_the_coordinator() {
+        // A chain c0 -> c1 -> ... of edges, each output collection the input of the next, one beyond the limit.
+        let ids = (0..=MAX_ATTACHED_FUNCTION_DEPTH + 1)
+            .map(|_| Uuid::new_v4().to_string())
+            .collect::<Vec<_>>();
+        let graph = AttachedFunctionGraph {
+            attached_functions: ids
+                .windows(2)
+                .map(|pair| AttachedFunctionRow {
+                    id: Uuid::new_v4(),
+                    name: "f".into(),
+                    tenant_id: "t".into(),
+                    database_id: "d".into(),
+                    input_collection_id: pair[0].clone(),
+                    output_collection_name: pair[1].clone(),
+                    output_collection_id: Some(pair[1].clone()),
+                    function_id: Uuid::new_v4(),
+                    function_params: "{}".into(),
+                    completion_offset: 0,
+                    min_records_for_invocation: 100,
+                    is_ready: true,
+                    created_at_micros: 0,
+                    updated_at_micros: 0,
+                    failure_count: 0,
+                })
+                .collect(),
+            collections: HashMap::new(),
+        };
+        let depth = graph
+            .max_path_length(
+                ids.last().unwrap(),
+                &mut HashMap::new(),
+                &mut HashSet::new(),
+                "cycle",
+                &|id| graph.incoming_collection_ids(id),
+            )
+            .unwrap();
+        assert_eq!(depth, MAX_ATTACHED_FUNCTION_DEPTH + 1);
+        assert!(graph.reaches(&ids[0], ids.last().unwrap()));
+        assert!(!graph.reaches(ids.last().unwrap(), &ids[0]));
+    }
+
+    #[tokio::test]
+    async fn the_built_in_functions_are_those_of_distributed_chroma() {
+        let sysdb = SqliteSysDb::new(
+            get_new_sqlite_db().await,
+            "default".into(),
+            "default".into(),
+        );
+        let mut functions = sysdb.get_all_functions().await.unwrap();
+        functions.sort();
+        let mut expected = vec![
+            (
+                chroma_types::FUNCTION_RECORD_COUNTER_NAME,
+                chroma_types::FUNCTION_RECORD_COUNTER_ID,
+            ),
+            (
+                chroma_types::FUNCTION_STATISTICS_NAME,
+                chroma_types::FUNCTION_STATISTICS_ID,
+            ),
+            (
+                chroma_types::FUNCTION_DUMMY_ASYNC_NAME,
+                chroma_types::FUNCTION_DUMMY_ASYNC_ID,
+            ),
+            (
+                chroma_types::FUNCTION_HTTP_GENERATE_NAME,
+                chroma_types::FUNCTION_HTTP_GENERATE_ID,
+            ),
+            (
+                chroma_types::FUNCTION_HTTP_CURRENTS_NAME,
+                chroma_types::FUNCTION_HTTP_CURRENTS_ID,
+            ),
+            (
+                chroma_types::FUNCTION_REVISION_HISTORY_NAME,
+                chroma_types::FUNCTION_REVISION_HISTORY_ID,
+            ),
+            (
+                chroma_types::FUNCTION_COUNT_TO_FILE_ASYNC_NAME,
+                chroma_types::FUNCTION_COUNT_TO_FILE_ASYNC_ID,
+            ),
+        ]
+        .into_iter()
+        .map(|(name, id)| (name.to_string(), id))
+        .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(functions, expected);
+    }
+
+    #[tokio::test]
+    async fn deleting_the_output_collection_deletes_the_attached_functions_that_write_into_it() {
+        let sysdb = SqliteSysDb::new(
+            get_new_sqlite_db().await,
+            "default".into(),
+            "default".into(),
+        );
+        let input = function_collection(&sysdb, "input").await;
+        let (id, _) = attach(&sysdb, "f", "record_counter", input, "out")
+            .await
+            .unwrap();
+        finish(&sysdb, id).await;
+        let output = sysdb
+            .get_attached_functions(None, Some(input), vec![], true)
+            .await
+            .unwrap()[0]
+            .output_collection_id
+            .unwrap();
+        sysdb
+            .delete_collection(
+                "default_tenant".into(),
+                "default_database".into(),
+                output,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(sysdb
+            .get_attached_functions(None, Some(input), vec![], false)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    // The calls of the work queue of the asynchronous functions answer as the coordinator of distributed Chroma.
+    #[tokio::test]
+    async fn an_asynchronous_function_finishes_fails_and_is_checked_as_the_coordinator_does() {
+        let sysdb = SqliteSysDb::new(
+            get_new_sqlite_db().await,
+            "default".into(),
+            "default".into(),
+        );
+        let input = function_collection(&sysdb, "input").await;
+        let (id, _) = attach(&sysdb, "dummy", "dummy_async", input, "out")
+            .await
+            .unwrap();
+        finish(&sysdb, id).await;
+        let try_finish = |offset: u64| {
+            sysdb.try_finish_async_attached_function_invocation(
+                chroma_proto::TryFinishAsyncAttachedFunctionInvocationRequest {
+                    attached_function_id: id.0.to_string(),
+                    collection_id: input.to_string(),
+                    new_completion_offset: offset,
+                },
+            )
+        };
+        use chroma_proto::try_finish_async_attached_function_invocation_response::Result as FinishResult;
+        // The log position of a collection with no segment applied is 0: an offset at it is done.
+        assert!(matches!(
+            try_finish(0).await.unwrap().result,
+            Some(FinishResult::Success(_))
+        ));
+        assert!(matches!(
+            try_finish(5).await.unwrap().result,
+            Some(FinishResult::Success(_))
+        ));
+        assert_eq!(
+            try_finish(3).await.unwrap_err().message(),
+            "completion offset cannot move backwards"
+        );
+        let input_str = input.to_string();
+        let id_str = id.0.to_string();
+        let fail = || sysdb.change_attached_function_failure_count(&id_str, &input_str, None);
+        assert_eq!(fail().await.unwrap(), 1);
+        assert_eq!(fail().await.unwrap(), 2);
+        assert_eq!(
+            sysdb
+                .change_attached_function_failure_count(&id_str, &input_str, Some(7))
+                .await
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            sysdb
+                .change_attached_function_failure_count(&id_str, &input_str, Some(-1))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        // A finish resets the failure count, as UpdateCompletionOffsetAndHeapEntry does.
+        try_finish(6).await.unwrap();
+        assert_eq!(fail().await.unwrap(), 1);
+        sysdb
+            .finalize_async_attached_function_repair(
+                chroma_proto::FinalizeAsyncAttachedFunctionRepairRequest {
+                    attached_function_id: id_str.clone(),
+                    collection_id: input_str.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let check = |offset: i64, function_id: String| chroma_proto::InvocationCheckItem {
+            function_id,
+            input_collection_id: input_str.clone(),
+            completion_offset: offset,
+        };
+        let statuses = sysdb
+            .check_invocation_status(chroma_proto::CheckInvocationStatusRequest {
+                items: vec![
+                    check(6, id_str.clone()),
+                    check(5, id_str.clone()),
+                    check(0, Uuid::new_v4().to_string()),
+                ],
+            })
+            .await
+            .unwrap()
+            .results
+            .into_iter()
+            .map(|result| (result.status, result.current_completion_offset))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                (chroma_proto::InvocationStatus::NotDone as i32, 6),
+                (chroma_proto::InvocationStatus::Done as i32, 6),
+                (chroma_proto::InvocationStatus::Done as i32, 0),
+            ]
+        );
+        // A synchronous function is not finished through the work queue.
+        let other = function_collection(&sysdb, "other").await;
+        let (sync_id, _) = attach(&sysdb, "counter", "record_counter", other, "counts")
+            .await
+            .unwrap();
+        finish(&sysdb, sync_id).await;
+        let err = sysdb
+            .try_finish_async_attached_function_invocation(
+                chroma_proto::TryFinishAsyncAttachedFunctionInvocationRequest {
+                    attached_function_id: sync_id.0.to_string(),
+                    collection_id: other.to_string(),
+                    new_completion_offset: 1,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.message(), "attached function is not async");
     }
 }

@@ -5758,7 +5758,25 @@ mod tests {
 
     // A frontend with its HNSW indexes in files under `root`, and its SQLite database there too, as `chroma run`.
     async fn persistent_frontend(root: &std::path::Path) -> ServiceBasedFrontend {
+        persistent_frontend_with(root, false).await
+    }
+
+    // With allow_reset, which count_to_file_async, a function of the tests of distributed Chroma, asks for.
+    async fn persistent_frontend_with(
+        root: &std::path::Path,
+        allow_reset: bool,
+    ) -> ServiceBasedFrontend {
+        ServiceBasedFrontend::try_from_config(
+            &(persistent_config(root, allow_reset), System::new()),
+            &Registry::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn persistent_config(root: &std::path::Path, allow_reset: bool) -> FrontendConfig {
         let mut config = FrontendConfig::sqlite_in_memory();
+        config.allow_reset = allow_reset;
         config.sqlitedb = Some(chroma_sqlite::config::SqliteDBConfig {
             url: Some(root.join("chroma.sqlite3").to_str().unwrap().to_string()),
             ..Default::default()
@@ -5766,9 +5784,7 @@ mod tests {
         if let Some(segment_manager) = config.segment_manager.as_mut() {
             segment_manager.persist_path = Some(root.to_str().unwrap().to_string());
         }
-        ServiceBasedFrontend::try_from_config(&(config, System::new()), &Registry::new())
-            .await
-            .unwrap()
+        config
     }
 
     async fn add_record(frontend: &mut ServiceBasedFrontend, collection: &Collection, id: &str) {
@@ -5803,6 +5819,817 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    async fn collection_version(
+        frontend: &mut ServiceBasedFrontend,
+        collection: &Collection,
+    ) -> i32 {
+        frontend
+            .sysdb_client
+            .get_collections(GetCollectionsOptions {
+                collection_id: Some(collection.collection_id),
+                ..Default::default()
+            })
+            .await
+            .unwrap()[0]
+            .version
+    }
+
+    // As a compaction of distributed Chroma, each apply of records to an HNSW collection is one more version, and a read
+    // that applies nothing again leaves it.
+    #[tokio::test]
+    async fn an_hnsw_collection_has_one_more_version_for_each_apply_of_records() {
+        let (mut frontend, collection) = seeded_collection().await;
+        assert_eq!(count_records(&mut frontend, &collection).await, 1);
+        let applied = collection_version(&mut frontend, &collection).await;
+        assert!(applied >= 1, "version {applied} after the first apply");
+        assert_eq!(count_records(&mut frontend, &collection).await, 1);
+        assert_eq!(
+            collection_version(&mut frontend, &collection).await,
+            applied
+        );
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    vec!["id2".to_string()],
+                    vec![vec![3.0, 4.0]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count_records(&mut frontend, &collection).await, 2);
+        assert_eq!(
+            collection_version(&mut frontend, &collection).await,
+            applied + 1
+        );
+        // A write of deletes only is one more version too, as a compaction of deletes in distributed Chroma.
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    Some(vec!["id2".to_string()]),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count_records(&mut frontend, &collection).await, 1);
+        assert_eq!(
+            collection_version(&mut frontend, &collection).await,
+            applied + 2
+        );
+    }
+
+    // The total of record_counter in the output collection of an attached function, once it reaches the one expected.
+    async fn wait_for_total_count(
+        frontend: &mut ServiceBasedFrontend,
+        input: &Collection,
+        expected: i64,
+    ) -> i64 {
+        let attached_function = frontend
+            .get_attached_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                input.collection_id.to_string(),
+                "counter".to_string(),
+            )
+            .await
+            .unwrap();
+        let output = attached_function.output_collection_id.unwrap();
+        let mut total = -1;
+        for _ in 0..100 {
+            let got = frontend
+                .get(
+                    GetRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        output,
+                        Some(vec!["function_output".to_string()]),
+                        None,
+                        None,
+                        0,
+                        chroma_types::IncludeList(vec![chroma_types::Include::Metadata]),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            total = got
+                .metadatas
+                .and_then(|metadatas| metadatas.into_iter().next().flatten())
+                .and_then(|metadata| match metadata.get("total_count") {
+                    Some(MetadataValue::Int(total)) => Some(*total),
+                    _ => None,
+                })
+                .unwrap_or(-1);
+            if total == expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        total
+    }
+
+    // A synchronous attached function runs on the single node as in distributed Chroma: attached to a collection that
+    // has records, it counts them (its backfill); then each write is counted against the records as they were before it,
+    // so that adding an id again does not count it twice, and a delete takes it off.
+    #[tokio::test]
+    async fn record_counter_counts_the_records_of_its_input_collection() {
+        let (mut frontend, collection) = seeded_collection().await;
+        let add = |ids: &[&str]| {
+            AddCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection.collection_id,
+                ids.iter().map(|id| id.to_string()).collect(),
+                ids.iter().map(|_| vec![1.0, 2.0]).collect(),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        frontend.add(add(&["id2", "id3"])).await.unwrap();
+        frontend
+            .attach_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                AttachFunctionRequest::try_new(
+                    "counter".to_string(),
+                    chroma_types::FUNCTION_RECORD_COUNTER_NAME.to_string(),
+                    "counts".to_string(),
+                    serde_json::json!({}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 3).await, 3);
+
+        frontend.add(add(&["id4", "id2"])).await.unwrap();
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 4).await, 4);
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    Some(vec!["id3".to_string()]),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 3).await, 3);
+        // Its completion offset follows the log, so that the next write runs on its own records, not as a backfill.
+        let mut completion_offset = 0;
+        for _ in 0..100 {
+            completion_offset = frontend
+                .get_attached_function(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    collection.collection_id.to_string(),
+                    "counter".to_string(),
+                )
+                .await
+                .unwrap()
+                .completion_offset;
+            if completion_offset > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            completion_offset > 0,
+            "completion offset {completion_offset}"
+        );
+    }
+
+    async fn attach_count_to_file(
+        frontend: &mut ServiceBasedFrontend,
+        collection: &Collection,
+        path: &str,
+    ) {
+        frontend
+            .attach_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                AttachFunctionRequest::try_new(
+                    "file_counter".to_string(),
+                    chroma_types::FUNCTION_COUNT_TO_FILE_ASYNC_NAME.to_string(),
+                    "file_counts".to_string(),
+                    serde_json::json!({ "s3_path": path }),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // The count that count_to_file_async writes to the storage of the single node, once it reaches the one expected.
+    async fn wait_for_file_count(file: &std::path::Path, expected: i64) -> Option<i64> {
+        let mut count = None;
+        for _ in 0..150 {
+            count = std::fs::read_to_string(file)
+                .ok()
+                .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                .and_then(|state| state["count"].as_i64());
+            if count == Some(expected) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        count
+    }
+
+    // An asynchronous function runs on the single node as from the queue of distributed Chroma: attached to a collection
+    // that has records, it counts them (its backfill); then the writes after, against the state of the records kept
+    // before each apply: first a delete of a record from before the attach, then an id added again once.
+    #[tokio::test]
+    async fn count_to_file_async_counts_the_records_of_its_input_collection() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = persistent_frontend_with(root.path(), true).await;
+        let collection = create_collection_for(&mut frontend, TENANT, DATABASE, "file_input").await;
+        add_record(&mut frontend, &collection, "a").await;
+        add_record(&mut frontend, &collection, "b").await;
+        attach_count_to_file(&mut frontend, &collection, "s3://any-bucket/counts/a.json").await;
+        let file = root.path().join("counts/a.json");
+        assert_eq!(wait_for_file_count(&file, 2).await, Some(2));
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    Some(vec!["b".to_string()]),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wait_for_file_count(&file, 1).await, Some(1));
+        add_record(&mut frontend, &collection, "c").await;
+        add_record(&mut frontend, &collection, "a").await;
+        assert_eq!(wait_for_file_count(&file, 2).await, Some(2));
+        // The state kept before the applies goes once the function has run past it.
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut kept = -1;
+        for _ in 0..100 {
+            kept = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM attached_function_prior")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            if kept == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(kept, 0);
+    }
+
+    // With local_compaction_manager: storage, in the format of the storage of distributed Chroma, the attached functions
+    // write their files there, not in the data path.
+    #[tokio::test]
+    async fn count_to_file_async_writes_to_the_storage_of_the_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = persistent_config(root.path(), true);
+        config.local_compaction_manager = serde_json::from_value(serde_json::json!({
+            "storage": { "local": { "root": storage.path().to_str().unwrap() } }
+        }))
+        .unwrap();
+        let mut frontend =
+            ServiceBasedFrontend::try_from_config(&(config, System::new()), &Registry::new())
+                .await
+                .unwrap();
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "stored_input").await;
+        add_record(&mut frontend, &collection, "a").await;
+        attach_count_to_file(&mut frontend, &collection, "s3://any-bucket/counts/a.json").await;
+        assert_eq!(
+            wait_for_file_count(&storage.path().join("counts/a.json"), 1).await,
+            Some(1)
+        );
+        assert!(!root.path().join("counts").exists());
+    }
+
+    // An asynchronous function that keeps failing is dead-lettered after 5 failures, as the consumer of distributed
+    // Chroma does: here a path the storage cannot take. Ten writes, each with its window, so that windows wait for the
+    // function after its fifth failure.
+    #[tokio::test]
+    async fn an_asynchronous_function_that_keeps_failing_is_dead_lettered() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = persistent_frontend_with(root.path(), true).await;
+        let collection = create_collection_for(&mut frontend, TENANT, DATABASE, "dlq_input").await;
+        attach_count_to_file(&mut frontend, &collection, "s3://bucket-without-key/").await;
+        for id in 0..10 {
+            add_record(&mut frontend, &collection, &format!("r{id}")).await;
+        }
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut failures = 0;
+        for _ in 0..600 {
+            failures = sqlx::query_scalar::<_, i32>(
+                "SELECT failure_count FROM attached_functions WHERE input_collection_id = $1",
+            )
+            .bind(collection.collection_id.to_string())
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            if failures >= 5 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(failures, 5);
+        // Dead-lettered: no more runs, and no more state kept for it.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let failures: i32 = sqlx::query_scalar(
+            "SELECT failure_count FROM attached_functions WHERE input_collection_id = $1",
+        )
+        .bind(collection.collection_id.to_string())
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(failures, 5);
+        let mut kept = -1;
+        for _ in 0..150 {
+            kept = sqlx::query_scalar::<_, i64>(
+                "SELECT (SELECT COUNT(*) FROM attached_function_prior)                  + (SELECT COUNT(*) FROM attached_function_prior_since)",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            if kept == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(kept, 0);
+    }
+
+    // An asynchronous function attached to a collection whose log is already purged runs as its backfill, on every
+    // current record, as distributed Chroma runs a function behind what its log keeps. The log of an HNSW collection is
+    // purged up to the last save of its index, every 1,000 records (sync_threshold): one write of 1,000 records, of
+    // which the purge keeps the last, as Chroma 1.5.9 does.
+    #[tokio::test]
+    async fn an_asynchronous_function_attached_after_the_purge_counts_the_records() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = persistent_config(root.path(), true);
+        config.local_compaction_manager = chroma_log::LocalCompactionManagerConfig {
+            compaction_interval_sec: 1,
+            purge_interval_sec: 1,
+            ..Default::default()
+        };
+        config.log = chroma_log::config::LogConfig::Sqlite(chroma_log::config::SqliteLogConfig {
+            purge_cutoff_time_seconds: 0,
+            ..Default::default()
+        });
+        let mut frontend =
+            ServiceBasedFrontend::try_from_config(&(config, System::new()), &Registry::new())
+                .await
+                .unwrap();
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "purged_input").await;
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    (0..1_000).map(|id| format!("r{id}")).collect(),
+                    vec![vec![1.0, 2.0]; 1_000],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut rows = -1;
+        for _ in 0..150 {
+            rows = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM embeddings_queue")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            if rows <= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(rows, 1);
+        attach_count_to_file(
+            &mut frontend,
+            &collection,
+            "s3://any-bucket/counts/purged.json",
+        )
+        .await;
+        assert_eq!(
+            wait_for_file_count(&root.path().join("counts/purged.json"), 1_000).await,
+            Some(1_000)
+        );
+    }
+
+    // The windows queued for an asynchronous function before its fifth failure do not run it again once it is
+    // dead-lettered. The queue of the collection is held by the window of an attach that waits for a synchronous
+    // function not yet ready, as after an attach of record_counter that did not finish (its row, not ready), so that the
+    // windows of ten writes wait behind it and run after.
+    #[tokio::test]
+    async fn the_windows_queued_before_a_dead_letter_do_not_run_the_function() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = persistent_frontend_with(root.path(), true).await;
+        let collection = create_collection_for(&mut frontend, TENANT, DATABASE, "held_input").await;
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO attached_functions (id, name, tenant_id, database_id, input_collection_id, \
+             output_collection_name, function_id, function_params, is_ready) \
+             SELECT $1, 'held_counter', databases.tenant_id, collections.database_id, collections.id, \
+             'held_counts', functions.id, '{}', FALSE FROM collections \
+             JOIN databases ON databases.id = collections.database_id \
+             JOIN functions ON functions.name = 'record_counter' WHERE collections.id = $2",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(collection.collection_id.to_string())
+        .execute(&db)
+        .await
+        .unwrap();
+        attach_count_to_file(&mut frontend, &collection, "s3://bucket-without-key/").await;
+        for id in 0..10 {
+            add_record(&mut frontend, &collection, &format!("r{id}")).await;
+        }
+        let failures = || async {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT failure_count FROM attached_functions WHERE input_collection_id = $1 \
+                 AND name = 'file_counter'",
+            )
+            .bind(collection.collection_id.to_string())
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        };
+        let mut failed = 0;
+        for _ in 0..600 {
+            failed = failures().await;
+            if failed >= 5 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(failed, 5);
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(failures().await, 5);
+    }
+
+    // An asynchronous function runs after each apply of its input, not only at the round of the timer: here a timer of
+    // an hour. The state kept before the applies starts at the first of them, and stays there while the function has
+    // not run past it.
+    #[tokio::test]
+    async fn an_asynchronous_function_runs_after_each_apply() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = persistent_config(root.path(), true);
+        config.local_compaction_manager.compaction_interval_sec = 3_600;
+        let mut frontend =
+            ServiceBasedFrontend::try_from_config(&(config, System::new()), &Registry::new())
+                .await
+                .unwrap();
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "apply_input").await;
+        attach_count_to_file(
+            &mut frontend,
+            &collection,
+            "s3://any-bucket/counts/apply.json",
+        )
+        .await;
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let since = || async {
+            sqlx::query_scalar::<_, i64>("SELECT since FROM attached_function_prior_since")
+                .fetch_optional(&db)
+                .await
+                .unwrap()
+        };
+        let file = root.path().join("counts/apply.json");
+        add_record(&mut frontend, &collection, "a").await;
+        assert_eq!(wait_for_file_count(&file, 1).await, Some(1));
+        let first = since().await;
+        assert!(first.is_some());
+        add_record(&mut frontend, &collection, "b").await;
+        assert_eq!(wait_for_file_count(&file, 2).await, Some(2));
+        assert_eq!(since().await, first);
+    }
+
+    // An attach to a collection with no record yet, then writes: they are counted.
+    #[tokio::test]
+    async fn record_counter_attached_to_an_empty_collection_counts_the_writes_after() {
+        let mut frontend = sqlite_frontend().await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "empty_input").await;
+        frontend
+            .attach_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                AttachFunctionRequest::try_new(
+                    "counter".to_string(),
+                    chroma_types::FUNCTION_RECORD_COUNTER_NAME.to_string(),
+                    "counts".to_string(),
+                    serde_json::json!({}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        for round in 1..=3 {
+            frontend
+                .add(
+                    AddCollectionRecordsRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection.collection_id,
+                        vec![format!("id{round}")],
+                        vec![vec![1.0, 2.0]],
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                wait_for_total_count(&mut frontend, &collection, round).await,
+                round
+            );
+        }
+    }
+
+    // A frontend on a data path whose compaction manager has the timer given.
+    async fn frontend_with_timer(
+        root: &std::path::Path,
+        interval_sec: u64,
+    ) -> ServiceBasedFrontend {
+        let mut config = persistent_config(root, false);
+        config.local_compaction_manager.compaction_interval_sec = interval_sec;
+        ServiceBasedFrontend::try_from_config(&(config, System::new()), &Registry::new())
+            .await
+            .unwrap()
+    }
+
+    async fn attach_record_counter(frontend: &mut ServiceBasedFrontend, collection: &Collection) {
+        frontend
+            .attach_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                AttachFunctionRequest::try_new(
+                    "counter".to_string(),
+                    chroma_types::FUNCTION_RECORD_COUNTER_NAME.to_string(),
+                    "counts".to_string(),
+                    serde_json::json!({}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // The window of an attach waits for its function: here the steps of create_attached_function_with_backfill, with
+    // two seconds between the records of the attach and its ready, and a timer of an hour, so that only the window of
+    // the attach counts the records from before it.
+    #[tokio::test]
+    async fn the_window_of_an_attach_waits_for_its_function() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 3_600).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "waiting_input").await;
+        add_record(&mut frontend, &collection, "a").await;
+        add_record(&mut frontend, &collection, "b").await;
+        let (id, created) = frontend
+            .sysdb_client
+            .create_attached_function(
+                "counter".to_string(),
+                chroma_types::FUNCTION_RECORD_COUNTER_NAME.to_string(),
+                collection.collection_id,
+                "counts".to_string(),
+                serde_json::json!({}),
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(created);
+        frontend
+            .log_client
+            .push_logs(
+                TENANT,
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id,
+                vec![chroma_types::OperationRecord {
+                    id: "backfill_id".to_string(),
+                    embedding: Some(vec![0.0, 0.0]),
+                    encoding: None,
+                    metadata: None,
+                    document: None,
+                    operation: chroma_types::Operation::BackfillFn,
+                }],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        frontend
+            .sysdb_client
+            .finish_create_attached_function(
+                id,
+                serde_json::to_string(&Schema::new_default(KnnIndex::Hnsw)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 2).await, 2);
+    }
+
+    // A synchronous function behind the records applied to its input with no window left for them, as after a kill that
+    // lost the queue of its windows, runs as its backfill at the round of the timer. The window is lost here by a write
+    // while the function is marked deleted.
+    #[tokio::test]
+    async fn a_synchronous_function_behind_its_input_catches_up_at_the_timer() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 1).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "behind_input").await;
+        add_record(&mut frontend, &collection, "a").await;
+        attach_record_counter(&mut frontend, &collection).await;
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 1).await, 1);
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let deleted = |deleted: bool| {
+            sqlx::query(
+                "UPDATE attached_functions SET is_deleted = $1 WHERE input_collection_id = $2",
+            )
+            .bind(deleted)
+            .bind(collection.collection_id.to_string())
+            .execute(&db)
+        };
+        deleted(true).await.unwrap();
+        add_record(&mut frontend, &collection, "b").await;
+        deleted(false).await.unwrap();
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 2).await, 2);
+    }
+
+    // revision_history runs on the records of each window, not on the current records as a backfill: a delete is a
+    // revision of its own, its tombstone, which no current record shows.
+    #[tokio::test]
+    async fn revision_history_archives_a_delete() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 3_600).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "revised_input").await;
+        frontend
+            .attach_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                AttachFunctionRequest::try_new(
+                    "history".to_string(),
+                    chroma_types::FUNCTION_REVISION_HISTORY_NAME.to_string(),
+                    "revisions".to_string(),
+                    serde_json::json!({}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    vec!["a".to_string()],
+                    vec![vec![1.0, 2.0]],
+                    None,
+                    None,
+                    Some(vec![Some(chroma_types::Metadata::from([(
+                        "version".to_string(),
+                        MetadataValue::Int(1),
+                    )]))]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    Some(vec!["a".to_string()]),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        let output = frontend
+            .get_attached_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                "history".to_string(),
+            )
+            .await
+            .unwrap()
+            .output_collection_id
+            .unwrap();
+        let mut tombstones = 0;
+        for _ in 0..100 {
+            let got = frontend
+                .get(
+                    GetRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        output,
+                        None,
+                        None,
+                        None,
+                        0,
+                        chroma_types::IncludeList(vec![chroma_types::Include::Metadata]),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            tombstones = got
+                .metadatas
+                .iter()
+                .flatten()
+                .flatten()
+                .filter(|metadata| metadata.get("is_delete") == Some(&MetadataValue::Bool(true)))
+                .count();
+            if tombstones > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(tombstones, 1);
+    }
+
+    // Each run reads the output of the run before it once applied: fifty writes at once, each with its window queued
+    // before the output of the first run reaches the compaction manager, are all counted.
+    #[tokio::test]
+    async fn record_counter_counts_fifty_writes_at_once() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 3_600).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "rapid_input").await;
+        attach_record_counter(&mut frontend, &collection).await;
+        futures::future::join_all((0..50).map(|id| {
+            let mut frontend = frontend.clone();
+            let collection = collection.clone();
+            async move { add_record(&mut frontend, &collection, &format!("r{id}")).await }
+        }))
+        .await;
+        assert_eq!(
+            wait_for_total_count(&mut frontend, &collection, 50).await,
+            50
+        );
     }
 
     fn index_folders(root: &std::path::Path) -> Vec<std::path::PathBuf> {

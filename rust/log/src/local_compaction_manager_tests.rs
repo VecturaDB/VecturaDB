@@ -103,6 +103,8 @@ impl Fixture {
             spann_flush_stop: None,
             background: tokio_util::task::TaskTracker::new(),
             shutdown_grace: Duration::from_secs(30),
+            function_runs: Default::default(),
+            function_storage: None,
         });
         Self {
             db,
@@ -255,6 +257,8 @@ impl Fixture {
             spann_flush_stop: None,
             background: background.clone(),
             shutdown_grace: Duration::from_secs(30),
+            function_runs: Default::default(),
+            function_storage: None,
         });
         background
     }
@@ -270,7 +274,10 @@ impl Fixture {
 
     // The compactor again with the interval of its purges given, for a collection in use by conditional transactions, with
     // no cutoff: what it applied goes at the purge of the timer.
-    async fn in_use_with_a_timer_of(&mut self, interval: Duration) -> tokio_util::task::TaskTracker {
+    async fn in_use_with_a_timer_of(
+        &mut self,
+        interval: Duration,
+    ) -> tokio_util::task::TaskTracker {
         self.log
             .note_conditional_use(self.collection.collection_id)
             .await
@@ -380,6 +387,37 @@ async fn stale_checkpoint_never_authorizes_purge_even_with_cached_validation() {
         assert_records(f.records().await, original);
         f.stop().await;
     }
+}
+
+// As the garbage collector of distributed Chroma: the records after the lowest completion offset of the attached
+// functions of a collection stay, as its functions have not run on them.
+#[tokio::test]
+async fn purge_keeps_the_records_its_attached_functions_have_not_run_on() {
+    let mut f = Fixture::new().await;
+    let original = f.seed().await;
+    f.checkpoint().await;
+    f.watermark(f.metadata, 4).await;
+    f.watermark(f.vector, 4).await;
+    let insert = |offset: i64, deleted: bool| {
+        sqlx::query(
+            "INSERT INTO attached_functions (id, name, tenant_id, database_id, input_collection_id, \
+             output_collection_name, function_id, function_params, completion_offset, is_deleted) \
+             VALUES (?, ?, 't', 'd', ?, 'out', 'f', '{}', ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(f.collection.collection_id.to_string())
+        .bind(offset)
+        .bind(deleted)
+        .execute(f.db.get_conn())
+    };
+    insert(1, false).await.unwrap();
+    // A deleted function does not keep any.
+    insert(0, true).await.unwrap();
+    f.purge().await.unwrap();
+    let expected: Vec<_> = original.into_iter().filter(|r| r.log_offset >= 2).collect();
+    assert_records(f.records().await, expected);
+    f.stop().await;
 }
 
 #[tokio::test]
@@ -1773,6 +1811,8 @@ async fn replaced_spann_versions_are_forgotten_after_the_grace() {
         spann_flush_stop: None,
         background: tokio_util::task::TaskTracker::new(),
         shutdown_grace: Duration::from_secs(30),
+        function_runs: Default::default(),
+        function_storage: None,
     };
     let collection = Collection::test_collection(3);
     for _ in 0..100 {

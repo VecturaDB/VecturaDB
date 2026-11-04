@@ -169,6 +169,24 @@ Differences from Chroma Cloud:
 - A stale read names its error `StaleReadError`, the name the clients go by, where Chroma Cloud answers 412 with the name `ChromaError`.
 - The positions in the log, the read token and `first_inserted_record_offset`, count the records of the whole server, not those of the collection.
 
+## Attached functions
+
+The attached functions of distributed Chroma work on the single node, with the same API: `collection.attach_function()` writes what a function computes from the records of a collection to its output collection. The functions are those of distributed Chroma: `record_counter`, `statistics` and `revision_history` run after each apply of the records of their input; `count_to_file_async` runs later, from its queue, and after 5 failures in a row it stops, as in distributed Chroma. `http_generate` and `http_currents` do not run on the single node, as they are part of Foundations, a service of Chroma Cloud: each of their runs fails, and they stop after 5.
+
+`count_to_file_async` writes a file, and as in distributed Chroma it is only enabled with `allow_reset: true`. By default it writes in the data path. To write to S3 instead, give the storage under `local_compaction_manager:`, in the format of distributed Chroma, for example:
+
+```yaml
+local_compaction_manager:
+  storage:
+    s3:
+      bucket: "chroma-storage"
+      credentials: "AWS"
+```
+
+The storage holds only the files of the functions: the indexes stay in the data path.
+
+Chroma 1.5.9 opens a data path with attached functions, and serves its collections as before; it does not run the functions. A synchronous function catches up with the writes of Chroma 1.5.9 once VecturaDB opens the data path again. An asynchronous function takes the records that already existed and that Chroma 1.5.9 deleted or updated as if they had not existed: `count_to_file_async` does not count those deletes, and counts those upserts as new records. To count again, detach it and attach it again with a new file.
+
 ## Clients
 
 A client that needs to know which server it talks to reads `GET /api/v2/pre-flight-checks`. VecturaDB answers with the fields of Chroma and adds a `server` block, for example:
