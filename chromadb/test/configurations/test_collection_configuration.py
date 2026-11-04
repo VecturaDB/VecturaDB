@@ -22,10 +22,10 @@ from chromadb.api.collection_configuration import (
 )
 import json
 from chromadb.utils.embedding_functions import register_embedding_function
+from chromadb.errors import InvalidArgumentError
 from chromadb.test.conftest import ClientFactories
 from chromadb.test.conftest import (
     is_spann_disabled_mode,
-    skip_reason_spann_disabled,
     spann_honored,
 )
 from chromadb.types import Collection as CollectionModel
@@ -473,7 +473,7 @@ def test_spann_configuration(client: ClientAPI) -> None:
             assert ef is not None
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("spann")
 def test_spann_configuration_persistence(client_factories: "ClientFactories") -> None:
     """Test SPANN configuration persistence across client restarts"""
     client = client_factories.create_client_from_system()
@@ -684,7 +684,7 @@ def test_spann_json_serialization(client: ClientAPI) -> None:
             assert spann_config_loaded.get("ef_search") == 150
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("spann")
 def test_configuration_spann_updates(client: ClientAPI) -> None:
     """Test updating SPANN collection configurations"""
     client.reset()
@@ -730,7 +730,7 @@ def test_configuration_spann_updates(client: ClientAPI) -> None:
             assert spann_config.get("space") == "cosine"
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("spann")
 def test_spann_update_from_json(client: ClientAPI) -> None:
     """Test updating SPANN configuration from JSON and applying it"""
     client.reset()
@@ -822,7 +822,7 @@ def test_overwrite_spann_configuration() -> None:
     assert updated_config.get("max_neighbors") == 16
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("spann")
 def test_exclusive_update_hnsw_spann_configuration(client: ClientAPI) -> None:
     """Test that HNSW and SPANN configurations cannot both be specified in an update"""
     client.reset()
@@ -849,8 +849,10 @@ def test_exclusive_update_hnsw_spann_configuration(client: ClientAPI) -> None:
         "spann": update_spann,
     }
 
-    # This should raise a ValueError
-    with pytest.raises(ValueError):
+    # The server refuses it, also in process
+    with pytest.raises(
+        InvalidArgumentError, match="Multiple vector index configurations provided"
+    ):
         coll.modify(configuration=update_config)
 
 

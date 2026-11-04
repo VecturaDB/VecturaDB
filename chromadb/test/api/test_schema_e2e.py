@@ -22,7 +22,6 @@ from chromadb.test.conftest import (
     spann_honored,
     skip_if_not_cluster,
     skip_reason_spann_disabled,
-    skip_reason_spann_enabled,
 )
 from chromadb.test.utils.wait_for_version_increase import (
     get_collection_version,
@@ -504,7 +503,7 @@ def test_delete_collection_resets_schema_configuration(
     assert set(recreated_json["keys"].keys()) == set(baseline_json["keys"].keys())
 
 
-@pytest.mark.skipif(not is_spann_disabled_mode, reason=skip_reason_spann_enabled)
+@pytest.mark.needs("sparse_vector_index")
 def test_sparse_vector_allowed_locally(
     client_factories: "ClientFactories",
 ) -> None:
@@ -516,7 +515,7 @@ def test_sparse_vector_allowed_locally(
     assert "sparse_metadata" in collection.schema.keys
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index", "search")
 def test_sparse_vector_source_key_and_index_constraints(
     client_factories: "ClientFactories",
 ) -> None:
@@ -669,7 +668,7 @@ def test_collection_embed_uses_schema_or_collection_embedding_function(
     assert np.allclose(direct_embeddings[0], [0.0, 1.0, 2.0])
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("search")
 def test_search_embeds_string_knn_queries(
     client_factories: "ClientFactories",
 ) -> None:
@@ -697,7 +696,7 @@ def test_search_embeds_string_knn_queries(
     assert embedded_rank.query == [11.0, 12.5]
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index", "search")
 def test_search_embeds_string_knn_queries_with_sparse_embedding_function(
     client_factories: "ClientFactories",
 ) -> None:
@@ -727,7 +726,7 @@ def test_search_embeds_string_knn_queries_with_sparse_embedding_function(
     assert embedded_rank.query == SparseVector(indices=[0], values=[11.0])
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("search")
 def test_search_embeds_string_queries_in_nested_ranks(
     client_factories: "ClientFactories",
 ) -> None:
@@ -858,7 +857,7 @@ def test_disabled_metadata_index_filters_raise_invalid_argument_all_modes(
         _expect_disabled_error(operation)
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("search")
 def test_disabled_metadata_index_filters_raise_invalid_argument(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1026,7 +1025,7 @@ def test_schema_rejects_conflicting_discoverable_key_types(
 
 
 @skip_if_not_cluster()
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("fork")
 def test_collection_fork_inherits_and_isolates_schema(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1098,7 +1097,7 @@ def test_collection_fork_inherits_and_isolates_schema(
     assert set(child_results["ids"]) == {"fork-10"}
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index", "search")
 def test_schema_embedding_configuration_enforced(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1167,7 +1166,7 @@ def test_schema_embedding_configuration_enforced(
     assert "sparse_auto" not in numeric_metadata
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index", "search")
 def test_multiple_sparse_vector_indices_e2e(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1251,7 +1250,7 @@ def test_multiple_sparse_vector_indices_e2e(
     assert set(rrf_result["ids"][0]) == {"doc-1", "doc-2"}
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index", "search")
 def test_combined_sparse_knn_rejects_unindexed_key(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1351,7 +1350,7 @@ def test_schema_precedence_for_overrides_discoverables_and_defaults(
         collection.get(where={"discover_key": "discover_5"})
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index")
 def test_sparse_auto_embedding_with_document_source_no_metadata(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1392,7 +1391,7 @@ def test_sparse_auto_embedding_with_document_source_no_metadata(
         assert actual.values == expected_batch[i].values
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index")
 def test_sparse_auto_embedding_with_document_source_and_metadata(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1438,7 +1437,7 @@ def test_sparse_auto_embedding_with_document_source_and_metadata(
     assert actual_m1.indices == expected_batch[0].indices
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index")
 def test_sparse_auto_embedding_with_metadata_source_key(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1488,7 +1487,7 @@ def test_sparse_auto_embedding_with_metadata_source_key(
         assert actual.values == expected_batch[i].values
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index")
 def test_sparse_auto_embedding_with_mixed_metadata_none_and_filled(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1536,7 +1535,7 @@ def test_sparse_auto_embedding_with_mixed_metadata_none_and_filled(
     assert result["metadatas"][2]["existing"] == "data"
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index")
 def test_sparse_auto_embedding_skips_existing_values(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1581,10 +1580,10 @@ def test_sparse_auto_embedding_skips_existing_values(
     assert manual_meta is not None
     actual_manual = cast(SparseVector, manual_meta["preserve_sparse"])
     assert actual_manual.indices == [999]
-    assert actual_manual.values == [123.456]
+    assert actual_manual.values == pytest.approx([123.456])
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index")
 def test_sparse_auto_embedding_with_missing_source_field(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1627,7 +1626,7 @@ def test_sparse_auto_embedding_with_missing_source_field(
     assert result["metadatas"][3] is None  # No metadata provided, stays None
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index")
 def test_sparse_auto_embedding_with_string_inverted_index(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1682,7 +1681,7 @@ def test_sparse_auto_embedding_with_string_inverted_index(
     assert set(filtered["ids"]) == {"multi1"}
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index")
 def test_dense_and_sparse_auto_embeddings_together(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1728,7 +1727,7 @@ def test_dense_and_sparse_auto_embeddings_together(
         assert "sparse_key" in metadata
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index")
 def test_sparse_auto_embedding_with_update_and_upsert(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1784,7 +1783,7 @@ def test_sparse_auto_embedding_with_update_and_upsert(
     assert actual_upsert.indices == expected_upsert.indices
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index")
 def test_sparse_auto_embedding_persistence_across_client_reload(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1833,7 +1832,7 @@ def test_sparse_auto_embedding_persistence_across_client_reload(
     assert "persist_sparse" in result["metadatas"][1]
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index")
 def test_sparse_auto_embedding_with_batch_operations(
     client_factories: "ClientFactories",
 ) -> None:
@@ -1872,7 +1871,7 @@ def test_sparse_auto_embedding_with_batch_operations(
         assert actual.indices == expected_batch[i].indices
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index")
 def test_sparse_auto_embedding_with_empty_documents(
     client_factories: "ClientFactories",
 ) -> None:
@@ -2146,7 +2145,6 @@ def test_conflicting_embedding_functions_in_schema_and_config_fails(
     assert "schema" in error_msg.lower() or "conflict" in error_msg.lower()
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
 def test_create_index_with_key_type(
     client_factories: "ClientFactories",
 ) -> None:
@@ -2179,7 +2177,6 @@ def test_create_index_with_key_type(
     assert set(int_result["ids"]) == {"key-test-1"}
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
 def test_delete_index_with_key_type(
     client_factories: "ClientFactories",
 ) -> None:
@@ -2211,7 +2208,7 @@ def test_delete_index_with_key_type(
         collection.get(where={"disabled_key": 100})
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("search")
 def test_vector_index_config_with_key_document_source(
     client_factories: "ClientFactories",
 ) -> None:
@@ -2258,7 +2255,7 @@ def test_vector_index_config_with_key_document_source(
     assert len(search_result["ids"][0]) <= 2  # limit=2
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index", "search")
 def test_sparse_vector_index_config_with_key_types(
     client_factories: "ClientFactories",
 ) -> None:
@@ -2390,7 +2387,6 @@ def test_schema_rejects_invalid_source_key_in_configs() -> None:
         SparseVectorIndexConfig(source_key="#metadata")
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
 def test_server_validates_schema_with_special_keys(
     client_factories: "ClientFactories",
 ) -> None:
@@ -2431,7 +2427,7 @@ def test_server_validates_schema_with_special_keys(
     )
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index")
 def test_server_validates_invalid_source_key_in_sparse_vector_config(
     client_factories: "ClientFactories",
 ) -> None:
@@ -2547,7 +2543,7 @@ def test_modify_collection_no_initial_config_creates_default_schema_local(
     assert refreshed_schema.defaults.float_list.vector_index.config.hnsw.ef_search == 100  # type: ignore
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("spann")
 def test_modify_collection_with_initial_spann_schema(client: ClientAPI) -> None:
     """Test creating collection with SPANN schema within server limits and modifying it."""
     collection_name = f"test_modify_with_schema_{uuid4()}"
@@ -2592,7 +2588,7 @@ def test_modify_collection_with_initial_spann_schema(client: ClientAPI) -> None:
     assert refreshed_schema.defaults.float_list.vector_index.config.spann.ef_search == 50  # type: ignore
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("spann")
 def test_modify_collection_updates_schema_spann_multiple_fields(
     client: ClientAPI,
 ) -> None:
@@ -2637,7 +2633,7 @@ def test_modify_collection_updates_schema_spann_multiple_fields(
     assert refreshed_schema.defaults.float_list.vector_index.config.spann.write_nprobe == 32  # type: ignore
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("spann")
 def test_modify_collection_preserves_other_schema_fields(client: ClientAPI) -> None:
     """Test that modifying configuration doesn't affect other schema value types."""
     collection_name = f"test_modify_schema_preserve_{uuid4()}"
@@ -2775,7 +2771,7 @@ class TestSparseEmbeddingFunction(SparseEmbeddingFunction[List[str]]):
         return TestSparseEmbeddingFunction(config.get("label", "test_sparse"))
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("sparse_vector_index", "search")
 def test_search_api_uses_embedded_searches_with_sparse_embeddings(
     client_factories: ClientFactories,
 ) -> None:
@@ -2980,7 +2976,7 @@ def test_fts_disabled_then_new_collection_with_fts_enabled(
     assert set(items["ids"]) == {"fts-toggle-2"}
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("search")
 def test_fts_disabled_search_api_blocks_document_filter(
     client_factories: "ClientFactories",
 ) -> None:
