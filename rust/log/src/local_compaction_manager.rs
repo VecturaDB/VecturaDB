@@ -81,6 +81,11 @@ pub struct LocalCompactionManagerConfig {
     /// garbage collector of distributed Chroma.
     #[serde(default = "LocalCompactionManagerConfig::default_purge_interval_sec")]
     pub purge_interval_sec: u64,
+    /// Where the attached functions write their files, count_to_file_async: the storage of distributed Chroma, in its
+    /// format (the storage of fn_consumer_service in rust/worker/chroma_config.yaml), for example s3 with a bucket and
+    /// its credentials. Without it, the data path, as the SPANN indexes (Federico, 01/11).
+    #[serde(default)]
+    pub storage: Option<chroma_storage::config::StorageConfig>,
 }
 
 impl LocalCompactionManagerConfig {
@@ -128,6 +133,7 @@ impl Default for LocalCompactionManagerConfig {
             timeout_us: Self::default_timeout_us(),
             shutdown_grace_sec: Self::default_shutdown_grace_sec(),
             purge_interval_sec: Self::default_purge_interval_sec(),
+            storage: None,
         }
     }
 }
@@ -170,6 +176,8 @@ pub struct LocalCompactionManager {
     shutdown_grace: Duration,
     // The synchronous attached functions: see FunctionRuns.
     function_runs: FunctionRuns,
+    // The storage of local_compaction_manager: storage, when set, for the files of the attached functions.
+    function_storage: Option<chroma_storage::Storage>,
 }
 
 // The purges asked, run together once the interval has passed since the last ones.
@@ -411,6 +419,12 @@ impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
             .get::<LocalSegmentManager>()
             .map_err(|e| e.boxed())?;
         let sysdb = registry.get::<SysDb>().map_err(|e| e.boxed())?;
+        let function_storage = match &config.storage {
+            Some(storage) => {
+                Some(chroma_storage::Storage::try_from_config(storage, registry).await?)
+            }
+            None => None,
+        };
         let res = Self {
             log,
             sqlite_db,
@@ -433,6 +447,7 @@ impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
             background: tokio_util::task::TaskTracker::new(),
             shutdown_grace: Duration::from_secs(config.shutdown_grace_sec),
             function_runs: FunctionRuns::default(),
+            function_storage,
         };
         registry.register(res.clone());
         Ok(res)
@@ -1244,11 +1259,12 @@ impl LocalCompactionManager {
             sysdb: self.sysdb.clone(),
             sqlite_db: self.sqlite_db.clone(),
             backfill: None,
-            storage: self
-                .hnsw_segment_manager
-                .spann_provider()
-                .and_then(|provider| provider.blockfile_provider.storage())
-                .map(|storage| (*storage).clone()),
+            storage: self.function_storage.clone().or_else(|| {
+                self.hnsw_segment_manager
+                    .spann_provider()
+                    .and_then(|provider| provider.blockfile_provider.storage())
+                    .map(|storage| (*storage).clone())
+            }),
         }
     }
 

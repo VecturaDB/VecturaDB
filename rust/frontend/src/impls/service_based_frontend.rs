@@ -5766,6 +5766,15 @@ mod tests {
         root: &std::path::Path,
         allow_reset: bool,
     ) -> ServiceBasedFrontend {
+        ServiceBasedFrontend::try_from_config(
+            &(persistent_config(root, allow_reset), System::new()),
+            &Registry::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn persistent_config(root: &std::path::Path, allow_reset: bool) -> FrontendConfig {
         let mut config = FrontendConfig::sqlite_in_memory();
         config.allow_reset = allow_reset;
         config.sqlitedb = Some(chroma_sqlite::config::SqliteDBConfig {
@@ -5775,9 +5784,7 @@ mod tests {
         if let Some(segment_manager) = config.segment_manager.as_mut() {
             segment_manager.persist_path = Some(root.to_str().unwrap().to_string());
         }
-        ServiceBasedFrontend::try_from_config(&(config, System::new()), &Registry::new())
-            .await
-            .unwrap()
+        config
     }
 
     async fn add_record(frontend: &mut ServiceBasedFrontend, collection: &Collection, id: &str) {
@@ -6101,6 +6108,32 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert_eq!(kept, 0);
+    }
+
+    // With local_compaction_manager: storage, in the format of the storage of distributed Chroma, the attached functions
+    // write their files there, not in the data path.
+    #[tokio::test]
+    async fn count_to_file_async_writes_to_the_storage_of_the_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = persistent_config(root.path(), true);
+        config.local_compaction_manager = serde_json::from_value(serde_json::json!({
+            "storage": { "local": { "root": storage.path().to_str().unwrap() } }
+        }))
+        .unwrap();
+        let mut frontend =
+            ServiceBasedFrontend::try_from_config(&(config, System::new()), &Registry::new())
+                .await
+                .unwrap();
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "stored_input").await;
+        add_record(&mut frontend, &collection, "a").await;
+        attach_count_to_file(&mut frontend, &collection, "s3://any-bucket/counts/a.json").await;
+        assert_eq!(
+            wait_for_file_count(&storage.path().join("counts/a.json"), 1).await,
+            Some(1)
+        );
+        assert!(!root.path().join("counts").exists());
     }
 
     // An asynchronous function that keeps failing is dead-lettered after 5 failures, as the consumer of distributed
