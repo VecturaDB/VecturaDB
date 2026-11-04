@@ -6061,8 +6061,8 @@ mod tests {
     }
 
     // An asynchronous function runs on the single node as from the queue of distributed Chroma: attached to a collection
-    // that has records, it counts them (its backfill); then the writes after, an id added again once and a delete taken
-    // off, against the state of the records kept before each apply.
+    // that has records, it counts them (its backfill); then the writes after, against the state of the records kept
+    // before each apply: first a delete of a record from before the attach, then an id added again once.
     #[tokio::test]
     async fn count_to_file_async_counts_the_records_of_its_input_collection() {
         let root = tempfile::tempdir().unwrap();
@@ -6073,9 +6073,6 @@ mod tests {
         attach_count_to_file(&mut frontend, &collection, "s3://any-bucket/counts/a.json").await;
         let file = root.path().join("counts/a.json");
         assert_eq!(wait_for_file_count(&file, 2).await, Some(2));
-        add_record(&mut frontend, &collection, "c").await;
-        add_record(&mut frontend, &collection, "a").await;
-        assert_eq!(wait_for_file_count(&file, 3).await, Some(3));
         frontend
             .delete(
                 DeleteCollectionRecordsRequest::try_new(
@@ -6091,6 +6088,9 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(wait_for_file_count(&file, 1).await, Some(1));
+        add_record(&mut frontend, &collection, "c").await;
+        add_record(&mut frontend, &collection, "a").await;
         assert_eq!(wait_for_file_count(&file, 2).await, Some(2));
         // The state kept before the applies goes once the function has run past it.
         let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
@@ -6137,14 +6137,17 @@ mod tests {
     }
 
     // An asynchronous function that keeps failing is dead-lettered after 5 failures, as the consumer of distributed
-    // Chroma does: here a path the storage cannot take.
+    // Chroma does: here a path the storage cannot take. Ten writes, each with its window, so that windows wait for the
+    // function after its fifth failure.
     #[tokio::test]
     async fn an_asynchronous_function_that_keeps_failing_is_dead_lettered() {
         let root = tempfile::tempdir().unwrap();
         let mut frontend = persistent_frontend_with(root.path(), true).await;
         let collection = create_collection_for(&mut frontend, TENANT, DATABASE, "dlq_input").await;
         attach_count_to_file(&mut frontend, &collection, "s3://bucket-without-key/").await;
-        add_record(&mut frontend, &collection, "a").await;
+        for id in 0..10 {
+            add_record(&mut frontend, &collection, &format!("r{id}")).await;
+        }
         let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
             .await
             .unwrap();
@@ -6173,6 +6176,177 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(failures, 5);
+        let mut kept = -1;
+        for _ in 0..150 {
+            kept = sqlx::query_scalar::<_, i64>(
+                "SELECT (SELECT COUNT(*) FROM attached_function_prior)                  + (SELECT COUNT(*) FROM attached_function_prior_since)",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            if kept == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(kept, 0);
+    }
+
+    // An asynchronous function attached to a collection whose log is already purged runs as its backfill, on every
+    // current record, as distributed Chroma runs a function behind what its log keeps. The log of an HNSW collection is
+    // purged up to the last save of its index, every 1,000 records (sync_threshold): one write of 1,000 records, of
+    // which the purge keeps the last, as Chroma 1.5.9 does.
+    #[tokio::test]
+    async fn an_asynchronous_function_attached_after_the_purge_counts_the_records() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = persistent_config(root.path(), true);
+        config.local_compaction_manager = chroma_log::LocalCompactionManagerConfig {
+            compaction_interval_sec: 1,
+            purge_interval_sec: 1,
+            ..Default::default()
+        };
+        config.log = chroma_log::config::LogConfig::Sqlite(chroma_log::config::SqliteLogConfig {
+            purge_cutoff_time_seconds: 0,
+            ..Default::default()
+        });
+        let mut frontend =
+            ServiceBasedFrontend::try_from_config(&(config, System::new()), &Registry::new())
+                .await
+                .unwrap();
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "purged_input").await;
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    (0..1_000).map(|id| format!("r{id}")).collect(),
+                    vec![vec![1.0, 2.0]; 1_000],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut rows = -1;
+        for _ in 0..150 {
+            rows = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM embeddings_queue")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            if rows <= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(rows, 1);
+        attach_count_to_file(
+            &mut frontend,
+            &collection,
+            "s3://any-bucket/counts/purged.json",
+        )
+        .await;
+        assert_eq!(
+            wait_for_file_count(&root.path().join("counts/purged.json"), 1_000).await,
+            Some(1_000)
+        );
+    }
+
+    // The windows queued for an asynchronous function before its fifth failure do not run it again once it is
+    // dead-lettered. The queue of the collection is held by the window of an attach that waits for a synchronous
+    // function not yet ready, as after an attach of record_counter that did not finish (its row, not ready), so that the
+    // windows of ten writes wait behind it and run after.
+    #[tokio::test]
+    async fn the_windows_queued_before_a_dead_letter_do_not_run_the_function() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = persistent_frontend_with(root.path(), true).await;
+        let collection = create_collection_for(&mut frontend, TENANT, DATABASE, "held_input").await;
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO attached_functions (id, name, tenant_id, database_id, input_collection_id, \
+             output_collection_name, function_id, function_params, is_ready) \
+             SELECT $1, 'held_counter', databases.tenant_id, collections.database_id, collections.id, \
+             'held_counts', functions.id, '{}', FALSE FROM collections \
+             JOIN databases ON databases.id = collections.database_id \
+             JOIN functions ON functions.name = 'record_counter' WHERE collections.id = $2",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(collection.collection_id.to_string())
+        .execute(&db)
+        .await
+        .unwrap();
+        attach_count_to_file(&mut frontend, &collection, "s3://bucket-without-key/").await;
+        for id in 0..10 {
+            add_record(&mut frontend, &collection, &format!("r{id}")).await;
+        }
+        let failures = || async {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT failure_count FROM attached_functions WHERE input_collection_id = $1 \
+                 AND name = 'file_counter'",
+            )
+            .bind(collection.collection_id.to_string())
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        };
+        let mut failed = 0;
+        for _ in 0..600 {
+            failed = failures().await;
+            if failed >= 5 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(failed, 5);
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(failures().await, 5);
+    }
+
+    // An asynchronous function runs after each apply of its input, not only at the round of the timer: here a timer of
+    // an hour. The state kept before the applies starts at the first of them, and stays there while the function has
+    // not run past it.
+    #[tokio::test]
+    async fn an_asynchronous_function_runs_after_each_apply() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = persistent_config(root.path(), true);
+        config.local_compaction_manager.compaction_interval_sec = 3_600;
+        let mut frontend =
+            ServiceBasedFrontend::try_from_config(&(config, System::new()), &Registry::new())
+                .await
+                .unwrap();
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "apply_input").await;
+        attach_count_to_file(
+            &mut frontend,
+            &collection,
+            "s3://any-bucket/counts/apply.json",
+        )
+        .await;
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let since = || async {
+            sqlx::query_scalar::<_, i64>("SELECT since FROM attached_function_prior_since")
+                .fetch_optional(&db)
+                .await
+                .unwrap()
+        };
+        let file = root.path().join("counts/apply.json");
+        add_record(&mut frontend, &collection, "a").await;
+        assert_eq!(wait_for_file_count(&file, 1).await, Some(1));
+        let first = since().await;
+        assert!(first.is_some());
+        add_record(&mut frontend, &collection, "b").await;
+        assert_eq!(wait_for_file_count(&file, 2).await, Some(2));
+        assert_eq!(since().await, first);
     }
 
     // An attach to a collection with no record yet, then writes: they are counted.
