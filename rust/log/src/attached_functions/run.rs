@@ -231,15 +231,17 @@ impl FunctionRunner {
             .logs
             .iter()
             .any(|(record, _)| record.record.operation == Operation::BackfillFn);
+        // Whether a function is not ready is read before the ready ones: a function made ready between the two reads is
+        // then among the ready ones, where in the other order the window would see it neither ready nor waited for.
         let mut waited = 0;
-        while attaches
-            && functions.is_empty()
-            && waited < ATTACH_WAIT_SECONDS
-            && self.has_sync_function_not_ready(input_id).await?
-        {
+        while attaches && functions.is_empty() && waited < ATTACH_WAIT_SECONDS {
+            let waiting = self.has_sync_function_not_ready(input_id).await?;
+            functions = self.ready_sync_functions(input_id).await?;
+            if !functions.is_empty() || !waiting {
+                break;
+            }
             tokio::time::sleep(Duration::from_secs(1)).await;
             waited += 1;
-            functions = self.ready_sync_functions(input_id).await?;
         }
         for function in functions {
             if function.completion_offset >= window.end {
