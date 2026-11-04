@@ -167,7 +167,10 @@ def test_v1_routes_answer_gone() -> None:
             }
 
 
-def test_rbac_user_reaches_its_tenant_only(tmp_path: Path) -> None:
+# With SimpleRBAC, and with authentication only: in both, a user of a tenant
+# reaches that tenant only, as with the API keys of the Rust server.
+@pytest.mark.parametrize("rbac", [True, False], ids=["rbac", "authn_only"])
+def test_user_reaches_its_tenant_only(tmp_path: Path, rbac: bool) -> None:
     authn = tmp_path / "authn.yaml"
     authn.write_text(
         """
@@ -198,12 +201,19 @@ users:
     role: all
 """
     )
+    authorization = (
+        {
+            "chroma_server_authz_provider": "chromadb.auth.simple_rbac_authz.SimpleRBACAuthorizationProvider",
+            "chroma_server_authz_config_file": str(authz),
+        }
+        if rbac
+        else {}
+    )
     server = FastAPI(
         segment_api_settings(
             chroma_server_authn_provider="chromadb.auth.token_authn.TokenAuthenticationServerProvider",
             chroma_server_authn_credentials_file=str(authn),
-            chroma_server_authz_provider="chromadb.auth.simple_rbac_authz.SimpleRBACAuthorizationProvider",
-            chroma_server_authz_config_file=str(authz),
+            **authorization,
         )
     )
     admin = {"Authorization": "Bearer admin-token"}
@@ -237,8 +247,12 @@ users:
         response = client.post(f"{a}/{ids['tenant_a']}/get", json=get, headers=team_a)
         assert response.status_code == 200
         assert response.json()["ids"] == ["x"]
-        # The path of another tenant: the authorization refuses it.
+        # The path of another tenant: the server refuses it.
         response = client.post(f"{b}/{ids['tenant_b']}/get", json=get, headers=team_a)
+        assert response.status_code == 403
+        response = client.post(
+            "/api/v2/tenants", json={"name": "tenant_c"}, headers=team_a
+        )
         assert response.status_code == 403
         # Its own path with the id of a collection of another tenant: there the
         # collection does not exist.

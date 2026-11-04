@@ -111,6 +111,16 @@ class SingletonTenantDatabaseCollectionStateMachine(
 
     @overrides
     def set_api_tenant_database(self, tenant: str, database: str) -> None:
+        if self.client == self.singleton_client and (tenant, database) != (
+            SINGLETON_TENANT,
+            self.singleton_database,
+        ):
+            # As with the API keys of the Rust server, the singleton user
+            # reaches its tenant and its database only: the client cannot
+            # switch to another one, and stays where it is.
+            with pytest.raises(Exception):
+                self.client.set_tenant(tenant, database)
+            return
         self.client.set_tenant(tenant, database)
 
     @overrides
@@ -166,6 +176,11 @@ class SingletonTenantDatabaseCollectionStateMachine(
 
     @property
     def model(self) -> Dict[str, Optional[types.CollectionMetadata]]:
+        # The singleton client always stays in its tenant and database.
+        if self.client == self.singleton_client:
+            return self.tenant_to_database_to_model[SINGLETON_TENANT][
+                self.singleton_database
+            ]
         # Always use current tenant/database context
         return self.tenant_to_database_to_model[self.curr_tenant][self.curr_database]
 
