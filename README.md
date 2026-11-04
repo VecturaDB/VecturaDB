@@ -206,7 +206,7 @@ A client that needs to know which server it talks to reads `GET /api/v2/pre-flig
 - `search`: the Search API, hybrid search included;
 - `fork`: collection fork and fork count;
 - `api_keys`: API keys, as on Chroma Cloud;
-- `indexing_status`: the indexing status of a collection, as on Chroma Cloud;
+- `indexing_status`: the indexing status of a collection. Distributed Chroma counts the operations of its log; the single node counts the records, so 3 adds and then 2 deletes count 1 and not 5. An HNSW collection has nothing waiting; a SPANN collection reports the records of its last flush as indexed and the operations of its log after it as not indexed;
 - `attached_functions`: the attached functions of distributed Chroma;
 - `spann`: SPANN indexes for the collections that ask for them, as on distributed Chroma; absent with `executor: local: spann: false`;
 - `conditional_transactions`: the conditional transactions of distributed Chroma; absent with `enable_transactions: false`.
