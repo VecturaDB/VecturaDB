@@ -348,6 +348,7 @@ pub(crate) fn is_conditional_run_retryable_error(err: &ChromaHttpClientError) ->
                         || message.contains("ConditionalWriteConflictError")))
                 || (*status == StatusCode::TOO_MANY_REQUESTS && message.contains("Backoff"))
         }
+        ChromaHttpClientError::RetryAfter(message, _) => message.contains("Backoff"),
         ChromaHttpClientError::StaleReadError(_) => true,
         _ => false,
     }
