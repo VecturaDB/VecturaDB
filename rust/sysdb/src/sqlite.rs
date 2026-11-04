@@ -1440,7 +1440,8 @@ impl SqliteSysDb {
         completion_offset: u64,
     ) -> Result<(), tonic::Status> {
         let updated = sqlx::query(
-            "UPDATE attached_functions SET completion_offset = $1, updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')              WHERE id = $2 AND is_deleted = FALSE",
+            "UPDATE attached_functions SET completion_offset = $1, updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+             WHERE id = $2 AND is_deleted = FALSE",
         )
         .bind(completion_offset as i64)
         .bind(attached_function_id.0.to_string())
@@ -2300,7 +2301,8 @@ pub async fn flush_compaction_in(
         .map_err(|e| internal(e.to_string()))?;
     // As a flush of distributed Chroma, one more version of the collection.
     let collection_version: i32 = sqlx::query_scalar(
-        "UPDATE collections SET schema_str = COALESCE($1, schema_str), version = version + 1 WHERE id = $2          RETURNING version",
+        "UPDATE collections SET schema_str = COALESCE($1, schema_str), version = version + 1 WHERE id = $2 \
+         RETURNING version",
     )
     .bind(schema_str)
     .bind(collection_id.to_string())

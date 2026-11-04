@@ -400,7 +400,9 @@ async fn purge_keeps_the_records_its_attached_functions_have_not_run_on() {
     f.watermark(f.vector, 4).await;
     let insert = |offset: i64, deleted: bool| {
         sqlx::query(
-            "INSERT INTO attached_functions (id, name, tenant_id, database_id, input_collection_id,              output_collection_name, function_id, function_params, completion_offset, is_deleted)              VALUES (?, ?, 't', 'd', ?, 'out', 'f', '{}', ?, ?)",
+            "INSERT INTO attached_functions (id, name, tenant_id, database_id, input_collection_id, \
+             output_collection_name, function_id, function_params, completion_offset, is_deleted) \
+             VALUES (?, ?, 't', 'd', ?, 'out', 'f', '{}', ?, ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(uuid::Uuid::new_v4().to_string())

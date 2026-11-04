@@ -65,7 +65,14 @@ pub async fn behind(
     sqlite_db: &SqliteDb,
 ) -> Result<Vec<(CollectionUuid, u64)>, Box<dyn ChromaError>> {
     let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT attached_functions.input_collection_id, MAX(CAST(max_seq_id.seq_id AS INTEGER))          FROM attached_functions          JOIN functions ON functions.id = attached_functions.function_id          JOIN segments ON segments.collection = attached_functions.input_collection_id AND segments.scope = 'METADATA'          JOIN max_seq_id ON max_seq_id.segment_id = segments.id          WHERE attached_functions.is_deleted = FALSE AND attached_functions.is_ready = TRUE          AND functions.is_async = FALSE AND attached_functions.completion_offset < CAST(max_seq_id.seq_id AS INTEGER)          GROUP BY attached_functions.input_collection_id",
+        "SELECT attached_functions.input_collection_id, MAX(CAST(max_seq_id.seq_id AS INTEGER)) \
+         FROM attached_functions \
+         JOIN functions ON functions.id = attached_functions.function_id \
+         JOIN segments ON segments.collection = attached_functions.input_collection_id AND segments.scope = 'METADATA' \
+         JOIN max_seq_id ON max_seq_id.segment_id = segments.id \
+         WHERE attached_functions.is_deleted = FALSE AND attached_functions.is_ready = TRUE \
+         AND functions.is_async = FALSE AND attached_functions.completion_offset < CAST(max_seq_id.seq_id AS INTEGER) \
+         GROUP BY attached_functions.input_collection_id",
     )
     .fetch_all(sqlite_db.get_conn())
     .await
