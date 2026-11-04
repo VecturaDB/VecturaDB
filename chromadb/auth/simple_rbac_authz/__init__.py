@@ -7,6 +7,7 @@ from chromadb.auth import (
     AuthzResource,
     UserIdentity,
     ServerAuthorizationProvider,
+    user_can_access_resource,
 )
 from chromadb.config import System
 from fastapi import HTTPException
@@ -25,7 +26,8 @@ class SimpleRBACAuthorizationProvider(ServerAuthorizationProvider):
     A simple Role-Based Access Control (RBAC) authorization provider. This
     provider reads a configuration file that maps users to roles, and roles to
     actions. The provider then checks if the user has the action they are
-    attempting to perform.
+    attempting to perform, and if the resource is in the tenant and the
+    databases that the authentication provider gives to the user.
 
     For an example of an RBAC configuration file, see
     examples/basic_functionality/authz/authz.yaml.
@@ -37,8 +39,8 @@ class SimpleRBACAuthorizationProvider(ServerAuthorizationProvider):
         self._config = yaml.safe_load("\n".join(self.read_config_or_config_file()))
 
         # We favor preprocessing here to avoid having to parse the config file
-        # on every request. This AuthorizationProvider does not support
-        # per-resource authorization so we just map the user ID to the
+        # on every request. The tenant and the databases of a user come from
+        # the authentication provider, so here we just map the user ID to the
         # permissions they have. We're not worried about the size of this dict
         # since users are all specified in the file -- anyone with a gigantic
         # number of users can roll their own AuthorizationProvider.
@@ -62,6 +64,7 @@ class SimpleRBACAuthorizationProvider(ServerAuthorizationProvider):
         if (
             user.user_id in self._permissions
             and action in self._permissions[user.user_id]
+            and user_can_access_resource(user, action, resource)
         ):
             policy_decision = True
 

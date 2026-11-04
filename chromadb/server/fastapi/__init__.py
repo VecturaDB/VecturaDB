@@ -45,6 +45,7 @@ from chromadb.auth import (
     AuthzResource,
     ServerAuthenticationProvider,
     ServerAuthorizationProvider,
+    user_can_access_resource,
 )
 from chromadb.config import DEFAULT_DATABASE, DEFAULT_TENANT, Settings, System
 from chromadb.api import ServerAPI
@@ -234,7 +235,7 @@ class FastAPI(Server):
 
         self.router = ChromaAPIRouter()
 
-        self.setup_v1_routes()
+        self.setup_v1_deprecation_route()
         self.setup_v2_routes()
 
         self._app.include_router(self.router)
@@ -491,6 +492,16 @@ class FastAPI(Server):
         """
         self._quota_enforcer.set_context(context={"request": request})
 
+    @staticmethod
+    def _authorize_user_scope(
+        user_identity: UserIdentity, action: AuthzAction, resource: AuthzResource
+    ) -> None:
+        # Without an authorization provider, a user still stays in the tenant
+        # and the databases that authentication gives it, as with the API keys
+        # of the Rust server.
+        if not user_can_access_resource(user_identity, action, resource):
+            raise HTTPException(status_code=403, detail="Forbidden")
+
     @trace_method(
         "auth_request",
         OpenTelemetryGranularity.OPERATION,
@@ -539,14 +550,15 @@ class FastAPI(Server):
 
         user_identity = self.authn_provider.authenticate_or_raise(dict(headers))
 
-        if not self.authz_provider:
-            return
-
         authz_resource = AuthzResource(
             tenant=tenant,
             database=database,
             collection=collection,
         )
+
+        if not self.authz_provider:
+            self._authorize_user_scope(user_identity, action, authz_resource)
+            return
 
         self.authz_provider.authorize_or_raise(user_identity, action, authz_resource)
         add_attributes_to_current_span(
@@ -1527,6 +1539,25 @@ class FastAPI(Server):
     # =========================================================================
     # OLD ROUTES FOR BACKWARDS COMPATIBILITY — WILL BE REMOVED
     # =========================================================================
+    def setup_v1_deprecation_route(self) -> None:
+        # As the Rust server: the v1 routes authorize a collection without its
+        # tenant and database, so every v1 request is answered with 410.
+        self.router.add_api_route(
+            "/api/v1/{path:path}",
+            self.v1_deprecation_notice,
+            methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+            include_in_schema=False,
+        )
+
+    async def v1_deprecation_notice(self, path: str) -> ORJSONResponse:
+        return ORJSONResponse(
+            status_code=status.HTTP_410_GONE,
+            content={
+                "error": "Unimplemented",
+                "message": "The v1 API is deprecated. Please use /v2 apis",
+            },
+        )
+
     def setup_v1_routes(self) -> None:
         self.router.add_api_route("/api/v1", self.root, methods=["GET"])
         self.router.add_api_route("/api/v1/reset", self.reset, methods=["POST"])
@@ -1723,14 +1754,15 @@ class FastAPI(Server):
         if (not database or database == DEFAULT_DATABASE) and new_database:
             database = new_database
 
-        if not self.authz_provider:
-            return (tenant, database)
-
         authz_resource = AuthzResource(
             tenant=tenant,
             database=database,
             collection=collection,
         )
+
+        if not self.authz_provider:
+            self._authorize_user_scope(user_identity, action, authz_resource)
+            return (tenant, database)
 
         self.authz_provider.authorize_or_raise(user_identity, action, authz_resource)
         add_attributes_to_current_span(
