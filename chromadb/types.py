@@ -83,8 +83,8 @@ class Collection(
     dimension: Optional[int]
     tenant: str
     database: str
-    # The version and log position is only used in the distributed version of chroma
-    # in single-node chroma, this field is always 0
+    # The version and log position of the collection, as distributed Chroma keeps them; the single node of VecturaDB
+    # also grows the version, at each apply of records
     version: int
     log_position: int
 

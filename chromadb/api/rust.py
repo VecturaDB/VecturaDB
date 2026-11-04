@@ -218,6 +218,8 @@ class RustBindingsAPI(ServerAPI):
                 dimension=collection.dimension,
                 tenant=collection.tenant,
                 database=collection.database,
+                version=collection.version,
+                log_position=collection.log_position,
             )
             for collection in collections
         ]
@@ -271,6 +273,8 @@ class RustBindingsAPI(ServerAPI):
             dimension=collection.dimension,
             tenant=collection.tenant,
             database=collection.database,
+            version=collection.version,
+            log_position=collection.log_position,
         )
         return collection_model
 
@@ -291,6 +295,8 @@ class RustBindingsAPI(ServerAPI):
             dimension=collection.dimension,
             tenant=collection.tenant,
             database=collection.database,
+            version=collection.version,
+            log_position=collection.log_position,
         )
 
     @override
@@ -312,6 +318,8 @@ class RustBindingsAPI(ServerAPI):
             dimension=collection.dimension,
             tenant=collection.tenant,
             database=collection.database,
+            version=collection.version,
+            log_position=collection.log_position,
         )
 
     @override
@@ -377,6 +385,8 @@ class RustBindingsAPI(ServerAPI):
             dimension=collection.dimension,
             tenant=collection.tenant,
             database=collection.database,
+            version=collection.version,
+            log_position=collection.log_position,
         )
 
     @override

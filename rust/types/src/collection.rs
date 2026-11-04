@@ -230,6 +230,16 @@ impl Collection {
     pub fn database(&self) -> &str {
         &self.database
     }
+
+    #[getter]
+    pub fn version(&self) -> i32 {
+        self.version
+    }
+
+    #[getter]
+    pub fn log_position(&self) -> i64 {
+        self.log_position
+    }
 }
 
 impl Collection {
