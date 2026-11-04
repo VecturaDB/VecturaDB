@@ -220,13 +220,21 @@ struct FunctionRuns {
 }
 
 impl FunctionRuns {
-    fn send(&self, runner: &FunctionRunner, window: FunctionWindow) {
+    // A stop waits for the run in progress (LocalCompactionManager::drain), not for an idle queue: a window it loses, the
+    // next start runs as the backfill of its function (attached_functions::run::behind).
+    fn send(
+        &self,
+        background: &tokio_util::task::TaskTracker,
+        runner: &FunctionRunner,
+        window: FunctionWindow,
+    ) {
         let collection_id = window.input.collection.collection_id;
         let mut queues = self.queues.lock().unwrap_or_else(|e| e.into_inner());
         let queue = queues.entry(collection_id).or_insert_with(|| {
             let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<FunctionWindow>();
             let runner = runner.clone();
             let queues = Arc::clone(&self.queues);
+            let background = background.clone();
             tokio::spawn(
                 async move {
                     loop {
@@ -247,7 +255,7 @@ impl FunctionRuns {
                         };
                         // A window that fails leaves the completion offset behind: the next window of the collection
                         // runs its function as the backfill of distributed Chroma.
-                        if let Err(err) = runner.run(window).await {
+                        if let Err(err) = background.track_future(runner.run(window)).await {
                             tracing::warn!(collection_id = %collection_id, error = %err, "An attached function failed");
                         }
                     }
@@ -586,7 +594,7 @@ impl Handler<BackfillMessage> for LocalCompactionManager {
         // A backfill that fails leaves the loaded instance not replayed, so that the next read asks for a backfill
         // again; one that succeeds, or runs, leaves it as it is (see below).
         let mut loaded = None;
-        let result = self.backfill(message, &mut loaded).await;
+        let result = self.backfill(message, &mut loaded, ctx).await;
         if result.is_err() {
             if let Some(index) = loaded {
                 index.set_replay_complete(false).await;
@@ -601,6 +609,7 @@ impl LocalCompactionManager {
         &mut self,
         message: BackfillMessage,
         loaded: &mut Option<chroma_segment::local_hnsw::LocalHnswIndex>,
+        ctx: &ComponentContext<LocalCompactionManager>,
     ) -> Result<(), CompactionManagerError> {
         // Applying logs moves the watermarks, even when the backfill fails part way.
         self.purged.remove(&message.collection_id);
@@ -731,7 +740,7 @@ impl LocalCompactionManager {
                     // Any attached function not deleted, ready or not yet: a write that comes between the records of an
                     // attach and its ready must not mark the collection without functions.
                     let has: bool = sqlx::query_scalar(
-                        "SELECT EXISTS(SELECT 1 FROM attached_functions WHERE input_collection_id = $1                          AND is_deleted = FALSE)",
+                        "SELECT EXISTS(SELECT 1 FROM attached_functions WHERE input_collection_id = $1 AND is_deleted = FALSE)",
                     )
                     .bind(message.collection_id.to_string())
                     .fetch_one(self.sqlite_db.get_conn())
@@ -825,7 +834,7 @@ impl LocalCompactionManager {
         if let Some(window) = function_window {
             let mut runner = self.function_runner();
             runner.backfill = Some(ctx.receiver::<BackfillMessage>());
-            self.function_runs.send(&runner, window);
+            self.function_runs.send(&self.background, &runner, window);
         }
         if spann {
             self.hnsw_segment_manager
@@ -918,6 +927,7 @@ impl Handler<ScheduledCompactMessage> for LocalCompactionManager {
                         .await
                     {
                         Ok(input) => self.function_runs.send(
+                            &self.background,
                             &runner,
                             FunctionWindow {
                                 input,

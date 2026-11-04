@@ -272,7 +272,10 @@ impl Fixture {
 
     // The compactor again with the interval of its purges given, for a collection in use by conditional transactions, with
     // no cutoff: what it applied goes at the purge of the timer.
-    async fn in_use_with_a_timer_of(&mut self, interval: Duration) -> tokio_util::task::TaskTracker {
+    async fn in_use_with_a_timer_of(
+        &mut self,
+        interval: Duration,
+    ) -> tokio_util::task::TaskTracker {
         self.log
             .note_conditional_use(self.collection.collection_id)
             .await
