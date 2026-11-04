@@ -177,6 +177,8 @@ Differences from Chroma Cloud:
 
 The attached functions of distributed Chroma work on the single node, with the same API: `collection.attach_function()` writes what a function computes from the records of a collection to its output collection. The functions are those of distributed Chroma: `record_counter`, `statistics` and `revision_history` run after each apply of the records of their input; `count_to_file_async` runs later, from its queue, and after 5 failures in a row it stops, as in distributed Chroma. `http_generate` and `http_currents` do not run on the single node, as they are part of Foundations, a service of Chroma Cloud: each of their runs fails, and they stop after 5.
 
+A run of `record_counter`, `statistics` or `revision_history` that fails is tried again after a wait that doubles each time, from the timer of the compaction (10 s by default), with a random part of up to as much again, and at most 5 minutes. After 5 failures in a row the function stops, as distributed Chroma stops compacting the collection: the version of the input collection stays and no output comes. The failures are kept in the database: a restart of the server does not reset them. A function stopped starts again when detached with its output collection and attached again, which computes its output again from the records: `revision_history` then loses the revisions it archived.
+
 `count_to_file_async` writes a file, and as in distributed Chroma it is only enabled with `allow_reset: true`. By default it writes in the data path. To write to S3 instead, give the storage under `local_compaction_manager:`, in the format of distributed Chroma, for example:
 
 ```yaml
