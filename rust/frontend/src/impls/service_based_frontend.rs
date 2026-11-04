@@ -6685,6 +6685,103 @@ mod tests {
         assert_eq!(total_count(&mut frontend, &collection).await, 2);
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         assert_eq!(version_of(&db, &collection).await, before + 1);
+        assert_eq!(failures_of(&db, &collection).await, 0);
+    }
+
+    // The failures in a row of the synchronous function of a collection, in its SQLite database.
+    async fn failures_of(db: &sqlx::SqlitePool, collection: &Collection) -> i32 {
+        sqlx::query_scalar(
+            "SELECT failure_count FROM attached_functions WHERE input_collection_id = $1 AND is_deleted = FALSE",
+        )
+        .bind(collection.collection_id.to_string())
+        .fetch_one(db)
+        .await
+        .unwrap()
+    }
+
+    // A synchronous function whose runs keep failing is tried again after waits that double, from the timer, here one
+    // second, and stops at its fifth failure in a row, as distributed Chroma stops compacting a collection: then the
+    // version of its input stays and no output comes, also once the run could succeed again. Detached and attached
+    // again, it starts again with its backfill. The runs fail here while the segments of the output collection are not
+    // its own.
+    #[tokio::test]
+    async fn a_synchronous_function_that_keeps_failing_stops_after_five_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 1).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "stopped_input").await;
+        add_record(&mut frontend, &collection, "a").await;
+        attach_record_counter(&mut frontend, &collection).await;
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 1).await, 1);
+        // As the server: the reference of segments to a table "collection" that does not exist (00009) holds with
+        // foreign keys off.
+        let db = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(root.path().join("chroma.sqlite3"))
+                .foreign_keys(false),
+        )
+        .await
+        .unwrap();
+        let output = frontend
+            .get_attached_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                "counter".to_string(),
+            )
+            .await
+            .unwrap()
+            .output_collection_id
+            .unwrap()
+            .to_string();
+        let segments_of = |from: String, to: String| {
+            sqlx::query("UPDATE segments SET collection = $1 WHERE collection = $2")
+                .bind(to)
+                .bind(from)
+                .execute(&db)
+        };
+        // The run of the attach counts its version right after its output.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let before = version_of(&db, &collection).await;
+        segments_of(output.clone(), "elsewhere".to_string())
+            .await
+            .unwrap();
+        let first = std::time::Instant::now();
+        add_record(&mut frontend, &collection, "b").await;
+        // The waits of 1, 2, 4 and 8 seconds, each with a jitter of up to as much again.
+        let mut failures = 0;
+        for _ in 0..600 {
+            failures = failures_of(&db, &collection).await;
+            if failures >= 5 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(failures, 5);
+        assert!(first.elapsed() >= std::time::Duration::from_secs(15));
+        segments_of("elsewhere".to_string(), output).await.unwrap();
+        add_record(&mut frontend, &collection, "c").await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(failures_of(&db, &collection).await, 5);
+        assert_eq!(version_of(&db, &collection).await, before);
+        assert_eq!(total_count(&mut frontend, &collection).await, 1);
+        frontend
+            .detach_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                "counter".to_string(),
+                chroma_types::DetachFunctionRequest::try_new(true).unwrap(),
+            )
+            .await
+            .unwrap();
+        attach_record_counter(&mut frontend, &collection).await;
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 3).await, 3);
+        assert_eq!(
+            wait_for_version(&db, &collection, before + 1).await,
+            before + 1
+        );
+        assert_eq!(failures_of(&db, &collection).await, 0);
     }
 
     // A window where no function runs, here a function behind without an output collection, which a run skips: the
