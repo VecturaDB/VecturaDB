@@ -39,6 +39,19 @@ pub fn is_checkpoint_changed(err: &io::Error) -> bool {
 pub static TOUCH_AFTER_INSPECTION: std::sync::Mutex<Option<std::path::PathBuf>> =
     std::sync::Mutex::new(None);
 
+/// For tests: the folder that TOUCH_AFTER_INSPECTION names gets its attributes changed after each inspection of its
+/// files, that of a purge and that of a load, as a file system that reports attributes late.
+#[cfg(feature = "test-hooks")]
+pub(super) fn touch_after_inspection(path: &Path) -> io::Result<()> {
+    if TOUCH_AFTER_INSPECTION.lock().unwrap().as_deref() == Some(path) {
+        File::options()
+            .append(true)
+            .open(path.join(METADATA_FILE))?
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))?;
+    }
+    Ok(())
+}
+
 // This is a change detector, not a content checksum. Unix identity and change
 // timestamps also detect replacement or edits that restore the modification time.
 #[derive(Debug, PartialEq, Eq)]
@@ -121,12 +134,7 @@ pub(crate) fn validate_checkpoint(path: &Path, watermark: u64) -> io::Result<Ver
     }
     validate_checkpoint_seq_id(inspection.checkpoint_seq_id, watermark)?;
     #[cfg(feature = "test-hooks")]
-    if TOUCH_AFTER_INSPECTION.lock().unwrap().as_deref() == Some(path) {
-        File::options()
-            .append(true)
-            .open(path.join(METADATA_FILE))?
-            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))?;
-    }
+    touch_after_inspection(path)?;
     if before != CheckpointFingerprint::read(path)? {
         return Err(checkpoint_changed());
     }

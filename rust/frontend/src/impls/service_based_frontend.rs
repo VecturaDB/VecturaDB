@@ -289,6 +289,12 @@ impl ServiceBasedFrontend {
         }
     }
 
+    // A read of the single node reads what its segments applied, whatever the tail of the log: only a conditional read
+    // looks at the log, so that the others cost what they cost in Chroma 1.5.9.
+    fn scouts_every_read(&self) -> bool {
+        self.enable_log_scouting && !matches!(self.log_client, Log::Sqlite(_))
+    }
+
     fn log_upper_bound_offset_to_i64(log_upper_bound_offset: u64) -> Result<i64, QueryError> {
         i64::try_from(log_upper_bound_offset).map_err(|_| {
             QueryError::Other(Box::new(ValidationError::InvalidArgument(format!(
@@ -708,6 +714,7 @@ impl ServiceBasedFrontend {
             .collect();
         Ok(GetResult {
             pulled_log_bytes: total_pulled_log_bytes,
+            applied_log_offset: None,
             result: ProjectionOutput {
                 records: merged_records,
             },
@@ -2373,6 +2380,7 @@ impl ServiceBasedFrontend {
             Err(PushLogsError::Backoff | PushLogsError::BackoffCompaction { .. }) => {
                 Err(ConditionalCommitError::Backoff)
             }
+            Err(PushLogsError::StaleRead(err)) => Err(ConditionalCommitError::StaleRead(err)),
             Err(other) => Err(ConditionalCommitError::Other(Box::new(other))),
         }
     }
@@ -2754,7 +2762,7 @@ impl ServiceBasedFrontend {
                 .size_bytes_post_compaction;
             let fts_query_length = where_clause.fts_query_length();
             let metadata_predicate_count = where_clause.metadata_predicate_count();
-            let log_upper_bound_offset = if self.enable_log_scouting {
+            let log_upper_bound_offset = if self.scouts_every_read() {
                 self.log_client
                     .scout_logs(
                         &collection_and_segments.collection.tenant,
@@ -2998,7 +3006,7 @@ impl ServiceBasedFrontend {
         let latest_collection_logical_size_bytes = collection_and_segments
             .collection
             .size_bytes_post_compaction;
-        let log_upper_bound_offset = if self.enable_log_scouting {
+        let log_upper_bound_offset = if self.scouts_every_read() {
             self.log_client
                 .scout_logs(
                     &collection_and_segments.collection.tenant,
@@ -3206,8 +3214,20 @@ impl ServiceBasedFrontend {
             .as_ref()
             .map(Where::fts_query_length)
             .unwrap_or_default();
+        // A conditional read asks the log to keep the records of the collection for its commit, before it reads.
+        if !matches!(occ_read_mode, OccReadMode::None) {
+            if let Log::Sqlite(log) = &self.log_client {
+                log.note_conditional_use(collection_id)
+                    .await
+                    .map_err(|err| QueryError::Other(Box::new(err)))?;
+            }
+        }
+        let log_scouting = match occ_read_mode {
+            OccReadMode::None => self.scouts_every_read(),
+            _ => self.enable_log_scouting,
+        };
         let scouted_log_upper_bound_offset =
-            if self.enable_log_scouting && !matches!(occ_read_mode, OccReadMode::AtToken(_)) {
+            if log_scouting && !matches!(occ_read_mode, OccReadMode::AtToken(_)) {
                 Some(
                     self.log_client
                         .scout_logs(
@@ -3221,17 +3241,23 @@ impl ServiceBasedFrontend {
             } else {
                 None
             };
-        let read_plan = Self::get_read_plan(
-            self.enable_log_scouting,
-            occ_read_mode,
-            scouted_log_upper_bound_offset,
-        )?;
+        let read_plan =
+            Self::get_read_plan(log_scouting, occ_read_mode, scouted_log_upper_bound_offset)?;
         if let Some(read_token) = read_plan.stale_read_token {
-            Self::validate_occ_read_snapshot(
-                collection_and_segments.collection.log_position,
-                read_token,
-            )?;
+            // The SQLite sysdb keeps no log position: on the single node the log gives it.
+            let log_position = match &self.log_client {
+                Log::Sqlite(log) => log
+                    .log_position(collection_and_segments.collection.collection_id)
+                    .await
+                    .map_err(|err| QueryError::Other(Box::new(err)))?,
+                _ => collection_and_segments.collection.log_position,
+            };
+            Self::validate_occ_read_snapshot(log_position, read_token)?;
         }
+        let ids_at_token = match occ_read_mode {
+            OccReadMode::AtToken(_) => ids.clone(),
+            _ => None,
+        };
         let get_result = Box::pin(self.fan_out_get(
             tenant_id,
             Get {
@@ -3258,10 +3284,58 @@ impl ServiceBasedFrontend {
         ))
         .await
         .map_err(|err| Self::map_occ_read_executor_error(err, read_plan.stale_read_token))?;
+        // A later read of a transaction answers the state at its token in distributed Chroma, which reads a version and
+        // the log up to the token. The segments of the single node hold only the current state: the read stands when what
+        // it read did not change after the token, and otherwise it is stale, as a version that can no longer be read.
+        if let (Log::Sqlite(log), OccReadMode::AtToken(read_token), Some(applied)) = (
+            &mut self.log_client,
+            occ_read_mode,
+            get_result.applied_log_offset,
+        ) {
+            let read_ids = ids_at_token
+                .iter()
+                .flatten()
+                .map(String::as_str)
+                .chain(
+                    get_result
+                        .result
+                        .records
+                        .iter()
+                        .map(|record| record.id.as_str()),
+                )
+                .collect();
+            let stands = log
+                .read_stands_at_token(
+                    collection_id,
+                    read_token.log_upper_bound_offset() as i64,
+                    applied as i64,
+                    &read_ids,
+                )
+                .await
+                .map_err(|err| QueryError::Other(Box::new(err)))?;
+            if !stands {
+                return Err(StaleReadError::version_purged(
+                    read_token.log_upper_bound_offset(),
+                    "the log does not show that the records it reads are as they were at the read token",
+                )
+                .into());
+            }
+        }
         let return_bytes = get_result.size_bytes();
         let pulled_log_bytes = get_result.pulled_log_bytes;
+        // On the single node a conditional read takes as its token the record after the last one that the metadata
+        // segment had applied when the get read it, not the tail of the log, so a commit not yet applied falls after
+        // the token and its conflict check sees it (from the read itself, as log_upper_bound_offset).
+        let applied_log_offset = get_result.applied_log_offset;
         let mut get_response: GetResponse = (get_result, include).into();
         if let Some(read_token) = read_plan.response_read_token {
+            let read_token = match (&self.log_client, occ_read_mode, applied_log_offset) {
+                (Log::Sqlite(_), OccReadMode::Capture, Some(applied)) => {
+                    OccReadToken::try_new(applied + 1)
+                        .map_err(|err| QueryError::Other(Box::new(err)))?
+                }
+                _ => read_token,
+            };
             get_response.set_occ_read_token(read_token);
         }
 
@@ -3363,7 +3437,7 @@ impl ServiceBasedFrontend {
             .map(Where::fts_query_length)
             .unwrap_or_default();
         let query_embedding_count = embeddings.len() as u64;
-        let log_upper_bound_offset = if self.enable_log_scouting {
+        let log_upper_bound_offset = if self.scouts_every_read() {
             self.log_client
                 .scout_logs(
                     &collection_and_segments.collection.tenant,
@@ -3533,7 +3607,7 @@ impl ServiceBasedFrontend {
 
         // Create a single Search plan with one scan and the payloads from the request
         // Clone the searches to use them later for aggregating select keys
-        let log_upper_bound_offset = if self.enable_log_scouting {
+        let log_upper_bound_offset = if self.scouts_every_read() {
             self.log_client
                 .scout_logs(
                     &collection_and_segments.collection.tenant,
@@ -4277,7 +4351,9 @@ mod tests {
     async fn conditional_commit_disabled_returns_transactions_disabled() {
         let registry = Registry::new();
         let system = System::new();
-        let config = FrontendConfig::sqlite_in_memory();
+        let mut config = FrontendConfig::sqlite_in_memory();
+        // Off, as the configuration of distributed Chroma that these tests copy.
+        config.enable_transactions = false;
         let mut frontend = ServiceBasedFrontend::try_from_config(&(config, system), &registry)
             .await
             .unwrap();
@@ -4298,8 +4374,10 @@ mod tests {
         assert_eq!(ErrorCodes::Unimplemented, err.code());
     }
 
+    // The SQLite log of the single node takes conditional writes: with transactions on, an empty commit is answered as
+    // by distributed Chroma, with no record.
     #[tokio::test]
-    async fn conditional_commit_unsupported_log_returns_transactions_not_supported() {
+    async fn conditional_commit_on_the_sqlite_log_is_supported() {
         let registry = Registry::new();
         let system = System::new();
         let mut config = FrontendConfig::sqlite_in_memory();
@@ -4308,7 +4386,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = frontend
+        let result = frontend
             .conditional_commit(
                 ConditionalCommitRequest {
                     buffered_writes: Vec::new(),
@@ -4318,14 +4396,10 @@ mod tests {
                 String::new(),
             )
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(
-            err,
-            ConditionalCommitError::TransactionsNotSupported { ref implementation }
-                if implementation == "sqlite"
-        ));
-        assert_eq!(ErrorCodes::Unimplemented, err.code());
+        assert_eq!(result.record_count, 0);
+        assert_eq!(result.first_inserted_record_offset, None);
     }
 
     #[tokio::test]
@@ -4333,6 +4407,8 @@ mod tests {
         let registry = Registry::new();
         let system = System::new();
         let mut config = FrontendConfig::sqlite_in_memory();
+        // Off, as the configuration of distributed Chroma that these tests copy.
+        config.enable_transactions = false;
         config.tenants_with_transactions_enabled = vec!["enabled_tenant".to_string()];
         let mut frontend = ServiceBasedFrontend::try_from_config(&(config, system), &registry)
             .await
@@ -4355,25 +4431,17 @@ mod tests {
         let registry = Registry::new();
         let system = System::new();
         let mut config = FrontendConfig::sqlite_in_memory();
+        // Off, as the configuration of distributed Chroma that these tests copy.
+        config.enable_transactions = false;
         config.tenants_with_transactions_enabled = vec!["enabled_tenant".to_string()];
-        let mut frontend = ServiceBasedFrontend::try_from_config(&(config, system), &registry)
+        let frontend = ServiceBasedFrontend::try_from_config(&(config, system), &registry)
             .await
             .unwrap();
 
-        let err = frontend
-            .conditional_commit(
-                conditional_commit_request_for_tenant("enabled_tenant"),
-                String::new(),
-            )
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            ConditionalCommitError::TransactionsNotSupported { ref implementation }
-                if implementation == "sqlite"
-        ));
-        assert_eq!(ErrorCodes::Unimplemented, err.code());
+        // The SQLite log of the single node takes conditional writes.
+        frontend
+            .ensure_conditional_commit_supported_for_tenant("enabled_tenant")
+            .unwrap();
     }
 
     #[test]
@@ -4925,6 +4993,696 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending, 0);
+    }
+
+    // A conditional get of the record "c" with its metadata.
+    async fn conditional_get_of_c(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+    ) -> GetResponse {
+        let request = GetRequest::try_new(
+            TENANT.to_string(),
+            DATABASE.to_string(),
+            collection_id,
+            Some(vec!["c".to_string()]),
+            None,
+            None,
+            0,
+            chroma_types::IncludeList(vec![chroma_types::Include::Metadata]),
+        )
+        .unwrap()
+        .with_occ_read_token_generation();
+        frontend.get(request).await.unwrap()
+    }
+
+    // The record "c" with n = 0.
+    async fn add_c(frontend: &mut ServiceBasedFrontend, collection_id: CollectionUuid) {
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    vec!["c".to_string()],
+                    vec![vec![1.0, 2.0]],
+                    None,
+                    None,
+                    Some(vec![Some(chroma_types::Metadata::from([(
+                        "n".to_string(),
+                        MetadataValue::Int(0),
+                    )]))]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // In the log, a commit of n = 1 on the record "c" that the segments have not applied, as between push_logs and its
+    // backfill.
+    async fn commit_of_c_not_applied(db: &SqliteDb) {
+        sqlx::query(
+            "INSERT INTO embeddings_queue (operation, topic, id, vector, encoding, metadata) \
+             SELECT 1, topic, id, vector, encoding, '{\"n\": 1}' FROM embeddings_queue WHERE id = 'c'",
+        )
+        .execute(db.get_conn())
+        .await
+        .unwrap();
+    }
+
+    // A commit at the token of a read, which read the record "c" and adds the record "d": whether it was refused, and how.
+    async fn commit_after_reading_c(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        token: u64,
+    ) -> Result<(), String> {
+        frontend
+            .conditional_commit(
+                ConditionalCommitRequest {
+                    buffered_writes: vec![ConditionalBufferedWrite::Add(
+                        AddCollectionRecordsRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            vec!["d".to_string()],
+                            vec![vec![1.0, 2.0]],
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    )],
+                    observed_log_offset: Some(token as i64),
+                    read_ids: vec!["c".to_string()],
+                },
+                String::new(),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
+    // A conditional read sees every record before its token, or a commit at that token conflicts with the records it
+    // missed: as the log service of distributed Chroma (the lost update of the oracle of 01/11).
+    async fn a_commit_not_applied_is_seen_or_conflicts(
+        frontend: &mut ServiceBasedFrontend,
+        db: &SqliteDb,
+        collection_id: CollectionUuid,
+    ) {
+        add_c(frontend, collection_id).await;
+        conditional_get_of_c(frontend, collection_id).await;
+        commit_of_c_not_applied(db).await;
+        let read = conditional_get_of_c(frontend, collection_id).await;
+        let seen = read.metadatas.unwrap()[0].as_ref().unwrap()["n"].clone();
+        let token = read.occ_read_token.unwrap().log_upper_bound_offset();
+        let commit = commit_after_reading_c(frontend, collection_id, token).await;
+        assert!(
+            seen == MetadataValue::Int(1)
+                || commit
+                    .as_ref()
+                    .is_err_and(|err| err.contains("conditional write conflict")),
+            "the read saw n = {seen:?} at token {token} and its commit gave {commit:?}"
+        );
+    }
+
+    // Only a conditional read, whose plan has a position of the log, takes the position that it read from a snapshot of
+    // SQLite. The plan of a get outside a transaction has none on the single node, and that get goes straight to SQLite.
+    async fn only_a_conditional_read_takes_the_position_that_it_read(spann: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), spann).await;
+        let collection_id = if spann {
+            spann_tail_tests::empty_spann_collection(&mut frontend, "position").await
+        } else {
+            create_collection_for(&mut frontend, TENANT, DATABASE, "position")
+                .await
+                .collection_id
+        };
+        add_c(&mut frontend, collection_id).await;
+        assert!(!frontend.scouts_every_read());
+        let plain_plan =
+            ServiceBasedFrontend::get_read_plan(false, OccReadMode::None, None).unwrap();
+        assert_eq!(plain_plan.log_upper_bound_offset, 0);
+        let collection_and_segments =
+            ServiceBasedFrontend::get_collection_with_segments_for_tenant(
+                &mut frontend.collections_with_segments_provider,
+                Some(DatabaseName::new(DATABASE).unwrap()),
+                collection_id,
+                TENANT,
+            )
+            .await
+            .unwrap();
+        let get = |log_upper_bound_offset| Get {
+            scan: Scan {
+                collection_and_segments: collection_and_segments.clone(),
+                shard_index: 0,
+                num_shards: 1,
+                log_upper_bound_offset,
+            },
+            filter: Filter {
+                query_ids: Some(vec!["c".to_string()]),
+                where_clause: None,
+            },
+            limit: Limit {
+                offset: 0,
+                limit: None,
+            },
+            proj: Projection {
+                document: false,
+                embedding: false,
+                metadata: true,
+            },
+        };
+        let mut executor = frontend.executor.clone();
+        let plain = Box::pin(
+            executor.get(get(plain_plan.log_upper_bound_offset), |_| async {
+                unreachable!()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plain.result.records.len(), 1);
+        assert_eq!(plain.applied_log_offset, None);
+        let conditional = Box::pin(executor.get(get(1), |_| async { unreachable!() }))
+            .await
+            .unwrap();
+        assert_eq!(conditional.result.records.len(), 1);
+        assert!(conditional.applied_log_offset.is_some());
+    }
+
+    #[tokio::test]
+    async fn only_a_conditional_read_of_hnsw_takes_the_position_that_it_read() {
+        only_a_conditional_read_takes_the_position_that_it_read(false).await;
+    }
+
+    #[test]
+    fn only_a_conditional_read_of_spann_takes_the_position_that_it_read() {
+        on_a_large_stack(TestRuntime::CurrentThread, || {
+            only_a_conditional_read_takes_the_position_that_it_read(true)
+        })
+    }
+
+    // Only a conditional read asks the log to keep the records of a collection.
+    #[tokio::test]
+    async fn only_a_conditional_read_asks_the_log_to_keep_the_records() {
+        let registry = Registry::new();
+        let system = System::new();
+        let mut frontend = ServiceBasedFrontend::try_from_config(
+            &(FrontendConfig::sqlite_in_memory(), system),
+            &registry,
+        )
+        .await
+        .unwrap();
+        let collection_id = create_collection_for(&mut frontend, TENANT, DATABASE, "in_use")
+            .await
+            .collection_id;
+        add_c(&mut frontend, collection_id).await;
+        let in_use = |frontend: &ServiceBasedFrontend| match &frontend.log_client {
+            Log::Sqlite(log) => log.used_by_conditional_transactions(collection_id),
+            _ => panic!("not the log of the single node"),
+        };
+        let plain_get = GetRequest::try_new(
+            TENANT.to_string(),
+            DATABASE.to_string(),
+            collection_id,
+            Some(vec!["c".to_string()]),
+            None,
+            None,
+            0,
+            chroma_types::IncludeList(vec![chroma_types::Include::Metadata]),
+        )
+        .unwrap();
+        frontend.get(plain_get.clone()).await.unwrap();
+        assert!(!in_use(&frontend));
+        // Once the index has replayed the log, a plain read does not look at it.
+        let db = registry.get::<SqliteDb>().unwrap();
+        for (from, to) in [
+            ("embeddings_queue", "hidden_embeddings_queue"),
+            ("hidden_embeddings_queue", "embeddings_queue"),
+        ] {
+            let read = frontend.get(plain_get.clone()).await;
+            sqlx::query(&format!("ALTER TABLE {from} RENAME TO {to}"))
+                .execute(db.get_conn())
+                .await
+                .unwrap();
+            assert!(read.is_ok(), "{:?}", read.err());
+        }
+        frontend.get(plain_get.clone()).await.unwrap();
+        conditional_get_of_c(&mut frontend, collection_id).await;
+        assert!(in_use(&frontend));
+    }
+
+    // The log of a collection in use follows the configuration: with no cutoff and an interval of 1 s, the purge of the
+    // timer removes what a flush applied, instead of keeping it for 12 hours until a purge in 2.
+    #[test]
+    fn the_purge_of_a_conditional_collection_follows_the_configuration() {
+        on_a_large_stack(TestRuntime::FourWorkers, || async {
+            let root = tempfile::tempdir().unwrap();
+            let registry = Registry::new();
+            let system = System::new();
+            let mut config = FrontendConfig::sqlite_in_memory();
+            config.sqlitedb.as_mut().unwrap().url =
+                Some(root.path().join("chroma.sqlite3").to_str().unwrap().into());
+            config.segment_manager.as_mut().unwrap().persist_path =
+                Some(root.path().to_str().unwrap().into());
+            config.executor = crate::executor::config::ExecutorConfig::Local(
+                crate::executor::config::LocalExecutorConfig {
+                    spann: true,
+                    ..Default::default()
+                },
+            );
+            config.local_compaction_manager = chroma_log::LocalCompactionManagerConfig {
+                compaction_interval_sec: 1,
+                min_compaction_size: 1,
+                purge_interval_sec: 1,
+                ..Default::default()
+            };
+            config.log =
+                chroma_log::config::LogConfig::Sqlite(chroma_log::config::SqliteLogConfig {
+                    purge_cutoff_time_seconds: 0,
+                    ..Default::default()
+                });
+            let mut frontend = ServiceBasedFrontend::try_from_config(&(config, system), &registry)
+                .await
+                .unwrap();
+            let db = registry.get::<SqliteDb>().unwrap();
+            let collection_id =
+                spann_tail_tests::empty_spann_collection(&mut frontend, "in_use").await;
+            add_c(&mut frontend, collection_id).await;
+            conditional_get_of_c(&mut frontend, collection_id).await;
+            let mut written = 1;
+            let mut rows = 1;
+            for _ in 0..300 {
+                frontend
+                    .add(
+                        AddCollectionRecordsRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            vec![format!("x{written}")],
+                            vec![vec![1.0, 2.0]],
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                written += 1;
+                rows = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM embeddings_queue")
+                    .fetch_one(db.get_conn())
+                    .await
+                    .unwrap();
+                if rows < written {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            assert!(rows < written, "{rows} records of {written} in the log");
+        })
+    }
+
+    #[tokio::test]
+    async fn a_conditional_read_sees_the_log_before_its_token_or_its_commit_conflicts() {
+        let registry = Registry::new();
+        let system = System::new();
+        let mut config = FrontendConfig::sqlite_in_memory();
+        config.enable_transactions = true;
+        config.enable_log_scouting = true;
+        let mut frontend = ServiceBasedFrontend::try_from_config(&(config, system), &registry)
+            .await
+            .unwrap();
+        let db = registry.get::<SqliteDb>().unwrap();
+        let collection_id = create_collection_for(&mut frontend, TENANT, DATABASE, "lost_update")
+            .await
+            .collection_id;
+        a_commit_not_applied_is_seen_or_conflicts(&mut frontend, &db, collection_id).await;
+    }
+
+    #[test]
+    fn a_conditional_read_of_spann_sees_the_log_before_its_token_or_its_commit_conflicts() {
+        on_a_large_stack(TestRuntime::CurrentThread, || async {
+            let root = tempfile::tempdir().unwrap();
+            let registry = Registry::new();
+            let mut frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+            let db = registry.get::<SqliteDb>().unwrap();
+            let collection_id =
+                spann_tail_tests::empty_spann_collection(&mut frontend, "lost_update").await;
+            a_commit_not_applied_is_seen_or_conflicts(&mut frontend, &db, collection_id).await;
+        })
+    }
+
+    // A conditional read whose own get applies the log takes a token past what it applied, so that its commit does not
+    // conflict with the records it read: as log_upper_bound_offset in distributed Chroma, the token of a read is the
+    // position it read at (the false conflicts of the oracle of 01/11). A new frontend on the data replays the log in its
+    // first get, which applies the row inserted by hand after the first frontend stopped.
+    async fn a_read_that_applies_the_log_commits_without_a_conflict(spann: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let collection_id = {
+            let mut frontend = frontend_with_spann(root.path(), spann).await;
+            let collection_id = if spann {
+                spann_tail_tests::empty_spann_collection(&mut frontend, "own_backfill").await
+            } else {
+                create_collection_for(&mut frontend, TENANT, DATABASE, "own_backfill")
+                    .await
+                    .collection_id
+            };
+            add_c(&mut frontend, collection_id).await;
+            collection_id
+        };
+        let registry = Registry::new();
+        let mut frontend = frontend_with_spann_registry(root.path(), spann, &registry).await;
+        commit_of_c_not_applied(&registry.get::<SqliteDb>().unwrap()).await;
+        let read = conditional_get_of_c(&mut frontend, collection_id).await;
+        assert_eq!(
+            read.metadatas.unwrap()[0].as_ref().unwrap()["n"],
+            MetadataValue::Int(1)
+        );
+        let token = read.occ_read_token.unwrap().log_upper_bound_offset();
+        let commit = commit_after_reading_c(&mut frontend, collection_id, token).await;
+        assert!(
+            commit.is_ok(),
+            "the read saw n = 1 at token {token} and its commit gave {commit:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conditional_read_that_applies_the_log_commits_without_a_conflict() {
+        a_read_that_applies_the_log_commits_without_a_conflict(false).await;
+    }
+
+    #[test]
+    fn a_conditional_read_of_spann_that_applies_the_log_commits_without_a_conflict() {
+        on_a_large_stack(TestRuntime::CurrentThread, || {
+            a_read_that_applies_the_log_commits_without_a_conflict(true)
+        })
+    }
+
+    // As Chroma Cloud: a commit answers the position of its first record, here the token of its read, and the next read
+    // goes on after its records.
+    #[tokio::test]
+    async fn a_conditional_commit_answers_the_position_of_its_first_record() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), false).await;
+        let collection_id = create_collection_for(&mut frontend, TENANT, DATABASE, "first_record")
+            .await
+            .collection_id;
+        add_c(&mut frontend, collection_id).await;
+        let token = conditional_get_of_c(&mut frontend, collection_id)
+            .await
+            .occ_read_token
+            .unwrap()
+            .log_upper_bound_offset();
+        let committed = frontend
+            .conditional_commit(
+                ConditionalCommitRequest {
+                    buffered_writes: vec![ConditionalBufferedWrite::Add(
+                        AddCollectionRecordsRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            vec!["d".to_string(), "e".to_string()],
+                            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    )],
+                    observed_log_offset: Some(token as i64),
+                    read_ids: vec!["c".to_string()],
+                },
+                String::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed.record_count, 2);
+        assert_eq!(committed.first_inserted_record_offset, Some(token as i64));
+        let next = conditional_get_of_c(&mut frontend, collection_id)
+            .await
+            .occ_read_token
+            .unwrap()
+            .log_upper_bound_offset();
+        assert_eq!(next, token + 2);
+    }
+
+    // A commit that the log can no longer check is stale, as a read at its token: the clients start it again on that name.
+    #[tokio::test]
+    async fn a_conditional_commit_below_the_readable_log_is_stale() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        let mut frontend = frontend_with_spann_registry(root.path(), false, &registry).await;
+        let collection_id = create_collection_for(&mut frontend, TENANT, DATABASE, "stale_commit")
+            .await
+            .collection_id;
+        add_c(&mut frontend, collection_id).await;
+        // The first use of the collection, past its first record: as after a restart.
+        sqlx::query(
+            "INSERT OR REPLACE INTO max_seq_id (segment_id, seq_id) \
+             SELECT id, 1 FROM segments WHERE collection = ?",
+        )
+        .bind(collection_id.0.to_string())
+        .execute(registry.get::<SqliteDb>().unwrap().get_conn())
+        .await
+        .unwrap();
+        let err = frontend
+            .conditional_commit(
+                ConditionalCommitRequest {
+                    buffered_writes: vec![ConditionalBufferedWrite::Add(
+                        AddCollectionRecordsRequest::try_new(
+                            TENANT.to_string(),
+                            DATABASE.to_string(),
+                            collection_id,
+                            vec!["d".to_string()],
+                            vec![vec![1.0, 2.0]],
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    )],
+                    observed_log_offset: Some(0),
+                    read_ids: vec!["c".to_string()],
+                },
+                String::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), chroma_error::ErrorCodes::FailedPrecondition);
+        assert!(
+            chroma_error::source_chain_contains(&err, |source| source.is::<StaleReadError>()),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("readable log lower bound"),
+            "{err}"
+        );
+    }
+
+    // A conditional read of the record "c", or of a filter on n when `ids` is off, at a token.
+    async fn read_at_token(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        token: u64,
+        ids: bool,
+    ) -> Result<GetResponse, QueryError> {
+        let request = GetRequest::try_new(
+            TENANT.to_string(),
+            DATABASE.to_string(),
+            collection_id,
+            ids.then(|| vec!["c".to_string()]),
+            (!ids).then(|| {
+                chroma_types::Where::Metadata(chroma_types::MetadataExpression {
+                    key: "n".to_string(),
+                    comparison: chroma_types::MetadataComparison::Primitive(
+                        chroma_types::PrimitiveOperator::GreaterThanOrEqual,
+                        MetadataValue::Int(0),
+                    ),
+                })
+            }),
+            None,
+            0,
+            chroma_types::IncludeList(vec![chroma_types::Include::Metadata]),
+        )
+        .unwrap()
+        .with_occ_read_token(OccReadToken::try_new(token).unwrap());
+        frontend.get(request).await
+    }
+
+    // A record written with the frontend, with n given when there is one.
+    async fn write_record(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        id: &str,
+        n: Option<i64>,
+    ) {
+        frontend
+            .upsert(
+                chroma_types::UpsertCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    vec![id.to_string()],
+                    vec![vec![1.0, 2.0]],
+                    None,
+                    None,
+                    Some(vec![n.map(|n| {
+                        chroma_types::UpdateMetadata::from([(
+                            "n".to_string(),
+                            chroma_types::UpdateMetadataValue::Int(n),
+                        )])
+                    })]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn assert_stale(read: Result<GetResponse, QueryError>) {
+        assert!(
+            matches!(
+                read,
+                Err(QueryError::StaleRead(StaleReadError::VersionPurged { .. }))
+            ),
+            "{read:?}"
+        );
+        // The clients start a transaction again on the name of the error, which goes by its chain of sources.
+        assert!(chroma_error::source_chain_contains(
+            &read.unwrap_err(),
+            |source| source.is::<StaleReadError>()
+        ));
+    }
+
+    // A later read of a transaction: the records it reads as they were at the token, or stale when one changed after it.
+    async fn a_later_read_answers_the_state_at_its_token_or_is_stale(spann: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        let mut frontend = frontend_with_spann_registry(root.path(), spann, &registry).await;
+        let collection_id = if spann {
+            spann_tail_tests::empty_spann_collection(&mut frontend, "later_read").await
+        } else {
+            create_collection_for(&mut frontend, TENANT, DATABASE, "later_read")
+                .await
+                .collection_id
+        };
+        add_c(&mut frontend, collection_id).await;
+        let token = conditional_get_of_c(&mut frontend, collection_id)
+            .await
+            .occ_read_token
+            .unwrap()
+            .log_upper_bound_offset();
+        // Nothing changed: both reads stand.
+        for ids in [true, false] {
+            let read = read_at_token(&mut frontend, collection_id, token, ids)
+                .await
+                .unwrap();
+            assert_eq!(read.ids, vec!["c".to_string()]);
+        }
+        // A record without n changes neither: it is not read.
+        write_record(&mut frontend, collection_id, "other", None).await;
+        for ids in [true, false] {
+            let read = read_at_token(&mut frontend, collection_id, token, ids)
+                .await
+                .unwrap();
+            assert_eq!(read.ids, vec!["c".to_string()]);
+        }
+        // A token past what the segments applied cannot be read.
+        assert_stale(read_at_token(&mut frontend, collection_id, token + 100, true).await);
+        // A record that the filter finds now was written after the token: only the read of the filter is stale.
+        write_record(&mut frontend, collection_id, "new", Some(1)).await;
+        assert_stale(read_at_token(&mut frontend, collection_id, token, false).await);
+        read_at_token(&mut frontend, collection_id, token, true)
+            .await
+            .unwrap();
+        // The record read changed after the token: both are stale, and a new read goes on from a new token.
+        write_record(&mut frontend, collection_id, "c", Some(5)).await;
+        assert_stale(read_at_token(&mut frontend, collection_id, token, true).await);
+        assert_stale(read_at_token(&mut frontend, collection_id, token, false).await);
+        let next = conditional_get_of_c(&mut frontend, collection_id).await;
+        assert_eq!(
+            next.metadatas.unwrap()[0].as_ref().unwrap()["n"],
+            MetadataValue::Int(5)
+        );
+        let token = next.occ_read_token.unwrap().log_upper_bound_offset();
+        read_at_token(&mut frontend, collection_id, token, true)
+            .await
+            .unwrap();
+        // A commit in the log that the segments have not applied changes nothing the read sees.
+        commit_of_c_not_applied(&registry.get::<SqliteDb>().unwrap()).await;
+        let read = read_at_token(&mut frontend, collection_id, token, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            read.metadatas.unwrap()[0].as_ref().unwrap()["n"],
+            MetadataValue::Int(5)
+        );
+        // The record read went after the token: the read finds nothing, and is stale.
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    Some(vec!["c".to_string()]),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        assert_stale(read_at_token(&mut frontend, collection_id, token, true).await);
+    }
+
+    #[tokio::test]
+    async fn a_later_conditional_read_answers_the_state_at_its_token_or_is_stale() {
+        a_later_read_answers_the_state_at_its_token_or_is_stale(false).await;
+    }
+
+    #[test]
+    fn a_later_conditional_read_of_spann_answers_the_state_at_its_token_or_is_stale() {
+        on_a_large_stack(TestRuntime::CurrentThread, || {
+            a_later_read_answers_the_state_at_its_token_or_is_stale(true)
+        })
+    }
+
+    // As distributed Chroma, a read at a token that the position of the collection has passed is too old.
+    #[tokio::test]
+    async fn a_later_conditional_read_past_the_position_of_the_collection_is_too_old() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        let mut frontend = frontend_with_spann_registry(root.path(), false, &registry).await;
+        let collection_id = create_collection_for(&mut frontend, TENANT, DATABASE, "too_old")
+            .await
+            .collection_id;
+        add_c(&mut frontend, collection_id).await;
+        let token = conditional_get_of_c(&mut frontend, collection_id)
+            .await
+            .occ_read_token
+            .unwrap()
+            .log_upper_bound_offset();
+        read_at_token(&mut frontend, collection_id, token, true)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT OR REPLACE INTO max_seq_id (segment_id, seq_id) \
+             SELECT id, ? FROM segments WHERE collection = ?",
+        )
+        .bind(token as i64)
+        .bind(collection_id.0.to_string())
+        .execute(registry.get::<SqliteDb>().unwrap().get_conn())
+        .await
+        .unwrap();
+        let read = read_at_token(&mut frontend, collection_id, token, true).await;
+        assert!(
+            matches!(
+                read,
+                Err(QueryError::StaleRead(StaleReadError::VersionTooOld { .. }))
+            ),
+            "{read:?}"
+        );
     }
 
     #[tokio::test]

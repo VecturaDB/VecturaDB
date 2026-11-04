@@ -480,6 +480,7 @@ impl Bindings {
             topic_namespace: "default".to_string(),
             num_records_before_backpressure:
                 SqliteLogConfig::default_num_records_before_backpressure(),
+            purge_cutoff_time_seconds: SqliteLogConfig::default_purge_cutoff_time_seconds(),
         });
 
         let collection_cache_config = CollectionsWithSegmentsProviderConfig {
@@ -514,8 +515,9 @@ impl Bindings {
             tenants_with_maxscore_enabled: vec![],
             tenants_with_token_bitmap_fts_enabled: vec![],
             tenants_with_transactions_enabled: vec![],
-            enable_log_scouting: false,
-            enable_transactions: false,
+            // On by default on the single node, as the server: see default_enable_transactions.
+            enable_log_scouting: true,
+            enable_transactions: true,
         };
 
         let frontend = runtime.block_on(async {

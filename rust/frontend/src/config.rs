@@ -114,8 +114,8 @@ impl FrontendConfig {
             tenants_with_maxscore_enabled: vec![],
             tenants_with_token_bitmap_fts_enabled: vec![],
             tenants_with_transactions_enabled: vec![],
-            enable_log_scouting: false,
-            enable_transactions: false,
+            enable_log_scouting: default_enable_log_scouting(),
+            enable_transactions: default_enable_transactions(),
         }
     }
 }
@@ -148,12 +148,16 @@ fn default_enable_schema() -> bool {
     true
 }
 
+// The conditional transactions are on by default on the single node, as on Chroma Cloud, where distributed Chroma
+// has them off unless its configuration turns them on (its sample configurations set both options): on the single node
+// only a conditional read looks at the log, so the others cost nothing. The configurations of distributed Chroma here set
+// both.
 fn default_enable_log_scouting() -> bool {
-    false
+    true
 }
 
 fn default_enable_transactions() -> bool {
-    false
+    true
 }
 
 pub fn default_min_records_for_invocation() -> u64 {
@@ -355,7 +359,8 @@ mod tests {
     fn single_node_full_config_valid() {
         let config = FrontendServerConfig::load_from_path("sample_configs/single_node_full.yaml");
         assert_eq!(config.port, 8000);
-        assert!(!config.frontend.enable_transactions);
+        assert!(config.frontend.enable_transactions);
+        assert!(config.frontend.enable_log_scouting);
         assert!(config.frontend.tenants_with_transactions_enabled.is_empty());
     }
 

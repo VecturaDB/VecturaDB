@@ -106,3 +106,16 @@ impl IntoResponse for ServerError {
         response
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chroma_types::QueryError;
+
+    // The clients start a transaction again on this name, as the Python client in conditional().run().
+    #[test]
+    fn a_stale_read_answers_its_name() {
+        let stale = QueryError::from(StaleReadError::version_purged(5, "changed"));
+        assert_eq!(error_name(&stale), STALE_READ_ERROR_NAME);
+    }
+}

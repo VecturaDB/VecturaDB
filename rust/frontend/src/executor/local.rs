@@ -309,13 +309,22 @@ impl LocalExecutor {
         })
     }
 
-    // A get of an HNSW collection whose records are then read from the index, at a snapshot of SQLite: while a write's
+    // On the single node only a conditional read has a position of the log in its plan: the plan of another read has 0, and
+    // a read token is never 0. It takes as its token the position that it read, which a snapshot of SQLite gives with its
+    // records; another get does not pay for that snapshot, nor for the read of the position.
+    fn is_conditional_read(plan: &Get) -> bool {
+        plan.scan.log_upper_bound_offset != 0
+    }
+
+    // A get of an HNSW collection at a snapshot of SQLite, which gives the records and the last record of the log applied
+    // to the metadata segment at one moment, so that a conditional read takes as its token what it read, as
+    // log_upper_bound_offset in distributed Chroma. When its records are then read from the index given: while a write's
     // backfill has committed its records to SQLite and not yet applied them to the index, the read waits for that
     // backfill, so that the index holds every record of its snapshot (the read of Chroma 1.5.9, which waited for every
     // backfill). Other reads do not wait for a running backfill.
-    async fn get_with_index_at_snapshot(
+    async fn get_at_snapshot(
         &mut self,
-        hnsw_reader: &LocalHnswSegmentReader,
+        index: Option<&LocalHnswSegmentReader>,
         plan: Get,
     ) -> Result<GetResult, ExecutorError> {
         let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
@@ -325,7 +334,7 @@ impl LocalExecutor {
             .max_seq_id(&collection_and_segments.metadata_segment.id)
             .await
             .map_err(internal)?;
-        if hnsw_reader.index.applied_seq_id_in_memory() < applied {
+        if index.is_some_and(|index| index.index.applied_seq_id_in_memory() < applied) {
             let backfill_msg = BackfillMessage {
                 collection_id: collection_and_segments.collection.collection_id,
             };
@@ -335,12 +344,13 @@ impl LocalExecutor {
                 .map_err(|err| ExecutorError::BackfillError(Box::new(err)))?
                 .map_err(|err| ExecutorError::BackfillError(Box::new(err)))?;
         }
-        let result = self
+        let mut result = self
             .metadata_reader
             .get_at(&mut snapshot, plan)
             .await
             .map_err(internal)?;
         snapshot.close().await.map_err(internal)?;
+        result.applied_log_offset = Some(applied);
         Ok(result)
     }
 
@@ -441,16 +451,15 @@ impl LocalExecutor {
             .try_backfill_collection(&collection_and_segments)
             .await?;
         let load_embedding = plan.proj.embedding;
-        let mut result = match &hnsw_reader {
-            // The embeddings come from the index: it must hold every record of the snapshot of the get.
-            Some(hnsw_reader) if load_embedding => {
-                self.get_with_index_at_snapshot(hnsw_reader, plan).await?
-            }
-            _ => self
-                .metadata_reader
+        // The embeddings come from the index: it must hold every record of the snapshot of the get.
+        let index = hnsw_reader.as_ref().filter(|_| load_embedding);
+        let mut result = if index.is_some() || Self::is_conditional_read(&plan) {
+            self.get_at_snapshot(index, plan).await?
+        } else {
+            self.metadata_reader
                 .get(plan)
                 .await
-                .map_err(|err| ExecutorError::Internal(Box::new(err)))?,
+                .map_err(|err| ExecutorError::Internal(Box::new(err)))?
         };
         if load_embedding {
             if let Some(hnsw_reader) = hnsw_reader {
@@ -719,6 +728,7 @@ impl LocalExecutor {
     // the files of the same flush and the tail after them, and closes before them.
     async fn spann_get(&mut self, plan: Get) -> Result<GetResult, ExecutorError> {
         let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
+        let conditional = Self::is_conditional_read(&plan);
         let (mut snapshot, collection_and_segments, tail) = self
             .spann_snapshot(&plan.scan.collection_and_segments, ReadLevel::IndexAndWal)
             .await?;
@@ -736,6 +746,15 @@ impl LocalExecutor {
             .get_at(&mut snapshot, filter_limit)
             .await
             .map_err(internal)?;
+        // As in get: the last record applied to the metadata segment, in the snapshot of the records.
+        if conditional {
+            result.applied_log_offset = Some(
+                snapshot
+                    .max_seq_id(&collection_and_segments.metadata_segment.id)
+                    .await
+                    .map_err(internal)?,
+            );
+        }
         snapshot.close().await.map_err(internal)?;
         if result.result.records.is_empty()
             || !(projection.document || projection.embedding || projection.metadata)
@@ -820,7 +839,7 @@ impl LocalExecutor {
 
                 // The ids that the filter gives are looked up in the index, which must hold every record of its snapshot.
                 let allowed_uids = self
-                    .get_with_index_at_snapshot(&hnsw_reader, filter_plan)
+                    .get_at_snapshot(Some(&hnsw_reader), filter_plan)
                     .await?
                     .result
                     .records

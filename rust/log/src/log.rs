@@ -3,7 +3,7 @@ use crate::grpc_log::{GrpcLog, GrpcPushLogsError, GrpcSealLogError, ScoutLogFrag
 use crate::in_memory_log::InMemoryLog;
 use crate::sqlite_log::{SqliteLog, SqlitePushLogsError};
 use crate::types::CollectionInfo;
-use chroma_api_types::CONDITIONAL_WRITE_CONFLICT_MESSAGE;
+use chroma_api_types::{StaleReadError, CONDITIONAL_WRITE_CONFLICT_MESSAGE};
 use chroma_error::{ChromaError, ErrorCodes};
 use chroma_memberlist::client_manager::ClientAssignmentError;
 use chroma_types::{
@@ -63,6 +63,9 @@ pub enum PushLogsError {
     /// The conditional write was rejected because the observed log state changed.
     #[error("conditional write conflict")]
     ConditionalWriteConflict,
+    /// The log can no longer check the conditional write: stale, as a read at its token.
+    #[error(transparent)]
+    StaleRead(#[from] StaleReadError),
     /// The record count cannot be represented by the log-service API.
     #[error("too many records in push_logs request: {0}")]
     RecordCountOutOfRange(usize),
@@ -78,6 +81,7 @@ impl ChromaError for PushLogsError {
             PushLogsError::BackoffCompaction { .. } => ErrorCodes::ResourceExhausted,
             PushLogsError::ConditionalWritesUnsupported(_) => ErrorCodes::Unimplemented,
             PushLogsError::ConditionalWriteConflict => ErrorCodes::AlreadyExists,
+            PushLogsError::StaleRead(e) => e.code(),
             PushLogsError::RecordCountOutOfRange(_) => ErrorCodes::InvalidArgument,
             PushLogsError::Other(e) => e.code(),
         }
@@ -127,7 +131,7 @@ impl Log {
     }
 
     pub fn supports_conditional_transactions(&self) -> bool {
-        matches!(self, Log::Grpc(_))
+        matches!(self, Log::Grpc(_) | Log::Sqlite(_))
     }
 
     #[tracing::instrument(skip(self))]
@@ -254,11 +258,9 @@ impl Log {
             .map_err(|_| PushLogsError::RecordCountOutOfRange(records.len()))?;
         match self {
             Log::Sqlite(log) => {
-                if condition.is_some() {
-                    return Err(PushLogsError::ConditionalWritesUnsupported("sqlite"));
-                }
                 // A log too full answers as the log service of distributed Chroma, through the frontend.
-                log.push_logs(collection_id, records)
+                let first_inserted_record_offset = log
+                    .push_logs_with_condition(collection_id, records, condition.as_ref())
                     .await
                     .map_err(|e| match e {
                         SqlitePushLogsError::BackoffCompaction { retry_after } => {
@@ -266,11 +268,15 @@ impl Log {
                                 retry_after: Some(retry_after),
                             }
                         }
+                        SqlitePushLogsError::ConditionalWriteConflict => {
+                            PushLogsError::ConditionalWriteConflict
+                        }
+                        SqlitePushLogsError::StaleRead(err) => PushLogsError::StaleRead(err),
                         other => PushLogsError::Other(Box::new(other)),
                     })?;
                 Ok(PushLogsResult {
                     record_count,
-                    first_inserted_record_offset: None,
+                    first_inserted_record_offset,
                 })
             }
             Log::Grpc(log) => log

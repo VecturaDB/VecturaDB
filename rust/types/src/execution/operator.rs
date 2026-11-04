@@ -601,6 +601,9 @@ pub struct ProjectionOutput {
 pub struct GetResult {
     pub pulled_log_bytes: u64,
     pub result: ProjectionOutput,
+    /// On the single node, the last record of the log applied to the metadata segment that the get read,
+    /// in the same read of SQLite: the token of a conditional read, as log_upper_bound_offset in distributed Chroma.
+    pub applied_log_offset: Option<u64>,
 }
 
 impl GetResult {
@@ -619,6 +622,7 @@ impl TryFrom<chroma_proto::GetResult> for GetResult {
     fn try_from(value: chroma_proto::GetResult) -> Result<Self, Self::Error> {
         Ok(Self {
             pulled_log_bytes: value.pulled_log_bytes,
+            applied_log_offset: None,
             result: ProjectionOutput {
                 records: value
                     .records

@@ -4,10 +4,12 @@ use crate::{
     LocalCompactionManager, PurgeLogsMessage,
 };
 use async_trait::async_trait;
+use chroma_api_types::StaleReadError;
 use chroma_config::Configurable;
 use chroma_error::{ChromaError, ErrorCodes, WrappedSqlxError};
 use chroma_sqlite::{db::SqliteDb, helpers::get_embeddings_queue_topic_name};
 use chroma_system::{ChannelError, ComponentHandle, RequestError};
+use chroma_types::chroma_proto::PushLogsCondition;
 use chroma_types::{
     CollectionUuid, LogRecord, Operation, OperationRecord, ResetError, ResetResponse,
     ScalarEncoding, ScalarEncodingConversionError, SegmentType, UpdateMetadata,
@@ -18,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, SqliteConnection};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     str::FromStr,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
@@ -78,6 +80,15 @@ pub enum SqlitePushLogsError {
     // the flushes should have taken the log under the limit, which distributed Chroma does not give.
     #[error("log needs compaction; too full")]
     BackoffCompaction { retry_after: u64 },
+    // A conditional write that the log refuses, with the code and the message of the log service of distributed
+    // Chroma (rust/log-service/src/lib.rs: validate_conditional_log_bounds and the scan of the committed log).
+    #[error("conditional write conflict")]
+    ConditionalWriteConflict,
+    #[error("{1}")]
+    ConditionalWriteRefused(ErrorCodes, &'static str),
+    // A commit that the log can no longer check, stale as a read at its token, so that a client starts it again.
+    #[error("{0}")]
+    StaleRead(#[from] StaleReadError),
 }
 
 impl ChromaError for SqlitePushLogsError {
@@ -94,6 +105,9 @@ impl ChromaError for SqlitePushLogsError {
             SqlitePushLogsError::Unimplemented(_) => ErrorCodes::Unimplemented,
             SqlitePushLogsError::InvalidSparseMetadata => ErrorCodes::InvalidArgument,
             SqlitePushLogsError::BackoffCompaction { .. } => ErrorCodes::ResourceExhausted,
+            SqlitePushLogsError::ConditionalWriteConflict => ErrorCodes::Aborted,
+            SqlitePushLogsError::ConditionalWriteRefused(code, _) => *code,
+            SqlitePushLogsError::StaleRead(err) => err.code(),
         }
     }
 }
@@ -173,11 +187,26 @@ pub struct SqliteLog {
     compactor_handle: OnceLock<ComponentHandle<LocalCompactionManager>>,
     max_batch_size: OnceLock<u32>,
     num_records_before_backpressure: u64,
+    // See SqliteLogConfig::purge_cutoff_time_seconds.
+    purge_cutoff_time_seconds: u64,
+    // The collections that conditional transactions have used since this process started, shared by every copy of the log.
+    conditional_uses: Arc<Mutex<HashMap<CollectionUuid, ConditionalUse>>>,
     // The SPANN collections whose log was too full at the last round of the compactor, shared by every copy of the log,
     // as the set of the collections under backpressure of the log service of distributed Chroma.
     backpressure: Arc<Mutex<Arc<HashSet<CollectionUuid>>>>,
     // The rounds of the local compactor, for the seconds after which a refused write may be sent again.
     compaction_rounds: Arc<Mutex<Option<CompactionRounds>>>,
+}
+
+// The use of a collection by conditional transactions: the log keeps its records for the cutoff from the first use until the
+// cutoff after the last one, for the commits to check them.
+#[derive(Clone, Copy, Debug)]
+struct ConditionalUse {
+    last: Instant,
+    // The watermark at the first use: below it, records may have been purged at once, so a window that starts there may
+    // have lost records. No read of this use takes a token below it: it comes from a read before the use, as before a
+    // restart of the process.
+    kept_from: i64,
 }
 
 // The rounds of the local compactor: the next one starts compaction_interval after the end of the one before, as in
@@ -222,6 +251,8 @@ impl SqliteLog {
             max_batch_size: OnceLock::new(),
             num_records_before_backpressure:
                 SqliteLogConfig::default_num_records_before_backpressure(),
+            purge_cutoff_time_seconds: SqliteLogConfig::default_purge_cutoff_time_seconds(),
+            conditional_uses: Arc::default(),
             backpressure: Arc::default(),
             compaction_rounds: Arc::default(),
         }
@@ -256,6 +287,85 @@ impl SqliteLog {
     pub fn with_num_records_before_backpressure(mut self, records: u64) -> Self {
         self.num_records_before_backpressure = records;
         self
+    }
+
+    pub fn with_purge_cutoff_time_seconds(mut self, seconds: u64) -> Self {
+        self.purge_cutoff_time_seconds = seconds;
+        self
+    }
+
+    // The bound of SQLite on created_at, in UTC as CURRENT_TIMESTAMP writes it, of the records the purge may remove: the
+    // records of a collection in use by conditional transactions stay for the cutoff, the others go once applied, as in
+    // Chroma 1.5.9.
+    fn purge_cutoff(&self, collection_id: CollectionUuid) -> String {
+        let in_use = self
+            .conditional_uses
+            .lock()
+            .unwrap()
+            .get(&collection_id)
+            .is_some_and(|used| used.last.elapsed().as_secs() < self.purge_cutoff_time_seconds);
+        format!(
+            "-{} seconds",
+            if in_use {
+                self.purge_cutoff_time_seconds
+            } else {
+                0
+            }
+        )
+    }
+
+    /// A conditional transaction reads or writes a collection, before it does: the log keeps the records of the collection
+    /// for the cutoff from now until the cutoff after the last use. After a use that ended, this is a first use again.
+    pub async fn note_conditional_use(
+        &self,
+        collection_id: CollectionUuid,
+    ) -> Result<(), WrappedSqlxError> {
+        let now = Instant::now();
+        let cutoff = Duration::from_secs(self.purge_cutoff_time_seconds);
+        {
+            let mut uses = self.conditional_uses.lock().unwrap();
+            match uses.get_mut(&collection_id) {
+                Some(used) if used.last.elapsed() < cutoff => {
+                    used.last = now;
+                    return Ok(());
+                }
+                // Until the watermark is read, a commit is refused and starts again.
+                _ => {
+                    uses.insert(
+                        collection_id,
+                        ConditionalUse {
+                            last: now,
+                            kept_from: i64::MAX,
+                        },
+                    );
+                }
+            }
+        }
+        // After the use is noted: a purge that starts from now on keeps the records, and one that started before removes
+        // only records below the watermark it read, which is at most this one.
+        let kept_from = self.log_position(collection_id).await;
+        let mut uses = self.conditional_uses.lock().unwrap();
+        match kept_from {
+            Ok(kept_from) => {
+                if let Some(used) = uses.get_mut(&collection_id) {
+                    used.kept_from = kept_from;
+                }
+                Ok(())
+            }
+            Err(err) => {
+                uses.remove(&collection_id);
+                Err(err)
+            }
+        }
+    }
+
+    /// Whether conditional transactions have used the collection since this process started: its purges wait for their
+    /// timer, as they may remove the records of hours.
+    pub fn used_by_conditional_transactions(&self, collection_id: CollectionUuid) -> bool {
+        self.conditional_uses
+            .lock()
+            .unwrap()
+            .contains_key(&collection_id)
     }
 
     fn set_backpressure(&self, to_pressure: HashSet<CollectionUuid>) {
@@ -323,14 +433,190 @@ impl SqliteLog {
             .map_err(|_| SqlitePushLogsError::MaxBatchSizeSetError)
     }
 
+    // The offset of the next record of the log, as the scout of the log service gives the tail of a collection: the
+    // seq_id of SQLite is the offset of the single node, and it grows over the whole table, so the tail is its next one.
     pub(super) async fn scout_logs(
         &mut self,
         _collection_id: CollectionUuid,
         _starting_offset: i64,
     ) -> Result<u64, SqlitePullLogsError> {
-        Err(SqlitePullLogsError::NotImplemented(
-            "scout_logs".to_string(),
-        ))
+        let max: Option<i64> = sqlx::query_scalar("SELECT MAX(seq_id) FROM embeddings_queue")
+            .fetch_one(self.db.get_conn())
+            .await
+            .map_err(WrappedSqlxError)?;
+        Ok(max.unwrap_or(0) as u64 + 1)
+    }
+
+    // The seq_id up to which the records of a collection are applied to both its segments, as max_purge_seq_id: the
+    // compactor may purge the log below it, and a read sees every record up to it. It is what the log_position of a
+    // collection is to distributed Chroma, which the SQLite sysdb does not keep.
+    async fn applied_up_to(
+        conn: &mut SqliteConnection,
+        collection_id: CollectionUuid,
+    ) -> Result<i64, WrappedSqlxError> {
+        sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(MIN(COALESCE(CAST(max_seq_id.seq_id AS INTEGER), 0)), 0)
+            FROM segments
+            LEFT JOIN max_seq_id ON max_seq_id.segment_id = segments.id
+            WHERE segments.collection = ?
+            "#,
+        )
+        .bind(collection_id.0.to_string())
+        .fetch_one(conn)
+        .await
+        .map_err(WrappedSqlxError)
+    }
+
+    /// The log position of a collection for the stale reads of the conditional transactions: see applied_up_to.
+    pub async fn log_position(
+        &self,
+        collection_id: CollectionUuid,
+    ) -> Result<i64, WrappedSqlxError> {
+        let mut conn = self
+            .db
+            .get_conn()
+            .acquire()
+            .await
+            .map_err(WrappedSqlxError)?;
+        Self::applied_up_to(&mut conn, collection_id).await
+    }
+
+    // A use of the collection keeps its records for the cutoff, from the watermark at its start: below that, or below
+    // the watermark with a record older than the cutoff before the window, the window may have lost records. seq_id
+    // grows with time, so every record after the one before the window, of any collection, is as new as it. That
+    // record is one lookup in the primary key, where the first record within the cutoff would be a walk over those a
+    // purge has yet to remove, in the write lock.
+    async fn may_be_purged(
+        &self,
+        conn: &mut SqliteConnection,
+        collection_id: CollectionUuid,
+        observed: i64,
+    ) -> Result<bool, WrappedSqlxError> {
+        let kept_from = self
+            .conditional_uses
+            .lock()
+            .unwrap()
+            .get(&collection_id)
+            .map_or(i64::MAX, |used| used.kept_from);
+        Ok(observed < kept_from
+            || (observed < Self::applied_up_to(&mut *conn, collection_id).await?
+                && sqlx::query_scalar::<_, bool>(
+                    "SELECT COALESCE((SELECT created_at <= datetime('now', ?) FROM embeddings_queue \
+                     WHERE seq_id <= ? ORDER BY seq_id DESC LIMIT 1), 1)",
+                )
+                .bind(format!("-{} seconds", self.purge_cutoff_time_seconds))
+                .bind(observed)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(WrappedSqlxError)?))
+    }
+
+    // Whether a later read of a transaction, on segments that applied the log up to `applied`, answers what its records held
+    // at its token. The segments hold only the current state, so it does when the log shows that no record at or after the
+    // token, up to what they applied, touched them. A token past what they applied, or a window the log may have lost, cannot
+    // be checked and does not stand.
+    pub async fn read_stands_at_token(
+        &mut self,
+        collection_id: CollectionUuid,
+        token: i64,
+        applied: i64,
+        read_ids: &HashSet<&str>,
+    ) -> Result<bool, WrappedSqlxError> {
+        if token > applied + 1 {
+            return Ok(false);
+        }
+        let purged = self
+            .get_legacy_embeddings_queue_config()
+            .await
+            .map_or(true, |config| config.automatically_purge);
+        let topic =
+            get_embeddings_queue_topic_name(&self.tenant_id, &self.topic_namespace, collection_id);
+        let mut tx = self.db.get_conn().begin().await.map_err(WrappedSqlxError)?;
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM embeddings_queue WHERE topic = ? AND seq_id >= ? AND seq_id <= ?",
+        )
+        .bind(topic)
+        .bind(token)
+        .bind(applied)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(WrappedSqlxError)?;
+        if purged && self.may_be_purged(&mut tx, collection_id, token).await? {
+            return Ok(false);
+        }
+        Ok(!ids.iter().any(|id| read_ids.contains(id.as_str())))
+    }
+
+    // As validate_conditional_log_bounds and the scan of the committed log of the log service of distributed Chroma, in
+    // the transaction of the write: the window goes from the observed offset to the tail; the readable lower bound is
+    // the watermark up to which the compactor may have purged the log of the collection (the lower of the watermarks of
+    // its segments, as max_purge_seq_id), or 0 when the log is never purged; a record in the window with an id read or
+    // written is a conflict.
+    async fn check_condition(
+        &self,
+        tx: &mut SqliteConnection,
+        topic: &str,
+        collection_id: CollectionUuid,
+        condition: &PushLogsCondition,
+        write_ids: &HashSet<String>,
+        purged: bool,
+    ) -> Result<(), SqlitePushLogsError> {
+        let refused = SqlitePushLogsError::ConditionalWriteRefused;
+        if condition.observed_log_offset < 0 {
+            return Err(refused(
+                ErrorCodes::InvalidArgument,
+                "observed_log_offset must be non-negative",
+            ));
+        }
+        if condition.read_ids.iter().any(String::is_empty) {
+            return Err(refused(
+                ErrorCodes::InvalidArgument,
+                "read_ids must not contain empty ids",
+            ));
+        }
+        if write_ids.contains("") {
+            return Err(refused(
+                ErrorCodes::InvalidArgument,
+                "records must not contain empty ids",
+            ));
+        }
+        let observed = condition.observed_log_offset;
+        let max: Option<i64> = sqlx::query_scalar("SELECT MAX(seq_id) FROM embeddings_queue")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(WrappedSqlxError)?;
+        if observed > max.unwrap_or(0) + 1 {
+            return Err(refused(
+                ErrorCodes::InvalidArgument,
+                "observed_log_offset is beyond the current log tail",
+            ));
+        }
+        if purged
+            && self
+                .may_be_purged(&mut *tx, collection_id, observed)
+                .await?
+        {
+            return Err(StaleReadError::version_purged(
+                observed as u64,
+                "observed_log_offset is before the readable log lower bound",
+            )
+            .into());
+        }
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM embeddings_queue WHERE topic = ? AND seq_id >= ?")
+                .bind(topic)
+                .bind(observed)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(WrappedSqlxError)?;
+        if ids
+            .iter()
+            .any(|id| write_ids.contains(id) || condition.read_ids.contains(id))
+        {
+            return Err(SqlitePushLogsError::ConditionalWriteConflict);
+        }
+        Ok(())
     }
 
     pub(super) async fn read(
@@ -467,14 +753,37 @@ impl SqliteLog {
         Ok(count as u64)
     }
 
+    // A write without a condition, as the tests of the log write.
+    #[cfg(test)]
     pub(super) async fn push_logs(
         &mut self,
         collection_id: CollectionUuid,
         records: Vec<OperationRecord>,
     ) -> Result<(), SqlitePushLogsError> {
+        self.push_logs_with_condition(collection_id, records, None)
+            .await
+            .map(|_| ())
+    }
+
+    // A write to the log; with a condition, the conditional write of distributed Chroma, which answers the position of its
+    // first record.
+    pub(super) async fn push_logs_with_condition(
+        &mut self,
+        collection_id: CollectionUuid,
+        records: Vec<OperationRecord>,
+        condition: Option<&PushLogsCondition>,
+    ) -> Result<Option<i64>, SqlitePushLogsError> {
         if records.is_empty() {
-            return Ok(());
+            // As the log service of distributed Chroma: a commit of a delete with a filter has no records.
+            if condition.is_some() {
+                return Err(SqlitePushLogsError::ConditionalWriteRefused(
+                    ErrorCodes::InvalidArgument,
+                    "Too few records",
+                ));
+            }
+            return Ok(None);
         }
+        let write_ids: HashSet<String> = records.iter().map(|record| record.id.clone()).collect();
         self.check_for_backpressure(collection_id).await?;
 
         let topic =
@@ -513,7 +822,40 @@ impl SqliteLog {
             .get()
             .copied()
             .unwrap_or(DEFAULT_MAX_BATCH_SIZE) as usize;
-        let mut tx = self.db.get_conn().begin().await.map_err(WrappedSqlxError)?;
+        // A conditional write takes the write lock of SQLite before its check, so that no write comes between the check
+        // and its own, as the admission of the log service of distributed Chroma.
+        // Whether the log is purged, read before the transaction: a database in memory has one connection, which the
+        // transaction holds.
+        if condition.is_some() {
+            self.note_conditional_use(collection_id)
+                .await
+                .map_err(SqlitePushLogsError::from)?;
+        }
+        let purged = match condition {
+            Some(_) => self
+                .get_legacy_embeddings_queue_config()
+                .await
+                .map_or(true, |config| config.automatically_purge),
+            None => false,
+        };
+        let mut tx = if condition.is_some() {
+            self.db.get_conn().begin_with("BEGIN IMMEDIATE").await
+        } else {
+            self.db.get_conn().begin().await
+        }
+        .map_err(WrappedSqlxError)?;
+        if let Some(condition) = condition {
+            self.check_condition(
+                &mut tx,
+                &topic,
+                collection_id,
+                condition,
+                &write_ids,
+                purged,
+            )
+            .await?;
+        }
+        let mut first_inserted_record_offset = None;
         for batch in records_and_serialized_metadatas.chunks(max_batch_size) {
             let mut query_builder = QueryBuilder::new(
                 "INSERT INTO embeddings_queue (topic, id, operation, vector, encoding, metadata) ",
@@ -531,8 +873,19 @@ impl SqliteLog {
                 builder.push_bind(record.encoding.as_ref().map(String::from));
                 builder.push_bind(serialized_metadata);
             });
-            let query = query_builder.build();
-            query.execute(&mut *tx).await.map_err(WrappedSqlxError)?;
+            if condition.is_some() {
+                query_builder.push(" RETURNING seq_id");
+                let seq_ids = query_builder
+                    .build_query_scalar::<i64>()
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(WrappedSqlxError)?;
+                first_inserted_record_offset =
+                    first_inserted_record_offset.or(seq_ids.into_iter().min());
+            } else {
+                let query = query_builder.build();
+                query.execute(&mut *tx).await.map_err(WrappedSqlxError)?;
+            }
         }
         tx.commit().await.map_err(WrappedSqlxError)?;
 
@@ -558,7 +911,7 @@ impl SqliteLog {
             purge_result?;
         }
 
-        Ok(())
+        Ok(first_inserted_record_offset)
     }
 
     pub(super) async fn get_collections_with_new_data(
@@ -697,10 +1050,11 @@ impl SqliteLog {
         let topic =
             get_embeddings_queue_topic_name(&self.tenant_id, &self.topic_namespace, collection_id);
         sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM embeddings_queue WHERE topic = ? AND seq_id < ?)",
+            "SELECT EXISTS(SELECT 1 FROM embeddings_queue WHERE topic = ? AND seq_id < ? AND created_at <= datetime('now', ?))",
         )
         .bind(topic)
         .bind(seq_id as i64)
+        .bind(self.purge_cutoff(collection_id))
         .fetch_one(self.db.get_conn())
         .await
         .map_err(|err| SqlitePurgeLogsError::from(WrappedSqlxError(err)))
@@ -720,9 +1074,13 @@ impl SqliteLog {
         let topic =
             get_embeddings_queue_topic_name(&self.tenant_id, &self.topic_namespace, collection_id);
 
-        sqlx::query("DELETE FROM embeddings_queue WHERE topic = ? AND seq_id < ?")
-            .bind(topic)
-            .bind(seq_id as i64)
+        // The records of a collection in use by conditional transactions stay for purge_cutoff_time_seconds.
+        sqlx::query(
+            "DELETE FROM embeddings_queue WHERE topic = ? AND seq_id < ? AND created_at <= datetime('now', ?)",
+        )
+        .bind(topic)
+        .bind(seq_id as i64)
+        .bind(self.purge_cutoff(collection_id))
             .execute(self.db.get_conn())
             .await
             .map_err(WrappedSqlxError)?;
@@ -949,7 +1307,8 @@ impl Configurable<SqliteLogConfig> for SqliteLog {
             config.tenant_id.clone(),
             config.topic_namespace.clone(),
         )
-        .with_num_records_before_backpressure(config.num_records_before_backpressure);
+        .with_num_records_before_backpressure(config.num_records_before_backpressure)
+        .with_purge_cutoff_time_seconds(config.purge_cutoff_time_seconds);
 
         // This populates the legacy config if not present (when upgrading from an old version)
         log.get_legacy_embeddings_queue_config()
@@ -984,6 +1343,593 @@ mod tests {
         .unwrap();
 
         SqliteLog::new(db, "default".to_string(), "default".to_string())
+    }
+
+    fn conditional_record(id: &str) -> OperationRecord {
+        OperationRecord {
+            id: id.into(),
+            embedding: Some(vec![1.0, 2.0]),
+            encoding: Some(ScalarEncoding::FLOAT32),
+            metadata: None,
+            document: None,
+            operation: Operation::Upsert,
+        }
+    }
+
+    fn condition(observed_log_offset: i64, read_ids: &[&str]) -> PushLogsCondition {
+        PushLogsCondition {
+            observed_log_offset,
+            read_ids: read_ids.iter().map(|id| id.to_string()).collect(),
+        }
+    }
+
+    async fn push_conditional(
+        log: &mut SqliteLog,
+        collection: CollectionUuid,
+        ids: &[&str],
+        condition: &PushLogsCondition,
+    ) -> Result<Option<i64>, SqlitePushLogsError> {
+        log.push_logs_with_condition(
+            collection,
+            ids.iter().map(|id| conditional_record(id)).collect(),
+            Some(condition),
+        )
+        .await
+    }
+
+    // As the log service of distributed Chroma: a conditional write is refused with a conflict when a record written
+    // after the offset it observed has an id it read or writes, and accepted otherwise; the scout gives the offset of
+    // the next record.
+    #[tokio::test]
+    async fn a_conditional_write_conflicts_with_a_record_written_after_its_offset() {
+        let mut log = setup_sqlite_log().await;
+        let collection = CollectionUuid::new();
+        log.push_logs(collection, vec![conditional_record("a")])
+            .await
+            .unwrap();
+        let observed = log.scout_logs(collection, 0).await.unwrap() as i64;
+        assert_eq!(observed, 2);
+        log.push_logs(collection, vec![conditional_record("b")])
+            .await
+            .unwrap();
+        assert_eq!(log.scout_logs(collection, 0).await.unwrap(), 3);
+        // Written after the offset: b, read or written.
+        assert!(matches!(
+            push_conditional(&mut log, collection, &["c"], &condition(observed, &["b"])).await,
+            Err(SqlitePushLogsError::ConditionalWriteConflict)
+        ));
+        assert!(matches!(
+            push_conditional(&mut log, collection, &["b"], &condition(observed, &[])).await,
+            Err(SqlitePushLogsError::ConditionalWriteConflict)
+        ));
+        // a was written before the offset; a record of another collection does not count.
+        log.push_logs(CollectionUuid::new(), vec![conditional_record("d")])
+            .await
+            .unwrap();
+        push_conditional(&mut log, collection, &["d"], &condition(observed, &["a"]))
+            .await
+            .unwrap();
+        // The refused writes wrote nothing: b, then d.
+        assert_eq!(log.scout_logs(collection, 0).await.unwrap(), 5);
+    }
+
+    // As the log service of distributed Chroma, a conditional write of no records is refused, as it would change nothing that
+    // the client asked; a write without a condition of no records has nothing to do.
+    #[tokio::test]
+    async fn a_conditional_write_of_no_records_is_refused() {
+        let mut log = setup_sqlite_log().await;
+        let collection = CollectionUuid::new();
+        assert!(matches!(
+            push_conditional(&mut log, collection, &[], &condition(1, &[])).await,
+            Err(SqlitePushLogsError::ConditionalWriteRefused(
+                ErrorCodes::InvalidArgument,
+                "Too few records"
+            ))
+        ));
+        log.push_logs(collection, Vec::new()).await.unwrap();
+    }
+
+    // As the log service of distributed Chroma, a conditional write answers the position of its first record, whatever the
+    // batches it takes.
+    #[tokio::test]
+    async fn a_conditional_write_answers_the_position_of_its_first_record() {
+        let mut log = setup_sqlite_log().await;
+        log.init_max_batch_size(2).unwrap();
+        let collection = CollectionUuid::new();
+        log.push_logs(collection, vec![conditional_record("a")])
+            .await
+            .unwrap();
+        let observed = log.scout_logs(collection, 0).await.unwrap() as i64;
+        assert_eq!(
+            push_conditional(
+                &mut log,
+                collection,
+                &["b", "c", "d"],
+                &condition(observed, &["a"])
+            )
+            .await
+            .unwrap(),
+            Some(observed)
+        );
+        assert_eq!(
+            log.scout_logs(collection, 0).await.unwrap() as i64,
+            observed + 3
+        );
+    }
+
+    // A later read stands when the log shows that no record at or after its token, up to what the segments applied, touched
+    // what it read. A token past what they applied, or a window the log may have lost, does not stand.
+    #[tokio::test]
+    async fn a_later_read_stands_when_the_log_shows_its_records_did_not_change() {
+        let mut log = setup_sqlite_log()
+            .await
+            .with_purge_cutoff_time_seconds(3_600);
+        // As a server that starts on an empty log, which purges it.
+        log.get_legacy_embeddings_queue_config().await.unwrap();
+        let collection = CollectionUuid::new();
+        log.note_conditional_use(collection).await.unwrap();
+        log.push_logs(
+            collection,
+            vec![
+                conditional_record("a"),
+                conditional_record("b"),
+                conditional_record("c"),
+            ],
+        )
+        .await
+        .unwrap();
+        let cases: &[(i64, i64, &[&str], bool)] = &[
+            (2, 3, &["a"], true),
+            (2, 3, &["a", "b"], false),
+            (2, 3, &["c"], false),
+            // A record past what the segments applied does not count; a token past them cannot be read.
+            (2, 2, &["c"], true),
+            (3, 2, &["c"], true),
+            (4, 2, &["a"], false),
+        ];
+        for (token, applied, ids, stands) in cases {
+            let read_ids = ids.iter().copied().collect();
+            assert_eq!(
+                log.read_stands_at_token(collection, *token, *applied, &read_ids)
+                    .await
+                    .unwrap(),
+                *stands,
+                "token {token}, applied {applied}, ids {ids:?}"
+            );
+        }
+        // Below the watermark, with a record older than the cutoff at the start of the window, the log may have lost records.
+        let read_ids = ["a"].into_iter().collect();
+        sqlx::query(
+            "UPDATE embeddings_queue SET created_at = datetime('now', '-7200 seconds') WHERE seq_id = 2",
+        )
+        .execute(log.db.get_conn())
+        .await
+        .unwrap();
+        assert!(log
+            .read_stands_at_token(collection, 2, 3, &read_ids)
+            .await
+            .unwrap());
+        applied_up_to_for_the_tests(&log, collection, 3).await;
+        assert!(!log
+            .read_stands_at_token(collection, 2, 3, &read_ids)
+            .await
+            .unwrap());
+    }
+
+    // The bounds of the log service of distributed Chroma: an offset that is negative or beyond the tail, or empty ids,
+    // are invalid; an offset below what the compactor applied, so that the log may be purged, cannot be checked and is
+    // refused, not passed.
+    #[tokio::test]
+    async fn a_conditional_write_is_refused_outside_the_readable_log() {
+        let mut log = setup_sqlite_log().await.with_purge_cutoff_time_seconds(0);
+        // As a server that starts on an empty log, which purges it.
+        log.get_legacy_embeddings_queue_config().await.unwrap();
+        let collection = CollectionUuid::new();
+        log.push_logs(
+            collection,
+            vec![conditional_record("a"), conditional_record("b")],
+        )
+        .await
+        .unwrap();
+        let refused = |result: Result<Option<i64>, SqlitePushLogsError>| match result {
+            Err(SqlitePushLogsError::ConditionalWriteRefused(code, message)) => (code, message),
+            other => panic!("not refused: {other:?}"),
+        };
+        assert_eq!(
+            refused(push_conditional(&mut log, collection, &["c"], &condition(-1, &[])).await),
+            (
+                ErrorCodes::InvalidArgument,
+                "observed_log_offset must be non-negative"
+            )
+        );
+        assert_eq!(
+            refused(push_conditional(&mut log, collection, &["c"], &condition(4, &[])).await),
+            (
+                ErrorCodes::InvalidArgument,
+                "observed_log_offset is beyond the current log tail"
+            )
+        );
+        assert_eq!(
+            refused(push_conditional(&mut log, collection, &["c"], &condition(3, &[""])).await),
+            (
+                ErrorCodes::InvalidArgument,
+                "read_ids must not contain empty ids"
+            )
+        );
+        assert_eq!(
+            refused(push_conditional(&mut log, collection, &[""], &condition(3, &[])).await),
+            (
+                ErrorCodes::InvalidArgument,
+                "records must not contain empty ids"
+            )
+        );
+        // Both segments of the collection applied up to 2.
+        for (segment, scope) in [("m", "METADATA"), ("v", "VECTOR")] {
+            sqlx::query("INSERT INTO segments (id, type, scope, collection) VALUES (?, ?, ?, ?)")
+                .bind(segment)
+                .bind(segment)
+                .bind(scope)
+                .bind(collection.0.to_string())
+                .execute(log.db.get_conn())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO max_seq_id (segment_id, seq_id) VALUES (?, 2)")
+                .bind(segment)
+                .execute(log.db.get_conn())
+                .await
+                .unwrap();
+        }
+        assert_eq!(log.log_position(collection).await.unwrap(), 2);
+        assert!(matches!(
+            push_conditional(&mut log, collection, &["c"], &condition(1, &[])).await,
+            Err(SqlitePushLogsError::StaleRead(_))
+        ));
+        push_conditional(&mut log, collection, &["c"], &condition(2, &[]))
+            .await
+            .unwrap();
+    }
+
+    // The records applied stay in the log for purge_cutoff_time_seconds, as distributed Chroma keeps its log for the
+    // versions of relative_cutoff_time_seconds: a conditional write that observed an offset below the watermark of the
+    // compactor is still checked against them, and after the purge, with a cutoff of 0, it is refused.
+    #[tokio::test]
+    async fn the_log_applied_stays_for_the_cutoff_and_conditional_writes_check_it() {
+        // The cutoff of distributed Chroma (relative_cutoff_time_seconds in rust/garbage_collector/garbage_collector_config.yaml).
+        assert_eq!(SqliteLogConfig::default().purge_cutoff_time_seconds, 43_200);
+        let mut log = setup_sqlite_log().await;
+        // As a server that starts on an empty log, which purges it.
+        log.get_legacy_embeddings_queue_config().await.unwrap();
+        let collection = CollectionUuid::new();
+        log.note_conditional_use(collection).await.unwrap();
+        log.push_logs(collection, vec![conditional_record("a")])
+            .await
+            .unwrap();
+        let observed = log.scout_logs(collection, 0).await.unwrap() as i64;
+        log.push_logs(
+            collection,
+            vec![conditional_record("b"), conditional_record("c")],
+        )
+        .await
+        .unwrap();
+        // Both segments applied every record: the watermark is past the observed offset.
+        for (segment, scope) in [("m", "METADATA"), ("v", "VECTOR")] {
+            sqlx::query("INSERT INTO segments (id, type, scope, collection) VALUES (?, ?, ?, ?)")
+                .bind(segment)
+                .bind(segment)
+                .bind(scope)
+                .bind(collection.0.to_string())
+                .execute(log.db.get_conn())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO max_seq_id (segment_id, seq_id) VALUES (?, 3)")
+                .bind(segment)
+                .execute(log.db.get_conn())
+                .await
+                .unwrap();
+        }
+        let rows = |log: &SqliteLog| {
+            let pool = log.db.get_conn().clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM embeddings_queue")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(!log.has_purge_work(collection, 3).await.unwrap());
+        log.purge_logs(collection, 3).await.unwrap();
+        assert_eq!(rows(&log).await, 3);
+        assert!(matches!(
+            push_conditional(&mut log, collection, &["d"], &condition(observed, &["b"])).await,
+            Err(SqlitePushLogsError::ConditionalWriteConflict)
+        ));
+        push_conditional(&mut log, collection, &["d"], &condition(observed, &["a"]))
+            .await
+            .unwrap();
+        let mut log = log.with_purge_cutoff_time_seconds(0);
+        assert!(log.has_purge_work(collection, 3).await.unwrap());
+        log.purge_logs(collection, 3).await.unwrap();
+        assert_eq!(rows(&log).await, 2);
+        assert!(matches!(
+            push_conditional(&mut log, collection, &["e"], &condition(observed, &[])).await,
+            Err(SqlitePushLogsError::StaleRead(_))
+        ));
+    }
+
+    // Below the watermark, a window is whole only when the record before it was written within the cutoff, since the purge
+    // removes the records older than the cutoff, the oldest first: as the readable log lower bound of distributed Chroma.
+    #[tokio::test]
+    async fn a_conditional_write_below_the_watermark_needs_its_window_kept() {
+        let mut log = setup_sqlite_log()
+            .await
+            .with_purge_cutoff_time_seconds(3_600);
+        // As a server that starts on an empty log, which purges it.
+        log.get_legacy_embeddings_queue_config().await.unwrap();
+        let collection = CollectionUuid::new();
+        log.note_conditional_use(collection).await.unwrap();
+        log.push_logs(
+            collection,
+            vec![
+                conditional_record("a"),
+                conditional_record("b"),
+                conditional_record("c"),
+            ],
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE embeddings_queue SET created_at = datetime('now', '-7200 seconds') WHERE seq_id = 2",
+        )
+        .execute(log.db.get_conn())
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM embeddings_queue WHERE seq_id = 1")
+            .execute(log.db.get_conn())
+            .await
+            .unwrap();
+        for (segment, scope) in [("m", "METADATA"), ("v", "VECTOR")] {
+            sqlx::query("INSERT INTO segments (id, type, scope, collection) VALUES (?, ?, ?, ?)")
+                .bind(segment)
+                .bind(segment)
+                .bind(scope)
+                .bind(collection.0.to_string())
+                .execute(log.db.get_conn())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO max_seq_id (segment_id, seq_id) VALUES (?, 4)")
+                .bind(segment)
+                .execute(log.db.get_conn())
+                .await
+                .unwrap();
+        }
+        // Record 3 is within the cutoff: the window from it is whole.
+        push_conditional(&mut log, collection, &["d"], &condition(3, &[]))
+            .await
+            .unwrap();
+        // Record 2 is older than the cutoff, and record 1 is gone, with nothing before it: the window may have lost records.
+        for observed in [2, 1] {
+            assert!(
+                matches!(
+                    push_conditional(&mut log, collection, &["e"], &condition(observed, &[])).await,
+                    Err(SqlitePushLogsError::StaleRead(_))
+                ),
+                "offset {observed}"
+            );
+        }
+    }
+
+    async fn applied_up_to_for_the_tests(log: &SqliteLog, collection: CollectionUuid, seq_id: i64) {
+        for (segment, scope) in [("m", "METADATA"), ("v", "VECTOR")] {
+            sqlx::query("INSERT INTO segments (id, type, scope, collection) VALUES (?, ?, ?, ?)")
+                .bind(segment)
+                .bind(segment)
+                .bind(scope)
+                .bind(collection.0.to_string())
+                .execute(log.db.get_conn())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO max_seq_id (segment_id, seq_id) VALUES (?, ?)")
+                .bind(segment)
+                .bind(seq_id)
+                .execute(log.db.get_conn())
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn rows_of_the_tests(log: &SqliteLog) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM embeddings_queue")
+            .fetch_one(log.db.get_conn())
+            .await
+            .unwrap()
+    }
+
+    // The position of a collection is the lower of the watermarks of its segments, as max_purge_seq_id, and a segment with
+    // no watermark has applied nothing.
+    #[tokio::test]
+    async fn the_position_of_a_collection_is_the_lower_watermark() {
+        let log = setup_sqlite_log().await;
+        let collection = CollectionUuid::new();
+        for (segment, scope) in [("m", "METADATA"), ("v", "VECTOR")] {
+            sqlx::query("INSERT INTO segments (id, type, scope, collection) VALUES (?, ?, ?, ?)")
+                .bind(segment)
+                .bind(segment)
+                .bind(scope)
+                .bind(collection.0.to_string())
+                .execute(log.db.get_conn())
+                .await
+                .unwrap();
+        }
+        let watermark = |segment: &'static str, seq_id: i64| {
+            let pool = log.db.get_conn().clone();
+            async move {
+                sqlx::query("INSERT OR REPLACE INTO max_seq_id (segment_id, seq_id) VALUES (?, ?)")
+                    .bind(segment)
+                    .bind(seq_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        };
+        watermark("m", 4).await;
+        assert_eq!(log.log_position(collection).await.unwrap(), 0);
+        watermark("v", 2).await;
+        assert_eq!(log.log_position(collection).await.unwrap(), 2);
+    }
+
+    // A conditional write takes the write lock before its check: a write that holds the lock and commits meanwhile falls in
+    // the check, and the conditional write conflicts with it, as the admission of the log service of distributed Chroma.
+    #[tokio::test]
+    async fn a_conditional_write_checks_with_the_write_lock() {
+        let mut log = setup_sqlite_log().await;
+        let collection = CollectionUuid::new();
+        log.push_logs(collection, vec![conditional_record("a")])
+            .await
+            .unwrap();
+        let observed = log.scout_logs(collection, 0).await.unwrap() as i64;
+        let mut writer = log.db.get_conn().acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO embeddings_queue (operation, topic, id, vector, encoding, metadata) \
+             SELECT operation, topic, id, vector, encoding, metadata FROM embeddings_queue WHERE id = 'a'",
+        )
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+        let mut waiting = log.clone();
+        let write = tokio::spawn(async move {
+            push_conditional(
+                &mut waiting,
+                collection,
+                &["b"],
+                &condition(observed, &["a"]),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
+        assert!(matches!(
+            write.await.unwrap(),
+            Err(SqlitePushLogsError::ConditionalWriteConflict)
+        ));
+    }
+
+    // The log keeps the records applied only of a collection that conditional transactions use; the others purge them at
+    // once, as Chroma 1.5.9.
+    #[tokio::test]
+    async fn the_log_keeps_the_records_only_of_the_collections_in_use() {
+        let mut log = setup_sqlite_log().await;
+        // As a server that starts on an empty log, which purges it.
+        log.get_legacy_embeddings_queue_config().await.unwrap();
+        let (in_use, other) = (CollectionUuid::new(), CollectionUuid::new());
+        log.note_conditional_use(in_use).await.unwrap();
+        assert!(log.used_by_conditional_transactions(in_use));
+        assert!(!log.used_by_conditional_transactions(other));
+        log.push_logs(in_use, vec![conditional_record("a")])
+            .await
+            .unwrap();
+        log.push_logs(other, vec![conditional_record("b")])
+            .await
+            .unwrap();
+        assert!(!log.has_purge_work(in_use, 3).await.unwrap());
+        log.purge_logs(in_use, 3).await.unwrap();
+        assert_eq!(rows_of_the_tests(&log).await, 2);
+        assert!(log.has_purge_work(other, 3).await.unwrap());
+        log.purge_logs(other, 3).await.unwrap();
+        assert_eq!(rows_of_the_tests(&log).await, 1);
+    }
+
+    // Records may have been purged at once before the first use of a collection, as by a process before a restart: a commit
+    // whose window starts below the watermark of that first use is refused, and the client starts again.
+    #[tokio::test]
+    async fn a_commit_older_than_the_first_use_of_the_collection_is_refused() {
+        let mut log = setup_sqlite_log().await;
+        // As a server that starts on an empty log, which purges it.
+        log.get_legacy_embeddings_queue_config().await.unwrap();
+        let collection = CollectionUuid::new();
+        log.push_logs(
+            collection,
+            vec![
+                conditional_record("a"),
+                conditional_record("b"),
+                conditional_record("c"),
+            ],
+        )
+        .await
+        .unwrap();
+        applied_up_to_for_the_tests(&log, collection, 3).await;
+        assert!(matches!(
+            push_conditional(&mut log, collection, &["d"], &condition(2, &[])).await,
+            Err(SqlitePushLogsError::StaleRead(_))
+        ));
+        // From the watermark on, nothing was purged.
+        push_conditional(&mut log, collection, &["d"], &condition(3, &[]))
+            .await
+            .unwrap();
+    }
+
+    // A use ends a cutoff after its last read or write: the purges go back to at once, and the next use is a first use again.
+    #[tokio::test]
+    async fn a_use_that_ended_is_a_first_use_again() {
+        let mut log = setup_sqlite_log().await.with_purge_cutoff_time_seconds(1);
+        // As a server that starts on an empty log, which purges it.
+        log.get_legacy_embeddings_queue_config().await.unwrap();
+        let collection = CollectionUuid::new();
+        log.note_conditional_use(collection).await.unwrap();
+        log.push_logs(
+            collection,
+            vec![conditional_record("a"), conditional_record("b")],
+        )
+        .await
+        .unwrap();
+        applied_up_to_for_the_tests(&log, collection, 3).await;
+        // Written within the cutoff, in use: they stay, and a window from them is whole.
+        log.purge_logs(collection, 3).await.unwrap();
+        assert_eq!(rows_of_the_tests(&log).await, 2);
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+        // The use ended: the purge takes them, and it stays used for the timer of its purges.
+        log.purge_logs(collection, 3).await.unwrap();
+        assert_eq!(rows_of_the_tests(&log).await, 0);
+        assert!(log.used_by_conditional_transactions(collection));
+        // A record of another collection, written just now at the offset, says nothing of the window after it.
+        let other = CollectionUuid::new();
+        log.push_logs(other, vec![conditional_record("z")])
+            .await
+            .unwrap();
+        assert!(matches!(
+            push_conditional(&mut log, collection, &["c"], &condition(2, &[])).await,
+            Err(SqlitePushLogsError::StaleRead(_))
+        ));
+    }
+
+    // A database in memory has one connection, which the transaction of a conditional write holds: the write reads
+    // nothing else through the pool, and answers at once, not after the timeout of the pool (30 s).
+    #[tokio::test]
+    async fn a_conditional_write_on_a_database_in_memory_answers_at_once() {
+        let db = SqliteDb::try_from_config(
+            &SqliteDBConfig {
+                url: None,
+                migration_mode: chroma_sqlite::config::MigrationMode::Apply,
+                hash_type: chroma_sqlite::config::MigrationHash::SHA256,
+                ..Default::default()
+            },
+            &Registry::new(),
+        )
+        .await
+        .unwrap();
+        let mut log = SqliteLog::new(db, "default".to_string(), "default".to_string());
+        let collection = CollectionUuid::new();
+        let observed = log.scout_logs(collection, 0).await.unwrap() as i64;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            push_conditional(&mut log, collection, &["a"], &condition(observed, &["a"])),
+        )
+        .await
+        .expect("a conditional write on a database in memory waited for the pool")
+        .unwrap();
     }
 
     #[tokio::test]

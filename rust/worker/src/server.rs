@@ -434,6 +434,7 @@ impl WorkerServer {
             Ok(GetResult {
                 pulled_log_bytes,
                 result,
+                ..
             }) => Ok(Response::new(chroma_proto::GetResult {
                 records: result
                     .records

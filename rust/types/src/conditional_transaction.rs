@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use chroma_api_types::{OccReadMode, OccReadToken};
+use chroma_api_types::{OccReadMode, OccReadToken, StaleReadError};
 use chroma_error::{ChromaError, ErrorCodes};
 use thiserror::Error;
 
@@ -505,6 +505,9 @@ pub enum ConditionalCommitError {
     InvalidDatabaseName,
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
+    // Not transparent: the name of the error goes by its chain of sources, which has to hold it.
+    #[error("{0}")]
+    StaleRead(#[from] StaleReadError),
     #[error(transparent)]
     Other(#[from] Box<dyn ChromaError>),
 }
@@ -518,6 +521,7 @@ impl ChromaError for ConditionalCommitError {
             ConditionalCommitError::Backoff => ErrorCodes::ResourceExhausted,
             ConditionalCommitError::InvalidDatabaseName => ErrorCodes::InvalidArgument,
             ConditionalCommitError::InvalidArgument(_) => ErrorCodes::InvalidArgument,
+            ConditionalCommitError::StaleRead(err) => err.code(),
             ConditionalCommitError::Other(err) => err.code(),
         }
     }

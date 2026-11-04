@@ -74,6 +74,10 @@ impl SqliteDb {
         let options = self.conn.connect_options();
         let wal = std::path::PathBuf::from(format!("{}-wal", options.get_filename().display()));
         while wal.exists() {
+            // A connection that comes back to the pool during the close stays open in it, as the wait of sqlx ends with the
+            // last permit, which that connection gives back: a close again takes it, within the grace.
+            let remaining = grace.saturating_sub(started.elapsed());
+            let _ = tokio::time::timeout(remaining, self.conn.close()).await;
             match SqliteConnection::connect_with(&options).await {
                 Ok(mut alone) => {
                     let _ = sqlx::query("SELECT COUNT(*) FROM sqlite_master")

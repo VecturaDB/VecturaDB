@@ -2642,7 +2642,8 @@ impl From<(SearchResult, Vec<SearchPayload>)> for SearchResponse {
 pub enum QueryError {
     #[error("Error executing plan: {0}")]
     Executor(#[from] ExecutorError),
-    #[error(transparent)]
+    // Not transparent: the name of the error goes by its chain of sources, which has to hold it.
+    #[error("{0}")]
     StaleRead(#[from] StaleReadError),
     #[error(transparent)]
     Other(#[from] Box<dyn ChromaError>),

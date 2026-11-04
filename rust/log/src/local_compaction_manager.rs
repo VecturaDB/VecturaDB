@@ -73,6 +73,10 @@ pub struct LocalCompactionManagerConfig {
     /// setting of its own.
     #[serde(default = "LocalCompactionManagerConfig::default_shutdown_grace_sec")]
     pub shutdown_grace_sec: u64,
+    /// How often the log of a collection that conditional transactions use is purged, as gc_interval_mins (120) of the
+    /// garbage collector of distributed Chroma.
+    #[serde(default = "LocalCompactionManagerConfig::default_purge_interval_sec")]
+    pub purge_interval_sec: u64,
 }
 
 impl LocalCompactionManagerConfig {
@@ -103,6 +107,10 @@ impl LocalCompactionManagerConfig {
     fn default_shutdown_grace_sec() -> u64 {
         30
     }
+
+    fn default_purge_interval_sec() -> u64 {
+        7_200
+    }
 }
 
 impl Default for LocalCompactionManagerConfig {
@@ -115,6 +123,7 @@ impl Default for LocalCompactionManagerConfig {
             max_concurrent_jobs: Self::default_max_concurrent_jobs(),
             timeout_us: Self::default_timeout_us(),
             shutdown_grace_sec: Self::default_shutdown_grace_sec(),
+            purge_interval_sec: Self::default_purge_interval_sec(),
         }
     }
 }
@@ -131,6 +140,13 @@ pub struct LocalCompactionManager {
     // backfill before a read or a write goes on. Each backfill forgets its collection, any other purge request
     // skips SQLite. A change missed here only delays a purge, which never decides what a read returns.
     purged: HashSet<CollectionUuid>,
+    // The collections with conditional transactions whose purge was asked since the last purge, which runs on a timer as
+    // the garbage collector of distributed Chroma: their log holds hours of records, and a purge after every write would
+    // read them each time.
+    purges: PurgeSchedule,
+    // A purge of the timer runs out of the actor, as the flushes of SPANN collections, so that a large
+    // DELETE does not hold up the reads and writes that wait for the actor; the next one waits for its end.
+    purging: bool,
     // The versions that the flushes of SPANN collections replaced within the grace, by segment.
     spann_versions: HashMap<SegmentUuid, ReplacedVersions>,
     spann_version_grace: Duration,
@@ -148,6 +164,36 @@ pub struct LocalCompactionManager {
     // shared by the clones of the manager, as the one the registry keeps.
     background: tokio_util::task::TaskTracker,
     shutdown_grace: Duration,
+}
+
+// The purges asked, run together once the interval has passed since the last ones.
+#[derive(Debug, Clone)]
+struct PurgeSchedule {
+    pending: HashSet<CollectionUuid>,
+    interval: Duration,
+    last: Instant,
+}
+
+impl PurgeSchedule {
+    fn new(interval: Duration) -> Self {
+        Self {
+            pending: HashSet::new(),
+            interval,
+            last: Instant::now(),
+        }
+    }
+
+    fn request(&mut self, collection_id: CollectionUuid) {
+        self.pending.insert(collection_id);
+    }
+
+    fn due(&mut self, now: Instant) -> Vec<CollectionUuid> {
+        if now.duration_since(self.last) < self.interval {
+            return Vec::new();
+        }
+        self.last = now;
+        self.pending.drain().collect()
+    }
 }
 
 // A request of a one-off flush, answered at the end of its flush.
@@ -298,6 +344,8 @@ impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
             sysdb,
             metrics: registry.get::<LocalCompactionMetrics>().unwrap_or_default(),
             purged: HashSet::new(),
+            purges: PurgeSchedule::new(Duration::from_secs(config.purge_interval_sec)),
+            purging: false,
             spann_versions: HashMap::new(),
             spann_version_grace: registry.get::<SpannVersionGrace>().unwrap_or_default().0,
             compaction_interval: Duration::from_secs(config.compaction_interval_sec),
@@ -441,6 +489,17 @@ pub struct SpannFlushed {
     collection_id: CollectionUuid,
     result: Result<Option<(CollectionAndSegments, SpannFlush)>, CompactionManagerError>,
 }
+
+/// The end of the purge of the log of a collection out of the actor.
+#[derive(Debug)]
+pub struct LogsPurged {
+    collection_id: CollectionUuid,
+    result: Result<(), CompactionManagerError>,
+}
+
+/// The end of the purges of the timer out of the actor.
+#[derive(Debug)]
+pub struct PurgesDone;
 
 /// The end of the flushes of a round of the timer, out of the actor: the next round, and the answer to its message.
 #[derive(Debug)]
@@ -653,15 +712,17 @@ impl Handler<PurgeLogsMessage> for LocalCompactionManager {
         message: PurgeLogsMessage,
         _: &ComponentContext<LocalCompactionManager>,
     ) -> Self::Result {
-        // Every read asks for a purge, to retry one that failed: one that succeeded holds until a backfill.
-        if self.purged.contains(&message.collection_id) {
-            return Ok(());
+        // Every write, and every read that backfilled, asks for a purge. A collection without conditional transactions
+        // keeps no record once applied: its purge runs now, on the few records since the last one, as in Chroma 1.5.9.
+        // The purge of a collection with conditional transactions may remove the records of hours: it waits for the timer.
+        let on_the_timer = match &self.log {
+            Log::Sqlite(log) => log.used_by_conditional_transactions(message.collection_id),
+            _ => false,
+        };
+        if !on_the_timer {
+            return self.purge_requested(message.collection_id).await;
         }
-        self.purge_logs(message.collection_id).await?;
-        if self.purged.len() >= MAX_PURGED_COLLECTIONS {
-            self.purged.clear();
-        }
-        self.purged.insert(message.collection_id);
+        self.purges.request(message.collection_id);
         Ok(())
     }
 }
@@ -725,13 +786,56 @@ impl Handler<SpannRoundDone> for LocalCompactionManager {
     async fn handle(
         &mut self,
         message: SpannRoundDone,
-        _ctx: &ComponentContext<LocalCompactionManager>,
+        ctx: &ComponentContext<LocalCompactionManager>,
     ) {
         if let Log::Sqlite(log) = &self.log {
             log.spann_round_ended();
         }
+        // After the round, so that the purges do not lengthen the round that sets the Retry-After of a refused write.
+        if !self.purging {
+            let due = self
+                .purges
+                .due(Instant::now())
+                .into_iter()
+                .filter(|collection_id| !self.purged.contains(collection_id))
+                .collect::<Vec<_>>();
+            if !due.is_empty() {
+                self.purging = true;
+                self.launch_purges(due, ctx);
+            }
+        }
         // The message of the round may come from no one who waits for it, as from the scheduler.
         let _ = message.round.send(());
+    }
+}
+
+#[async_trait]
+impl Handler<LogsPurged> for LocalCompactionManager {
+    type Result = ();
+
+    async fn handle(&mut self, message: LogsPurged, _: &ComponentContext<LocalCompactionManager>) {
+        match message.result {
+            Ok(()) => {
+                if self.purged.len() >= MAX_PURGED_COLLECTIONS {
+                    self.purged.clear();
+                }
+                self.purged.insert(message.collection_id);
+            }
+            Err(err) => tracing::warn!(
+                collection_id = %message.collection_id,
+                error = %err,
+                "Purge of logs failed; the next request tries again"
+            ),
+        }
+    }
+}
+
+#[async_trait]
+impl Handler<PurgesDone> for LocalCompactionManager {
+    type Result = ();
+
+    async fn handle(&mut self, _: PurgesDone, _: &ComponentContext<LocalCompactionManager>) {
+        self.purging = false;
     }
 }
 
@@ -886,6 +990,44 @@ impl LocalCompactionManager {
         }
     }
 
+    // The purges of the timer on a clone of the manager, out of the actor, as the flushes of SPANN
+    // collections; each end comes back as a message, then the end of all of them.
+    fn launch_purges(
+        &self,
+        collections: Vec<CollectionUuid>,
+        ctx: &ComponentContext<LocalCompactionManager>,
+    ) {
+        let mut purger = self.clone();
+        let purged = ctx.receiver::<LogsPurged>();
+        let done = ctx.receiver::<PurgesDone>();
+        let purges = async move {
+            for collection_id in collections {
+                let result = AssertUnwindSafe(purger.purge_logs(collection_id))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or(Err(CompactionManagerError::PurgeLogsFailure));
+                if let Err(err) = purged
+                    .send(
+                        LogsPurged {
+                            collection_id,
+                            result,
+                        },
+                        None,
+                    )
+                    .await
+                {
+                    tracing::error!(collection_id = %collection_id, error = %err, "The end of a purge did not reach the compaction manager");
+                }
+            }
+            if let Err(err) = done.send(PurgesDone, None).await {
+                tracing::error!(error = %err, "The end of the purges did not reach the compaction manager");
+            }
+        };
+        // On the tracker of the flushes, so that a stop waits for a purge within its grace too.
+        self.background
+            .spawn(purges.instrument(tracing::info_span!(parent: None, "Purges of the log")));
+    }
+
     // The flushes of the collections given, one after the other, out of the actor, as the compaction manager of
     // distributed Chroma runs its compactions out of its own (compact_awaiter_loop in
     // rust/worker/src/compactor/compaction_manager.rs), so that the writes and the reads do not wait behind them: the end
@@ -1019,6 +1161,22 @@ impl LocalCompactionManager {
                 &kept,
             )
             .await?;
+        Ok(())
+    }
+
+    // Every read asks for a purge, to retry one that failed: one that succeeded holds until a backfill.
+    async fn purge_requested(
+        &mut self,
+        collection_id: CollectionUuid,
+    ) -> Result<(), CompactionManagerError> {
+        if self.purged.contains(&collection_id) {
+            return Ok(());
+        }
+        self.purge_logs(collection_id).await?;
+        if self.purged.len() >= MAX_PURGED_COLLECTIONS {
+            self.purged.clear();
+        }
+        self.purged.insert(collection_id);
         Ok(())
     }
 
@@ -1553,6 +1711,36 @@ mod regression_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purges_wait_for_their_interval_and_run_once() {
+        let start = Instant::now();
+        let mut purges = PurgeSchedule {
+            pending: HashSet::new(),
+            interval: Duration::from_secs(7_200),
+            last: start,
+        };
+        let collection_id = CollectionUuid::new();
+        purges.request(collection_id);
+        purges.request(collection_id);
+        assert!(purges.due(start + Duration::from_secs(7_199)).is_empty());
+        assert_eq!(
+            purges.due(start + Duration::from_secs(7_200)),
+            vec![collection_id]
+        );
+        // The interval counts from the last purges, and a request after them waits for the next ones.
+        purges.request(collection_id);
+        assert!(purges.due(start + Duration::from_secs(14_399)).is_empty());
+        assert_eq!(
+            purges.due(start + Duration::from_secs(14_400)),
+            vec![collection_id]
+        );
+        // The interval of distributed Chroma (gc_interval_mins in rust/garbage_collector/garbage_collector_config.yaml).
+        assert_eq!(
+            LocalCompactionManagerConfig::default().purge_interval_sec,
+            7_200
+        );
+    }
 
     #[tokio::test]
     async fn purge_requires_both_durable_watermarks() {

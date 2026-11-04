@@ -89,11 +89,22 @@ pub struct SqliteLogConfig {
     /// rust/worker/chroma_config.yaml.
     #[serde(default = "SqliteLogConfig::default_num_records_before_backpressure")]
     pub num_records_before_backpressure: u64,
+    /// How long the records of a collection that conditional transactions use stay in the log after they are written, so
+    /// that a commit can still check the records written after its reads: as the garbage collector of distributed Chroma
+    /// keeps the log down to the versions of the last relative_cutoff_time_seconds, with the value of
+    /// rust/garbage_collector/garbage_collector_config.yaml (12 hours). The other collections purge what they applied at
+    /// once, as Chroma 1.5.9.
+    #[serde(default = "SqliteLogConfig::default_purge_cutoff_time_seconds")]
+    pub purge_cutoff_time_seconds: u64,
 }
 
 impl SqliteLogConfig {
     pub fn default_num_records_before_backpressure() -> u64 {
         100_000
+    }
+
+    pub fn default_purge_cutoff_time_seconds() -> u64 {
+        43_200
     }
 }
 
@@ -104,6 +115,7 @@ impl Default for SqliteLogConfig {
             topic_namespace: "default".to_string(),
             num_records_before_backpressure:
                 SqliteLogConfig::default_num_records_before_backpressure(),
+            purge_cutoff_time_seconds: SqliteLogConfig::default_purge_cutoff_time_seconds(),
         }
     }
 }
