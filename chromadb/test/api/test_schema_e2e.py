@@ -20,7 +20,6 @@ from chromadb.test.conftest import (
     ClientFactories,
     is_spann_disabled_mode,
     spann_honored,
-    skip_if_not_cluster,
 )
 from chromadb.test.utils.wait_for_version_increase import (
     get_collection_version,
@@ -1023,7 +1022,6 @@ def test_schema_rejects_conflicting_discoverable_key_types(
     assert isinstance(bad_metadata["conflict_key"], (int, float))
 
 
-@skip_if_not_cluster()
 @pytest.mark.needs("fork")
 def test_collection_fork_inherits_and_isolates_schema(
     client_factories: "ClientFactories",
