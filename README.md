@@ -108,7 +108,7 @@ vecturadb copy --from-cloud --to-local --host http://127.0.0.1:8000 --db <databa
 
 To copy only some collections, use `--collections <name>` once per collection instead of `--all`.
 
-What arrives: every record with its document, metadata, embedding and URI, the metadata of the collection, and its schema, sparse and BM25 indexes included. Sparse and BM25 searches give the same scores as on Chroma Cloud. The dense index arrives as on Chroma Cloud: SPANN, with the same settings. Collections whose metadata holds the legacy `hnsw:*` settings arrive with them.
+What arrives: every record with its document, metadata, embedding and URI, the metadata of the collection, and its schema, sparse and BM25 indexes included. Once Chroma Cloud has indexed the records, sparse and BM25 searches give the same scores as on Chroma Cloud. Records with the same score can come in another order. The dense index arrives as on Chroma Cloud: SPANN, with the same settings, unless the server has the option `spann` off: then HNSW. Collections whose metadata holds the legacy `hnsw:*` settings arrive with them.
 
 The copy waits when VecturaDB asks it to, when a server fails and when the network falls, and says why. A collection that cannot be copied does not stop the others: at the end the CLI says what happened to it, and exits with code 1.
 
@@ -199,7 +199,7 @@ A client that needs to know which server it talks to reads `GET /api/v2/pre-flig
 {"max_batch_size": 5461, "supports_base64_encoding": true, "server": {"name": "VecturaDB", "version": "1.0.0-preview.N", "features": ["sparse_vector_index", "bm25", "search", "fork", "api_keys", "indexing_status", "attached_functions", "spann", "conditional_transactions"]}}
 ```
 
-`features` lists what VecturaDB has beyond single-node Chroma:
+`features` lists these features of VecturaDB that single-node Chroma does not have:
 
 - `sparse_vector_index`: sparse vector indexes in the schema of a collection;
 - `bm25`: sparse indexes with BM25 scoring;
