@@ -45,6 +45,12 @@ pub enum ChromaHttpClientError {
     /// Contains the error message from the server and the HTTP status code that triggered the error.
     #[error("API error: {0} ({1})")]
     ApiError(String, reqwest::StatusCode),
+    /// The server refused the request for now, and said how long to wait in its header `Retry-After`.
+    ///
+    /// Contains the error message from the server and the time to wait. Without that header, a
+    /// refusal is an [`ChromaHttpClientError::ApiError`] with the status 429.
+    #[error("API error: {0} (429 Too Many Requests)")]
+    RetryAfter(String, Duration),
     /// Client lacks access to a unique database or cannot determine which database to use.
     #[error("Could not resolve database ID: {0}")]
     CouldNotResolveDatabaseId(String),
@@ -132,13 +138,42 @@ enum BackendSendError {
     Request(ChromaHttpClientError),
 }
 
+/// The time to wait in the header `Retry-After` of a refusal, when it is a number of seconds.
+fn retry_after_of(response: &reqwest::Response) -> Option<Duration> {
+    if response.status() != StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    let seconds = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+fn api_error(
+    message: String,
+    status: StatusCode,
+    retry_after: Option<Duration>,
+) -> ChromaHttpClientError {
+    match retry_after {
+        Some(retry_after) => ChromaHttpClientError::RetryAfter(message, retry_after),
+        None => ChromaHttpClientError::ApiError(message, status),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct BackendFailurePredicate;
 
 impl FailurePredicate<ChromaHttpClientError> for BackendFailurePredicate {
     fn is_err(&self, err: &ChromaHttpClientError) -> bool {
         match err {
-            ChromaHttpClientError::RequestError(_) | ChromaHttpClientError::SerdeError(_) => true,
+            ChromaHttpClientError::RequestError(_)
+            | ChromaHttpClientError::SerdeError(_)
+            | ChromaHttpClientError::RetryAfter(_, _) => true,
             ChromaHttpClientError::ApiError(_, status) => {
                 *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
             }
@@ -297,6 +332,16 @@ impl ChromaHttpClient {
             resolve_tenant_or_database_lock: Arc::new(tokio::sync::Mutex::new(())),
             auth_method: options.auth_method,
         }
+    }
+
+    /// This client, that never sends a request again by itself, for a caller that decides when to.
+    pub fn without_retries(mut self) -> Self {
+        self.retry_policy = crate::client::ChromaRetryOptions {
+            max_retries: 0,
+            ..Default::default()
+        }
+        .into();
+        self
     }
 
     /// Returns a clone of this client that shares the same underlying HTTP
@@ -1384,6 +1429,7 @@ impl ChromaHttpClient {
             Err((err, maybe_response)) => {
                 if let Some(response) = maybe_response {
                     let status = response.status();
+                    let retry_after = retry_after_of(&response);
                     let text = response.text().await.unwrap_or_default();
                     let json = match serde_json::from_str::<serde_json::Value>(&text) {
                         Ok(json) => json,
@@ -1395,9 +1441,10 @@ impl ChromaHttpClient {
                                 text
                             );
 
-                            return Err(ChromaHttpClientError::ApiError(
+                            return Err(api_error(
                                 format!("Non-JSON error response: {}", text),
                                 status,
+                                retry_after,
                             ));
                         }
                     };
@@ -1411,10 +1458,11 @@ impl ChromaHttpClient {
                         );
                     }
 
-                    if let Ok(api_error) = serde_json::from_value::<ErrorResponse>(json) {
-                        return Err(ChromaHttpClientError::ApiError(
-                            format!("{}: {}", api_error.error, api_error.message),
+                    if let Ok(refusal) = serde_json::from_value::<ErrorResponse>(json) {
+                        return Err(api_error(
+                            format!("{}: {}", refusal.error, refusal.message),
                             status,
+                            retry_after,
                         ));
                     }
                 }
@@ -1468,6 +1516,86 @@ mod tests {
             assert!(!identity.tenant.is_empty());
         })
         .await;
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn a_refusal_says_how_long_to_wait_when_its_header_does() {
+        let server = MockServer::start_async().await;
+        for (path, header) in [
+            ("/with", Some("34")),
+            ("/not-a-number", Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            ("/without", None),
+        ] {
+            server
+                .mock_async(|when, then| {
+                    when.method("POST").path(path);
+                    let then = then
+                        .status(429)
+                        .body(r#"{"error":"ChromaError","message":"later"}"#);
+                    if let Some(header) = header {
+                        then.header("Retry-After", header);
+                    }
+                })
+                .await;
+        }
+        let client = ChromaHttpClient::new(ChromaHttpClientOptions {
+            endpoint: server.base_url().parse().unwrap(),
+            ..Default::default()
+        })
+        .without_retries();
+        let send = |path: &'static str| {
+            let client = client.clone();
+            async move {
+                client
+                    .send::<(), (), serde_json::Value>("refused", Method::POST, path, None, None)
+                    .await
+                    .unwrap_err()
+            }
+        };
+
+        let error = send("/with").await;
+        assert!(
+            matches!(&error, ChromaHttpClientError::RetryAfter(message, wait)
+                if message == "ChromaError: later" && *wait == Duration::from_secs(34)),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "API error: ChromaError: later (429 Too Many Requests)"
+        );
+        for path in ["/not-a-number", "/without"] {
+            let error = send(path).await;
+            assert!(
+                matches!(
+                    &error,
+                    ChromaHttpClientError::ApiError(_, StatusCode::TOO_MANY_REQUESTS)
+                ),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn a_client_without_retries_sends_a_request_once() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method("GET").path("/down");
+                then.status(503).body("down");
+            })
+            .await;
+        let client = ChromaHttpClient::new(ChromaHttpClientOptions {
+            endpoint: server.base_url().parse().unwrap(),
+            ..Default::default()
+        })
+        .without_retries();
+        client
+            .send::<(), (), serde_json::Value>("down", Method::GET, "/down", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(mock.calls(), 1);
     }
 
     #[tokio::test]

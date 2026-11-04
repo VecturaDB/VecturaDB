@@ -50,6 +50,7 @@ tempfile = { workspace = true }
 tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 chroma-types = { workspace = true, features = ["testing"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
