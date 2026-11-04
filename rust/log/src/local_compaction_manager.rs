@@ -795,6 +795,7 @@ impl LocalCompactionManager {
                     end,
                     applied_before: mt_max_seq_id,
                     asynchronous: false,
+                    counts_version: !spann,
                 })
             } else {
                 None
@@ -858,7 +859,8 @@ impl LocalCompactionManager {
         }
         // As a compaction of distributed Chroma, an apply of records is one more version of the collection; a SPANN
         // collection counts its flushes instead (flush_compaction_in), and a replay that applies nothing does not count.
-        if applies_records && !spann {
+        // The apply of a collection with functions counts it at the end of the run of its window, after their output.
+        if applies_records && !spann && function_window.is_none() {
             sqlx::query("UPDATE collections SET version = version + 1 WHERE id = $1")
                 .bind(message.collection_id.to_string())
                 .execute(&mut *tx)
@@ -880,6 +882,7 @@ impl LocalCompactionManager {
                 end: window.end,
                 applied_before: window.end,
                 asynchronous: true,
+                counts_version: false,
             });
             self.function_runs.send(&self.background, &runner, window);
             if let Some(asynchronous) = asynchronous {
@@ -981,6 +984,7 @@ impl Handler<ScheduledCompactMessage> for LocalCompactionManager {
                             &self.background,
                             &runner,
                             FunctionWindow {
+                                counts_version: input.vector_segment.r#type != SegmentType::Spann,
                                 input,
                                 logs: Chunk::new(Arc::from(Vec::new())),
                                 before: Vec::new(),
@@ -1021,6 +1025,7 @@ impl Handler<ScheduledCompactMessage> for LocalCompactionManager {
                                 end: applied,
                                 applied_before: applied,
                                 asynchronous: true,
+                                counts_version: false,
                             },
                         ),
                         Err(err) => {

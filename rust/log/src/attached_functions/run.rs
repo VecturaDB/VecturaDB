@@ -57,6 +57,9 @@ pub struct FunctionWindow {
     pub applied_before: u64,
     /// A run of the asynchronous functions of the collection, up to `end`, where the others are of the synchronous ones.
     pub asynchronous: bool,
+    /// Whether the run counts one more version of the input collection (run): the window of an apply of an HNSW
+    /// collection, or of its functions behind; a SPANN collection counts its flushes.
+    pub counts_version: bool,
 }
 
 /// The input collections of the ready synchronous functions behind the records applied to them, with the log offset of
@@ -223,6 +226,24 @@ impl FunctionRunner {
         if window.asynchronous {
             return self.run_asynchronous(window).await;
         }
+        let ran = self.run_synchronous(&window).await?;
+        // As the register of distributed Chroma flushes the input collection with the output of its synchronous
+        // functions (FinishAttachedFunctionOperator), one more version of the input once their output is applied: a
+        // reader that waits for the version reads the output. A run that fails counts nothing, as a compaction of
+        // distributed Chroma that fails; the run of a function behind that then succeeds counts one, as the compaction
+        // that covers it. The window of an apply counts its apply also when no function runs on it.
+        if window.counts_version && (ran || !window.logs.is_empty()) {
+            sqlx::query("UPDATE collections SET version = version + 1 WHERE id = $1")
+                .bind(window.input.collection.collection_id.to_string())
+                .execute(self.sqlite_db.get_conn())
+                .await
+                .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)?;
+        }
+        Ok(())
+    }
+
+    // Whether a function ran on the window.
+    async fn run_synchronous(&self, window: &FunctionWindow) -> Result<bool, Box<dyn ChromaError>> {
         let input_id = window.input.collection.collection_id;
         let mut functions = self.ready_sync_functions(input_id).await?;
         // The window of an attach waits for its function, which the frontend makes ready right after writing the records
@@ -243,6 +264,7 @@ impl FunctionRunner {
             tokio::time::sleep(Duration::from_secs(1)).await;
             waited += 1;
         }
+        let mut ran = false;
         for function in functions {
             if function.completion_offset >= window.end {
                 continue;
@@ -279,7 +301,7 @@ impl FunctionRunner {
                     output: output.clone(),
                 };
                 let records = self
-                    .execute_window(&window, &*executor, Some(&reader))
+                    .execute_window(window, &*executor, Some(&reader))
                     .await?;
                 (records, window.end)
             };
@@ -310,8 +332,9 @@ impl FunctionRunner {
                 )
                 .await
                 .map_err(|e| e.boxed())?;
+            ran = true;
         }
-        Ok(())
+        Ok(ran)
     }
 
     async fn current_records(
@@ -840,6 +863,7 @@ impl FunctionRunner {
                 end: window.end,
                 applied_before: completion_offset,
                 asynchronous: true,
+                counts_version: false,
             };
             let reader = output.as_ref().map(|output| SqliteOutputRecords {
                 sqlite_db: self.sqlite_db.clone(),
