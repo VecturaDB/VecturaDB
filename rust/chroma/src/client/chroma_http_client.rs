@@ -730,6 +730,26 @@ impl ChromaHttpClient {
         .await
     }
 
+    /// What the server says it has beyond the single node of Chroma, such as `spann`: the `features` of the `server`
+    /// block of `/api/v2/pre-flight-checks`. Chroma does not send that block, and says nothing.
+    pub async fn server_features(&self) -> Result<Vec<String>, ChromaHttpClientError> {
+        let checks: serde_json::Value = self
+            .send_read_only::<(), (), _>(
+                "pre_flight_checks",
+                Method::GET,
+                "/api/v2/pre-flight-checks".to_string(),
+                None,
+                None,
+            )
+            .await?;
+        Ok(checks["server"]["features"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|feature| feature.as_str().map(str::to_string))
+            .collect())
+    }
+
     /// Retrieves an existing collection or creates it if it doesn't exist.
     ///
     /// Idempotent collection access that always succeeds if the name is valid. If a collection
@@ -1596,6 +1616,37 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(mock.calls(), 1);
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn the_features_of_a_server_come_from_its_pre_flight_checks() {
+        for (checks, features) in [
+            (
+                r#"{"max_batch_size":100,"supports_base64_encoding":true,"server":{"name":"VecturaDB","version":"1.0.0","features":["search","spann"]}}"#,
+                vec!["search", "spann"],
+            ),
+            // Chroma's answer.
+            (
+                r#"{"max_batch_size":100,"supports_base64_encoding":true}"#,
+                vec![],
+            ),
+        ] {
+            let server = MockServer::start_async().await;
+            server
+                .mock_async(|when, then| {
+                    when.method("GET").path("/api/v2/pre-flight-checks");
+                    then.status(200)
+                        .header("content-type", "application/json")
+                        .body(checks);
+                })
+                .await;
+            let client = ChromaHttpClient::new(ChromaHttpClientOptions {
+                endpoint: server.base_url().parse().unwrap(),
+                ..Default::default()
+            });
+            assert_eq!(client.server_features().await.unwrap(), features);
+        }
     }
 
     #[tokio::test]
