@@ -898,16 +898,20 @@ impl FunctionRunner {
 
     // The records as they were at the completion offset, from the state kept before the applies after it: for each id,
     // the state before the first apply after the offset that touched it; those that did not exist then are left out.
+    // The first apply of each id comes from one pass on the rows of the collection, then each of its rows from the
+    // primary key: a subquery for each row would read the rows of the collection once for each, which takes minutes
+    // once an asynchronous function lags behind tens of thousands of records.
     async fn prior(
         &self,
         input_id: CollectionUuid,
         completion_offset: u64,
     ) -> Result<Vec<ProjectionRecord>, Box<dyn ChromaError>> {
         let rows: Vec<(String, bool, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT id, existed, metadata, document FROM attached_function_prior AS p \
-             WHERE input_collection_id = $1 AND window_start > $2 AND window_start = \
-             (SELECT MIN(window_start) FROM attached_function_prior AS q \
-              WHERE q.input_collection_id = p.input_collection_id AND q.id = p.id AND q.window_start > $2)",
+            "SELECT p.id, p.existed, p.metadata, p.document FROM \
+             (SELECT id, MIN(window_start) AS first FROM attached_function_prior \
+              WHERE input_collection_id = $1 AND window_start > $2 GROUP BY id) AS m \
+             JOIN attached_function_prior AS p \
+             ON p.input_collection_id = $1 AND p.window_start = m.first AND p.id = m.id",
         )
         .bind(input_id.to_string())
         .bind(completion_offset as i64)
