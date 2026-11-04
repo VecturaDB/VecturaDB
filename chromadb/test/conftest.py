@@ -18,6 +18,9 @@ from typing import (
 )
 from uuid import UUID
 
+import functools
+
+import httpx
 import hypothesis
 import pytest
 import uvicorn
@@ -107,12 +110,27 @@ is_spann_disabled_mode = (
 
 def spann_honored(client: Any) -> bool:
     """Whether a collection that asks for SPANN gets it. VecturaDB: the single node in process, the Rust bindings,
-    gives SPANN to it when the client has a data path, and HNSW without one."""
+    gives SPANN to it when the client has a data path, and HNSW without one. A server says `spann` among the features
+    of the server block of its pre-flight checks when it gives SPANN; Chroma 1.5.9 has no server block.
+    """
     if not is_spann_disabled_mode:
         return True
-    return os.getenv("CHROMA_RUST_BINDINGS_TEST_ONLY") == "1" and bool(
-        client.get_settings().is_persistent
+    settings = client.get_settings()
+    if os.getenv("CHROMA_RUST_BINDINGS_TEST_ONLY") == "1":
+        return bool(settings.is_persistent)
+    return "spann" in _server_features(
+        settings.chroma_server_host or "localhost",
+        settings.chroma_server_http_port or 8000,
+        bool(settings.chroma_server_ssl_enabled),
     )
+
+
+@functools.lru_cache(maxsize=None)
+def _server_features(host: str, port: int, ssl: bool) -> Tuple[str, ...]:
+    """The features of the server block of the pre-flight checks, asked directly so that async clients get them too."""
+    scheme = "https" if ssl else "http"
+    checks = httpx.get(f"{scheme}://{host}:{port}/api/v2/pre-flight-checks").json()
+    return tuple((checks.get("server") or {}).get("features") or [])
 
 
 skip_reason_spann_disabled = (
