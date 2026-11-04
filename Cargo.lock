@@ -1911,6 +1911,7 @@ name = "chroma-log"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "backon",
  "bytemuck",
  "chroma-api-types",
  "chroma-blockstore",

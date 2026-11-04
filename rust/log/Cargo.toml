@@ -6,6 +6,7 @@ edition = "2021"
 
 [dependencies]
 async-trait = { workspace = true }
+backon = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

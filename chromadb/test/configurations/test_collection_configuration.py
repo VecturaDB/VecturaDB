@@ -22,8 +22,12 @@ from chromadb.api.collection_configuration import (
 )
 import json
 from chromadb.utils.embedding_functions import register_embedding_function
+from chromadb.errors import InvalidArgumentError
 from chromadb.test.conftest import ClientFactories
-from chromadb.test.conftest import is_spann_disabled_mode, skip_reason_spann_disabled
+from chromadb.test.conftest import (
+    is_spann_disabled_mode,
+    spann_honored,
+)
 from chromadb.types import Collection as CollectionModel
 from typing import Optional, TypedDict
 
@@ -361,7 +365,7 @@ def test_empty_spann_configuration(client: ClientAPI) -> None:
         "embedding_function": CustomEmbeddingFunction(dim=5),
     }
 
-    if is_spann_disabled_mode:
+    if not spann_honored(client):
         coll = client.create_collection(
             name="test_spann_config",
             configuration=config,
@@ -396,12 +400,13 @@ def test_empty_spann_configuration(client: ClientAPI) -> None:
                 CreateSpannConfiguration, loaded_config.get("spann", {})
             )
             ef = loaded_config.get("embedding_function")
+            # The defaults of rust/types/src/spann_configuration.rs, as Chroma Cloud gives them; a value asked for is kept.
             assert spann_config_loaded.get("space") == "l2"
             assert spann_config_loaded.get("ef_construction") == 200
             assert spann_config_loaded.get("ef_search") == 200
             assert spann_config_loaded.get("max_neighbors") == 64
-            assert spann_config_loaded.get("search_nprobe") == 128
-            assert spann_config_loaded.get("write_nprobe") == 128
+            assert spann_config_loaded.get("search_nprobe") == 64
+            assert spann_config_loaded.get("write_nprobe") == 32
             assert ef is not None
 
 
@@ -423,7 +428,7 @@ def test_spann_configuration(client: ClientAPI) -> None:
         "embedding_function": CustomEmbeddingFunction(dim=5),
     }
 
-    if is_spann_disabled_mode:
+    if not spann_honored(client):
         coll = client.create_collection(
             name="test_spann_config",
             configuration=config,
@@ -458,16 +463,17 @@ def test_spann_configuration(client: ClientAPI) -> None:
                 CreateSpannConfiguration, loaded_config.get("spann", {})
             )
             ef = loaded_config.get("embedding_function")
+            # The defaults of rust/types/src/spann_configuration.rs, as Chroma Cloud gives them; a value asked for is kept.
             assert spann_config_loaded.get("space") == "cosine"
             assert spann_config_loaded.get("ef_construction") == 100
-            assert spann_config_loaded.get("ef_search") == 200
+            assert spann_config_loaded.get("ef_search") == 20
             assert spann_config_loaded.get("max_neighbors") == 10
             assert spann_config_loaded.get("search_nprobe") == 5
             assert spann_config_loaded.get("write_nprobe") == 10
             assert ef is not None
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("spann")
 def test_spann_configuration_persistence(client_factories: "ClientFactories") -> None:
     """Test SPANN configuration persistence across client restarts"""
     client = client_factories.create_client_from_system()
@@ -549,7 +555,7 @@ def test_spann_default_parameters(client: ClientAPI) -> None:
         "spann": spann_config,
     }
 
-    if is_spann_disabled_mode:
+    if not spann_honored(client):
         coll = client.create_collection(
             name="test_spann_defaults",
             configuration=config,
@@ -585,12 +591,13 @@ def test_spann_default_parameters(client: ClientAPI) -> None:
             spann_config_loaded = cast(
                 CreateSpannConfiguration, loaded_config.get("spann", {})
             )
+            # The defaults of rust/types/src/spann_configuration.rs, as Chroma Cloud gives them; a value asked for is kept.
             assert spann_config_loaded.get("space") == "cosine"
             assert spann_config_loaded.get("ef_construction") == 200
-            assert spann_config_loaded.get("max_neighbors") == 16
+            assert spann_config_loaded.get("max_neighbors") == 64
             assert spann_config_loaded.get("ef_search") == 200
-            assert spann_config_loaded.get("search_nprobe") == 128
-            assert spann_config_loaded.get("write_nprobe") == 128
+            assert spann_config_loaded.get("search_nprobe") == 64
+            assert spann_config_loaded.get("write_nprobe") == 32
 
             ef = loaded_config.get("embedding_function")
             assert ef is not None
@@ -635,7 +642,7 @@ def test_spann_json_serialization(client: ClientAPI) -> None:
             "embedding_function"
         )
 
-    if is_spann_disabled_mode:
+    if not spann_honored(client):
         coll = client.create_collection(
             name="test_spann_json",
             configuration=create_config,
@@ -677,7 +684,7 @@ def test_spann_json_serialization(client: ClientAPI) -> None:
             assert spann_config_loaded.get("ef_search") == 150
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("spann")
 def test_configuration_spann_updates(client: ClientAPI) -> None:
     """Test updating SPANN collection configurations"""
     client.reset()
@@ -723,7 +730,7 @@ def test_configuration_spann_updates(client: ClientAPI) -> None:
             assert spann_config.get("space") == "cosine"
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("spann")
 def test_spann_update_from_json(client: ClientAPI) -> None:
     """Test updating SPANN configuration from JSON and applying it"""
     client.reset()
@@ -815,7 +822,7 @@ def test_overwrite_spann_configuration() -> None:
     assert updated_config.get("max_neighbors") == 16
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("spann")
 def test_exclusive_update_hnsw_spann_configuration(client: ClientAPI) -> None:
     """Test that HNSW and SPANN configurations cannot both be specified in an update"""
     client.reset()
@@ -842,8 +849,10 @@ def test_exclusive_update_hnsw_spann_configuration(client: ClientAPI) -> None:
         "spann": update_spann,
     }
 
-    # This should raise a ValueError
-    with pytest.raises(ValueError):
+    # The server refuses it, also in process
+    with pytest.raises(
+        InvalidArgumentError, match="Multiple vector index configurations provided"
+    ):
         coll.modify(configuration=update_config)
 
 

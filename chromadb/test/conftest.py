@@ -18,6 +18,9 @@ from typing import (
 )
 from uuid import UUID
 
+import functools
+
+import httpx
 import hypothesis
 import pytest
 import uvicorn
@@ -107,11 +110,55 @@ is_spann_disabled_mode = (
 
 def spann_honored(client: Any) -> bool:
     """Whether a collection that asks for SPANN gets it. VecturaDB: the single node in process, the Rust bindings,
-    gives SPANN to it when the client has a data path, and HNSW without one."""
+    gives SPANN to it when the client has a data path, and HNSW without one. A server says `spann` among the features
+    of the server block of its pre-flight checks when it gives SPANN; Chroma 1.5.9 has no server block.
+    """
     if not is_spann_disabled_mode:
         return True
-    return os.getenv("CHROMA_RUST_BINDINGS_TEST_ONLY") == "1" and bool(
-        client.get_settings().is_persistent
+    settings = client.get_settings()
+    if os.getenv("CHROMA_RUST_BINDINGS_TEST_ONLY") == "1":
+        return bool(settings.is_persistent)
+    return "spann" in _server_features(
+        settings.chroma_server_host or "localhost",
+        settings.chroma_server_http_port or 8000,
+        bool(settings.chroma_server_ssl_enabled),
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _server_features(host: str, port: int, ssl: bool) -> Tuple[str, ...]:
+    """The features of the server block of the pre-flight checks, asked directly so that async clients get them too."""
+    scheme = "https" if ssl else "http"
+    checks = httpx.get(f"{scheme}://{host}:{port}/api/v2/pre-flight-checks").json()
+    return tuple((checks.get("server") or {}).get("features") or [])
+
+
+# The features that the server of VecturaDB declares (server_info in rust/cli/src/commands/run.rs) and that the Rust
+# bindings in process have too, with the same code: in process there are no pre-flight checks to ask.
+IN_PROCESS_FEATURES = (
+    "sparse_vector_index",
+    "bm25",
+    "search",
+    "fork",
+    "indexing_status",
+)
+
+
+def server_has(client: Any, feature: str) -> bool:
+    """Whether the server of a client has a feature beyond the single node of Chroma, such as `search`, as it says
+    in the server block of its pre-flight checks. Outside the two local modes, every feature, as distributed Chroma.
+    """
+    if feature == "spann":
+        return spann_honored(client)
+    if not is_spann_disabled_mode:
+        return True
+    if os.getenv("CHROMA_RUST_BINDINGS_TEST_ONLY") == "1":
+        return feature in IN_PROCESS_FEATURES
+    settings = client.get_settings()
+    return feature in _server_features(
+        settings.chroma_server_host or "localhost",
+        settings.chroma_server_http_port or 8000,
+        bool(settings.chroma_server_ssl_enabled),
     )
 
 
@@ -1166,6 +1213,10 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "test_with_multi_region: run test with MCMR database when MULTI_REGION_ENABLED",
     )
+    config.addinivalue_line(
+        "markers",
+        "needs(*features): run test only if the server of its client has these features (server_has)",
+    )
 
 
 def is_client_in_process(client: ClientAPI) -> bool:
@@ -1183,6 +1234,21 @@ def log_tests(request: pytest.FixtureRequest) -> Generator[None, None, None]:
     yield
 
     logger.debug(f"Finished test: {test_name}")
+
+
+@pytest.fixture(autouse=True)
+def skip_unless_the_server_has(request: pytest.FixtureRequest) -> None:
+    """Skips a test marked `needs` when the server of its client lacks one of the features."""
+    marker = request.node.get_closest_marker("needs")
+    if marker is None:
+        return
+    if "client" in request.fixturenames:
+        client = request.getfixturevalue("client")
+    else:
+        client = request.getfixturevalue("client_factories").create_client_from_system()
+    for feature in marker.args:
+        if not server_has(client, feature):
+            pytest.skip(f"the server does not have {feature}")
 
 
 @pytest.fixture

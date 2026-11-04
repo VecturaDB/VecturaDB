@@ -176,6 +176,7 @@ pub struct LocalCompactionManager {
     shutdown_grace: Duration,
     // The synchronous attached functions: see FunctionRuns.
     function_runs: FunctionRuns,
+    sync_retries: attached_functions::run::SyncRetries,
     // The storage of local_compaction_manager: storage, when set, for the files of the attached functions.
     function_storage: Option<chroma_storage::Storage>,
 }
@@ -447,6 +448,7 @@ impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
             background: tokio_util::task::TaskTracker::new(),
             shutdown_grace: Duration::from_secs(config.shutdown_grace_sec),
             function_runs: FunctionRuns::default(),
+            sync_retries: Default::default(),
             function_storage,
         };
         registry.register(res.clone());
@@ -795,6 +797,7 @@ impl LocalCompactionManager {
                     end,
                     applied_before: mt_max_seq_id,
                     asynchronous: false,
+                    counts_version: !spann,
                 })
             } else {
                 None
@@ -858,7 +861,8 @@ impl LocalCompactionManager {
         }
         // As a compaction of distributed Chroma, an apply of records is one more version of the collection; a SPANN
         // collection counts its flushes instead (flush_compaction_in), and a replay that applies nothing does not count.
-        if applies_records && !spann {
+        // The apply of a collection with functions counts it at the end of the run of its window, after their output.
+        if applies_records && !spann && function_window.is_none() {
             sqlx::query("UPDATE collections SET version = version + 1 WHERE id = $1")
                 .bind(message.collection_id.to_string())
                 .execute(&mut *tx)
@@ -880,6 +884,7 @@ impl LocalCompactionManager {
                 end: window.end,
                 applied_before: window.end,
                 asynchronous: true,
+                counts_version: false,
             });
             self.function_runs.send(&self.background, &runner, window);
             if let Some(asynchronous) = asynchronous {
@@ -981,6 +986,7 @@ impl Handler<ScheduledCompactMessage> for LocalCompactionManager {
                             &self.background,
                             &runner,
                             FunctionWindow {
+                                counts_version: input.vector_segment.r#type != SegmentType::Spann,
                                 input,
                                 logs: Chunk::new(Arc::from(Vec::new())),
                                 before: Vec::new(),
@@ -1021,6 +1027,7 @@ impl Handler<ScheduledCompactMessage> for LocalCompactionManager {
                                 end: applied,
                                 applied_before: applied,
                                 asynchronous: true,
+                                counts_version: false,
                             },
                         ),
                         Err(err) => {
@@ -1259,6 +1266,8 @@ impl LocalCompactionManager {
             sysdb: self.sysdb.clone(),
             sqlite_db: self.sqlite_db.clone(),
             backfill: None,
+            sync_retries: self.sync_retries.clone(),
+            sync_retry_delay: self.compaction_interval,
             storage: self.function_storage.clone().or_else(|| {
                 self.hnsw_segment_manager
                     .spann_provider()

@@ -99,7 +99,7 @@ fn override_default_config_with_args(args: RunArgs) -> Result<FrontendServerConf
 /// The `server` block of `/api/v2/pre-flight-checks`: what VecturaDB has beyond the single node of Chroma. The
 /// release sets the version of this crate to the tag's (.github/workflows/ci.yml, "CLI version from the release tag").
 /// spann when the server gives SPANN to the collections that ask for it: its local executor has the option on, and the
-/// server always has a data path.
+/// server always has a data path. conditional_transactions when the server takes them: enable_transactions on.
 pub(crate) fn server_info(config: &FrontendServerConfig) -> ServerInfo {
     let mut features: Vec<String> = [
         "sparse_vector_index",
@@ -108,11 +108,15 @@ pub(crate) fn server_info(config: &FrontendServerConfig) -> ServerInfo {
         "fork",
         "api_keys",
         "indexing_status",
+        "attached_functions",
     ]
     .map(String::from)
     .to_vec();
     if matches!(&config.frontend.executor, ExecutorConfig::Local(local) if local.spann) {
         features.push("spann".to_string());
+    }
+    if config.frontend.enable_transactions {
+        features.push("conditional_transactions".to_string());
     }
     ServerInfo {
         name: "VecturaDB".to_string(),
@@ -219,6 +223,20 @@ mod tests {
             local.spann = false;
         }
         assert!(!server_info(&config).features.contains(&"spann".to_string()));
+    }
+
+    // The pre-flight checks declare the attached functions always, and the conditional transactions while
+    // enable_transactions is on, as by default.
+    #[test]
+    fn the_server_declares_its_transactions_and_attached_functions() {
+        let mut config = FrontendServerConfig::single_node_default();
+        let features = server_info(&config).features;
+        assert!(features.contains(&"attached_functions".to_string()));
+        assert!(features.contains(&"conditional_transactions".to_string()));
+        config.frontend.enable_transactions = false;
+        let features = server_info(&config).features;
+        assert!(features.contains(&"attached_functions".to_string()));
+        assert!(!features.contains(&"conditional_transactions".to_string()));
     }
 
     #[test]

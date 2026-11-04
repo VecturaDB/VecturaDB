@@ -80,7 +80,7 @@ Linux (x86_64 and arm64) and macOS (x64 and arm64):
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/VecturaDB/VecturaDB/main/rust/cli/install/install.sh | bash
-chroma run --path ./data
+vecturadb run --path ./data
 ```
 
 Windows (x64), in PowerShell:
@@ -89,7 +89,7 @@ Windows (x64), in PowerShell:
 iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/VecturaDB/VecturaDB/main/rust/cli/install/install.ps1'))
 ```
 
-The scripts install the newest release, previews included. Every binary is also in the [releases](https://github.com/VecturaDB/VecturaDB/releases). The binary keeps the name `chroma`.
+The scripts install the newest release, previews included. Every binary is also in the [releases](https://github.com/VecturaDB/VecturaDB/releases). The command is `vecturadb`. To have it also as `chroma`, set `VECTURADB_CHROMA_ALIAS=1` for the script.
 
 ## The SQLite database of the data path
 
@@ -102,15 +102,19 @@ SQLite keeps WAL to the processes of one machine. For a data path on a network f
 The CLI copies collections from Chroma Cloud into a running VecturaDB:
 
 ```bash
-chroma login --api-key <your Chroma Cloud API key>
-chroma copy --from-cloud --to-local --host http://localhost:8000 --db <database> --all
+vecturadb login --api-key <your Chroma Cloud API key>
+vecturadb copy --from-cloud --to-local --host http://127.0.0.1:8000 --db <database> --all
 ```
 
-To copy only some collections, use `--collections <name>` once per collection instead of `--all`. The collections must not exist yet in VecturaDB.
+To copy only some collections, use `--collections <name>` once per collection instead of `--all`.
 
-The copy stops at the first collection it cannot create. The collections copied before it stay in VecturaDB: copy the rest with `--collections`. Collections whose metadata holds the legacy `hnsw:*` settings fail with `Cannot set both collection config and schema simultaneously`; Chroma gives the same error.
+What arrives: every record with its document, metadata, embedding and URI, the metadata of the collection, and its schema, sparse and BM25 indexes included. Once Chroma Cloud has indexed the records, sparse and BM25 searches give the same scores as on Chroma Cloud. Records with the same score can come in another order. The dense index arrives as on Chroma Cloud: SPANN, with the same settings, unless the server has the option `spann` off: then HNSW. Collections whose metadata holds the legacy `hnsw:*` settings arrive with them.
 
-What arrives: every record with its document, metadata, embedding and URI, the metadata of the collection, and its schema, sparse and BM25 indexes included. Sparse and BM25 searches give the same scores as on Chroma Cloud. The settings of the dense index do not arrive: Chroma Cloud uses SPANN, VecturaDB uses HNSW with its default settings.
+The copy waits when VecturaDB asks it to, when a server fails and when the network falls, and says why. A collection that cannot be copied does not stop the others: at the end the CLI says what happened to it, and exits with code 1.
+
+Run again, the same command compares every collection already in VecturaDB with Chroma Cloud, record by record, before it writes anything, and reports how many records are the same, missing, different and only in VecturaDB. A collection that is the same is left alone. For the others the CLI asks what to do. Where nobody can answer, add `--resume --yes` to add the records they do not have, or `--force --yes` to make them exact copies of Chroma Cloud: `--force` also removes the records that are not on Chroma Cloud.
+
+The steps, with Docker and without, are in [Leaving Chroma Cloud: to VecturaDB](https://vecturadb.org/leaving-chroma-cloud/to-vecturadb). The same command copies into Chroma 1.5.9: see [to Chroma 1.5.9](https://vecturadb.org/leaving-chroma-cloud/to-chroma-single-node).
 
 ## SPANN index
 
@@ -173,6 +177,8 @@ Differences from Chroma Cloud:
 
 The attached functions of distributed Chroma work on the single node, with the same API: `collection.attach_function()` writes what a function computes from the records of a collection to its output collection. The functions are those of distributed Chroma: `record_counter`, `statistics` and `revision_history` run after each apply of the records of their input; `count_to_file_async` runs later, from its queue, and after 5 failures in a row it stops, as in distributed Chroma. `http_generate` and `http_currents` do not run on the single node, as they are part of Foundations, a service of Chroma Cloud: each of their runs fails, and they stop after 5.
 
+A run of `record_counter`, `statistics` or `revision_history` that fails is tried again after a wait that doubles each time, from the timer of the compaction (10 s by default), with a random part of up to as much again, and at most 5 minutes. After 5 failures in a row the function stops, as distributed Chroma stops compacting the collection: the version of the input collection stays and no output comes. The failures are kept in the database: a restart of the server does not reset them. A function stopped starts again when detached with its output collection and attached again, which computes its output again from the records: `revision_history` then loses the revisions it archived.
+
 `count_to_file_async` writes a file, and as in distributed Chroma it is only enabled with `allow_reset: true`. By default it writes in the data path. To write to S3 instead, give the storage under `local_compaction_manager:`, in the format of distributed Chroma, for example:
 
 ```yaml
@@ -192,18 +198,20 @@ Chroma 1.5.9 opens a data path with attached functions, and serves its collectio
 A client that needs to know which server it talks to reads `GET /api/v2/pre-flight-checks`. VecturaDB answers with the fields of Chroma and adds a `server` block, for example:
 
 ```json
-{"max_batch_size": 5461, "supports_base64_encoding": true, "server": {"name": "VecturaDB", "version": "1.0.0-preview.N", "features": ["sparse_vector_index", "bm25", "search", "fork", "api_keys", "indexing_status", "spann"]}}
+{"max_batch_size": 5461, "supports_base64_encoding": true, "server": {"name": "VecturaDB", "version": "1.0.0-preview.N", "features": ["sparse_vector_index", "bm25", "search", "fork", "api_keys", "indexing_status", "attached_functions", "spann", "conditional_transactions"]}}
 ```
 
-`features` lists what VecturaDB has beyond single-node Chroma:
+`features` lists these features of VecturaDB that single-node Chroma does not have:
 
 - `sparse_vector_index`: sparse vector indexes in the schema of a collection;
 - `bm25`: sparse indexes with BM25 scoring;
 - `search`: the Search API, hybrid search included;
 - `fork`: collection fork and fork count;
 - `api_keys`: API keys, as on Chroma Cloud;
-- `indexing_status`: the indexing status of a collection, as on Chroma Cloud;
-- `spann`: SPANN indexes for the collections that ask for them, as on distributed Chroma; absent with `executor: local: spann: false`.
+- `indexing_status`: the indexing status of a collection. Distributed Chroma counts the operations of its log; the single node counts the records, so 3 adds and then 2 deletes count 1 and not 5. An HNSW collection has nothing waiting; a SPANN collection reports the records of its last flush as indexed and the operations of its log after it as not indexed;
+- `attached_functions`: the attached functions of distributed Chroma;
+- `spann`: SPANN indexes for the collections that ask for them, as on distributed Chroma; absent with `executor: local: spann: false`;
+- `conditional_transactions`: the conditional transactions of distributed Chroma; absent with `enable_transactions: false`.
 
 With [API keys](docs/mintlify/guides/deploy/client-server-mode.mdx), only a request with a valid key gets the block. Chroma does not send the block, and the clients of Chroma ignore it. `GET /api/v2/version` answers `1.0.0`, as Chroma does.
 

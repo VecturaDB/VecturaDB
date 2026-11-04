@@ -5899,6 +5899,19 @@ mod tests {
         input: &Collection,
         expected: i64,
     ) -> i64 {
+        let mut total = -1;
+        for _ in 0..100 {
+            total = total_count(frontend, input).await;
+            if total == expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        total
+    }
+
+    // The total_count of the output of the function "counter" of an input collection, -1 without it.
+    async fn total_count(frontend: &mut ServiceBasedFrontend, input: &Collection) -> i64 {
         let attached_function = frontend
             .get_attached_function(
                 TENANT.to_string(),
@@ -5909,38 +5922,29 @@ mod tests {
             .await
             .unwrap();
         let output = attached_function.output_collection_id.unwrap();
-        let mut total = -1;
-        for _ in 0..100 {
-            let got = frontend
-                .get(
-                    GetRequest::try_new(
-                        TENANT.to_string(),
-                        DATABASE.to_string(),
-                        output,
-                        Some(vec!["function_output".to_string()]),
-                        None,
-                        None,
-                        0,
-                        chroma_types::IncludeList(vec![chroma_types::Include::Metadata]),
-                    )
-                    .unwrap(),
+        frontend
+            .get(
+                GetRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    output,
+                    Some(vec!["function_output".to_string()]),
+                    None,
+                    None,
+                    0,
+                    chroma_types::IncludeList(vec![chroma_types::Include::Metadata]),
                 )
-                .await
-                .unwrap();
-            total = got
-                .metadatas
-                .and_then(|metadatas| metadatas.into_iter().next().flatten())
-                .and_then(|metadata| match metadata.get("total_count") {
-                    Some(MetadataValue::Int(total)) => Some(*total),
-                    _ => None,
-                })
-                .unwrap_or(-1);
-            if total == expected {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        total
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .metadatas
+            .and_then(|metadatas| metadatas.into_iter().next().flatten())
+            .and_then(|metadata| match metadata.get("total_count") {
+                Some(MetadataValue::Int(total)) => Some(*total),
+                _ => None,
+            })
+            .unwrap_or(-1)
     }
 
     // A synchronous attached function runs on the single node as in distributed Chroma: attached to a collection that
@@ -6508,6 +6512,310 @@ mod tests {
         add_record(&mut frontend, &collection, "b").await;
         deleted(false).await.unwrap();
         assert_eq!(wait_for_total_count(&mut frontend, &collection, 2).await, 2);
+    }
+
+    // The version of a collection in its SQLite database.
+    async fn version_of(db: &sqlx::SqlitePool, collection: &Collection) -> i64 {
+        sqlx::query_scalar("SELECT version FROM collections WHERE id = $1")
+            .bind(collection.collection_id.to_string())
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
+    // The version of a collection that has the version given, within ten seconds, or its last.
+    async fn wait_for_version(
+        db: &sqlx::SqlitePool,
+        collection: &Collection,
+        expected: i64,
+    ) -> i64 {
+        let mut version = -1;
+        for _ in 0..100 {
+            version = version_of(db, collection).await;
+            if version == expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        version
+    }
+
+    // As the register of distributed Chroma flushes the input collection with the output of its synchronous functions,
+    // the apply of the records of an attach is one more version of the input only once the output is there: the window
+    // waits here for the function, two seconds, with the version as before, and a reader that sees the version reads
+    // the whole output at once.
+    #[tokio::test]
+    async fn the_version_of_an_input_counts_an_apply_after_the_output_of_its_functions() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 3_600).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "versioned_input").await;
+        add_record(&mut frontend, &collection, "a").await;
+        add_record(&mut frontend, &collection, "b").await;
+        add_record(&mut frontend, &collection, "c").await;
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let before = version_of(&db, &collection).await;
+        let (id, created) = frontend
+            .sysdb_client
+            .create_attached_function(
+                "counter".to_string(),
+                chroma_types::FUNCTION_RECORD_COUNTER_NAME.to_string(),
+                collection.collection_id,
+                "counts".to_string(),
+                serde_json::json!({}),
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(created);
+        frontend
+            .log_client
+            .push_logs(
+                TENANT,
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id,
+                vec![chroma_types::OperationRecord {
+                    id: "backfill_id".to_string(),
+                    embedding: Some(vec![0.0, 0.0]),
+                    encoding: None,
+                    metadata: None,
+                    document: None,
+                    operation: chroma_types::Operation::BackfillFn,
+                }],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert_eq!(version_of(&db, &collection).await, before);
+        frontend
+            .sysdb_client
+            .finish_create_attached_function(
+                id,
+                serde_json::to_string(&Schema::new_default(KnnIndex::Hnsw)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_version(&db, &collection, before + 1).await,
+            before + 1
+        );
+        assert_eq!(total_count(&mut frontend, &collection).await, 3);
+        add_record(&mut frontend, &collection, "d").await;
+        assert_eq!(
+            wait_for_version(&db, &collection, before + 2).await,
+            before + 2
+        );
+        assert_eq!(total_count(&mut frontend, &collection).await, 4);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert_eq!(version_of(&db, &collection).await, before + 2);
+        // A client reads the same version.
+        let read = frontend
+            .get_collection(
+                chroma_types::GetCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    "versioned_input".to_string(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.version as i64, before + 2);
+    }
+
+    // A run of the synchronous functions that fails counts no version, as a compaction of distributed Chroma that
+    // fails; the run of the timer that then succeeds, on the function behind, counts one. The run fails here while the
+    // segments of the output collection are not its own.
+    #[tokio::test]
+    async fn a_failed_run_of_a_synchronous_function_counts_its_version_when_it_succeeds() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 1).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "failing_input").await;
+        add_record(&mut frontend, &collection, "a").await;
+        attach_record_counter(&mut frontend, &collection).await;
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 1).await, 1);
+        // As the server: the reference of segments to a table "collection" that does not exist (00009) holds with
+        // foreign keys off.
+        let db = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(root.path().join("chroma.sqlite3"))
+                .foreign_keys(false),
+        )
+        .await
+        .unwrap();
+        let output = frontend
+            .get_attached_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                "counter".to_string(),
+            )
+            .await
+            .unwrap()
+            .output_collection_id
+            .unwrap()
+            .to_string();
+        let segments_of = |from: String, to: String| {
+            sqlx::query("UPDATE segments SET collection = $1 WHERE collection = $2")
+                .bind(to)
+                .bind(from)
+                .execute(&db)
+        };
+        // The run of the attach counts its version right after its output.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let before = version_of(&db, &collection).await;
+        segments_of(output.clone(), "elsewhere".to_string())
+            .await
+            .unwrap();
+        add_record(&mut frontend, &collection, "b").await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(version_of(&db, &collection).await, before);
+        segments_of("elsewhere".to_string(), output).await.unwrap();
+        assert_eq!(
+            wait_for_version(&db, &collection, before + 1).await,
+            before + 1
+        );
+        assert_eq!(total_count(&mut frontend, &collection).await, 2);
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(version_of(&db, &collection).await, before + 1);
+        assert_eq!(failures_of(&db, &collection).await, 0);
+    }
+
+    // The failures in a row of the synchronous function of a collection, in its SQLite database.
+    async fn failures_of(db: &sqlx::SqlitePool, collection: &Collection) -> i32 {
+        sqlx::query_scalar(
+            "SELECT failure_count FROM attached_functions WHERE input_collection_id = $1 AND is_deleted = FALSE",
+        )
+        .bind(collection.collection_id.to_string())
+        .fetch_one(db)
+        .await
+        .unwrap()
+    }
+
+    // A synchronous function whose runs keep failing is tried again after waits that double, from the timer, here one
+    // second, and stops at its fifth failure in a row, as distributed Chroma stops compacting a collection: then the
+    // version of its input stays and no output comes, also once the run could succeed again. Detached and attached
+    // again, it starts again with its backfill. The runs fail here while the segments of the output collection are not
+    // its own.
+    #[tokio::test]
+    async fn a_synchronous_function_that_keeps_failing_stops_after_five_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 1).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "stopped_input").await;
+        add_record(&mut frontend, &collection, "a").await;
+        attach_record_counter(&mut frontend, &collection).await;
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 1).await, 1);
+        // As the server: the reference of segments to a table "collection" that does not exist (00009) holds with
+        // foreign keys off.
+        let db = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(root.path().join("chroma.sqlite3"))
+                .foreign_keys(false),
+        )
+        .await
+        .unwrap();
+        let output = frontend
+            .get_attached_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                "counter".to_string(),
+            )
+            .await
+            .unwrap()
+            .output_collection_id
+            .unwrap()
+            .to_string();
+        let segments_of = |from: String, to: String| {
+            sqlx::query("UPDATE segments SET collection = $1 WHERE collection = $2")
+                .bind(to)
+                .bind(from)
+                .execute(&db)
+        };
+        // The run of the attach counts its version right after its output.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let before = version_of(&db, &collection).await;
+        segments_of(output.clone(), "elsewhere".to_string())
+            .await
+            .unwrap();
+        let first = std::time::Instant::now();
+        add_record(&mut frontend, &collection, "b").await;
+        // The waits of 1, 2, 4 and 8 seconds, each with a jitter of up to as much again.
+        let mut failures = 0;
+        for _ in 0..600 {
+            failures = failures_of(&db, &collection).await;
+            if failures >= 5 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(failures, 5);
+        assert!(first.elapsed() >= std::time::Duration::from_secs(15));
+        segments_of("elsewhere".to_string(), output).await.unwrap();
+        add_record(&mut frontend, &collection, "c").await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(failures_of(&db, &collection).await, 5);
+        assert_eq!(version_of(&db, &collection).await, before);
+        assert_eq!(total_count(&mut frontend, &collection).await, 1);
+        frontend
+            .detach_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                "counter".to_string(),
+                chroma_types::DetachFunctionRequest::try_new(true).unwrap(),
+            )
+            .await
+            .unwrap();
+        attach_record_counter(&mut frontend, &collection).await;
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 3).await, 3);
+        assert_eq!(
+            wait_for_version(&db, &collection, before + 1).await,
+            before + 1
+        );
+        assert_eq!(failures_of(&db, &collection).await, 0);
+    }
+
+    // A window where no function runs, here a function behind without an output collection, which a run skips: the
+    // window of an apply counts its apply, and the runs of the timer on the function behind, each second, count
+    // nothing.
+    #[tokio::test]
+    async fn a_window_where_no_function_runs_counts_its_apply_only() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 1).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "skipped_input").await;
+        add_record(&mut frontend, &collection, "a").await;
+        attach_record_counter(&mut frontend, &collection).await;
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 1).await, 1);
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        // The run of the attach counts its version right after its output.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let before = version_of(&db, &collection).await;
+        sqlx::query(
+            "UPDATE attached_functions SET output_collection_id = NULL WHERE input_collection_id = $1",
+        )
+        .bind(collection.collection_id.to_string())
+        .execute(&db)
+        .await
+        .unwrap();
+        add_record(&mut frontend, &collection, "b").await;
+        assert_eq!(
+            wait_for_version(&db, &collection, before + 1).await,
+            before + 1
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(version_of(&db, &collection).await, before + 1);
     }
 
     // revision_history runs on the records of each window, not on the current records as a backfill: a delete is a

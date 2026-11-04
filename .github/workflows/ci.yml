@@ -315,7 +315,7 @@ jobs:
           RUST_BACKTRACE: 1
         run: >-
           python -m pytest -x -v --color=yes --durations 10
-          chromadb/test/api chromadb/test/test_api.py chromadb/test/test_client.py
+          chromadb/test/api chromadb/test/configurations chromadb/test/test_api.py chromadb/test/test_client.py
           chromadb/test/test_local_sparse_search.py chromadb/test/ef/test_default_ef.py
           chromadb/test/ef/test_chroma_bm25_embedding_function.py
           chromadb/test/property --ignore-glob chromadb/test/property/test_cross_version_persist.py

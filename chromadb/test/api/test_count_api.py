@@ -10,8 +10,6 @@ from chromadb.api.models.Collection import Collection
 from chromadb.api.types import ReadLevel
 from chromadb.test.conftest import (
     ClientFactories,
-    is_spann_disabled_mode,
-    skip_reason_spann_disabled,
 )
 
 
@@ -28,7 +26,7 @@ def _create_test_collection(
     return collection, client
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("spann")
 def test_count_with_read_level_index_and_wal(
     client_factories: ClientFactories,
 ) -> None:
@@ -45,7 +43,7 @@ def test_count_with_read_level_index_and_wal(
     assert count == 3
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("spann")
 def test_count_with_read_level_index_only(
     client_factories: ClientFactories,
 ) -> None:
@@ -65,7 +63,7 @@ def test_count_with_read_level_index_only(
     assert count >= 0
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("spann")
 def test_count_with_read_level_index_and_bounded_wal(
     client_factories: ClientFactories,
 ) -> None:
@@ -85,7 +83,7 @@ def test_count_with_read_level_index_and_bounded_wal(
     assert count >= 0
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.needs("spann")
 def test_count_default_read_level(
     client_factories: ClientFactories,
 ) -> None:
