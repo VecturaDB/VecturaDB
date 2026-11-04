@@ -21,7 +21,6 @@ from chromadb.test.conftest import (
     is_spann_disabled_mode,
     spann_honored,
     skip_if_not_cluster,
-    skip_reason_spann_disabled,
 )
 from chromadb.test.utils.wait_for_version_increase import (
     get_collection_version,
@@ -2475,7 +2474,10 @@ def test_server_validates_invalid_source_key_in_sparse_vector_config(
     )
 
 
-@pytest.mark.skipif(is_spann_disabled_mode, reason=skip_reason_spann_disabled)
+@pytest.mark.skipif(
+    is_spann_disabled_mode,
+    reason="on the single node the default index is HNSW, not SPANN as on distributed Chroma: the _local test checks it",
+)
 def test_modify_collection_no_initial_config_creates_default_schema(
     client: ClientAPI,
 ) -> None:
