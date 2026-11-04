@@ -3929,6 +3929,49 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.message(), ERR_CANNOT_ATTACH_TO_OUTPUT_COLLECTION);
+        // More inputs only for an asynchronous function.
+        let other = function_collection(&sysdb, "other").await;
+        let err = sysdb
+            .add_attached_function_input(id, other)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // As CreateAttachedFunction of the coordinator: an attach whose output collection reaches its input is refused, and
+    // so is one past MAX_ATTACHED_FUNCTION_DEPTH functions in a chain, both on chains of asynchronous functions, which
+    // the output collection of a function can take as input.
+    #[tokio::test]
+    async fn an_attach_that_closes_a_cycle_or_passes_the_maximum_depth_is_refused() {
+        let sysdb = SqliteSysDb::new(
+            get_new_sqlite_db().await,
+            "default".into(),
+            "default".into(),
+        );
+        let mut input = function_collection(&sysdb, "c0").await;
+        for depth in 1..=MAX_ATTACHED_FUNCTION_DEPTH {
+            let (id, _) = attach(&sysdb, "f", "dummy_async", input, &format!("c{depth}"))
+                .await
+                .unwrap();
+            finish(&sysdb, id).await;
+            input = sysdb
+                .get_attached_functions(None, Some(input), vec![], true)
+                .await
+                .unwrap()[0]
+                .output_collection_id
+                .unwrap();
+        }
+        // c0 -> c1 -> ... -> c5: writing into c0 from c5 closes a cycle.
+        let err = attach(&sysdb, "f", "dummy_async", input, "c0")
+            .await
+            .unwrap_err();
+        assert_eq!(err.message(), ERR_CANNOT_ATTACH_TO_OUTPUT_COLLECTION);
+        // A sixth function after the chain of five.
+        let err = attach(&sysdb, "f", "dummy_async", input, "c6")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("depth exceeds maximum"));
     }
 
     #[test]

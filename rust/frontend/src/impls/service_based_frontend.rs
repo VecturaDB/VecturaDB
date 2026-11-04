@@ -6394,6 +6394,244 @@ mod tests {
         }
     }
 
+    // A frontend on a data path whose compaction manager has the timer given.
+    async fn frontend_with_timer(
+        root: &std::path::Path,
+        interval_sec: u64,
+    ) -> ServiceBasedFrontend {
+        let mut config = persistent_config(root, false);
+        config.local_compaction_manager.compaction_interval_sec = interval_sec;
+        ServiceBasedFrontend::try_from_config(&(config, System::new()), &Registry::new())
+            .await
+            .unwrap()
+    }
+
+    async fn attach_record_counter(frontend: &mut ServiceBasedFrontend, collection: &Collection) {
+        frontend
+            .attach_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                AttachFunctionRequest::try_new(
+                    "counter".to_string(),
+                    chroma_types::FUNCTION_RECORD_COUNTER_NAME.to_string(),
+                    "counts".to_string(),
+                    serde_json::json!({}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // The window of an attach waits for its function: here the steps of create_attached_function_with_backfill, with
+    // two seconds between the records of the attach and its ready, and a timer of an hour, so that only the window of
+    // the attach counts the records from before it.
+    #[tokio::test]
+    async fn the_window_of_an_attach_waits_for_its_function() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 3_600).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "waiting_input").await;
+        add_record(&mut frontend, &collection, "a").await;
+        add_record(&mut frontend, &collection, "b").await;
+        let (id, created) = frontend
+            .sysdb_client
+            .create_attached_function(
+                "counter".to_string(),
+                chroma_types::FUNCTION_RECORD_COUNTER_NAME.to_string(),
+                collection.collection_id,
+                "counts".to_string(),
+                serde_json::json!({}),
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(created);
+        frontend
+            .log_client
+            .push_logs(
+                TENANT,
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id,
+                vec![chroma_types::OperationRecord {
+                    id: "backfill_id".to_string(),
+                    embedding: Some(vec![0.0, 0.0]),
+                    encoding: None,
+                    metadata: None,
+                    document: None,
+                    operation: chroma_types::Operation::BackfillFn,
+                }],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        frontend
+            .sysdb_client
+            .finish_create_attached_function(
+                id,
+                serde_json::to_string(&Schema::new_default(KnnIndex::Hnsw)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 2).await, 2);
+    }
+
+    // A synchronous function behind the records applied to its input with no window left for them, as after a kill that
+    // lost the queue of its windows, runs as its backfill at the round of the timer. The window is lost here by a write
+    // while the function is marked deleted.
+    #[tokio::test]
+    async fn a_synchronous_function_behind_its_input_catches_up_at_the_timer() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 1).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "behind_input").await;
+        add_record(&mut frontend, &collection, "a").await;
+        attach_record_counter(&mut frontend, &collection).await;
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 1).await, 1);
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let deleted = |deleted: bool| {
+            sqlx::query(
+                "UPDATE attached_functions SET is_deleted = $1 WHERE input_collection_id = $2",
+            )
+            .bind(deleted)
+            .bind(collection.collection_id.to_string())
+            .execute(&db)
+        };
+        deleted(true).await.unwrap();
+        add_record(&mut frontend, &collection, "b").await;
+        deleted(false).await.unwrap();
+        assert_eq!(wait_for_total_count(&mut frontend, &collection, 2).await, 2);
+    }
+
+    // revision_history runs on the records of each window, not on the current records as a backfill: a delete is a
+    // revision of its own, its tombstone, which no current record shows.
+    #[tokio::test]
+    async fn revision_history_archives_a_delete() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 3_600).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "revised_input").await;
+        frontend
+            .attach_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                AttachFunctionRequest::try_new(
+                    "history".to_string(),
+                    chroma_types::FUNCTION_REVISION_HISTORY_NAME.to_string(),
+                    "revisions".to_string(),
+                    serde_json::json!({}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    vec!["a".to_string()],
+                    vec![vec![1.0, 2.0]],
+                    None,
+                    None,
+                    Some(vec![Some(chroma_types::Metadata::from([(
+                        "version".to_string(),
+                        MetadataValue::Int(1),
+                    )]))]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    Some(vec!["a".to_string()]),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        let output = frontend
+            .get_attached_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                "history".to_string(),
+            )
+            .await
+            .unwrap()
+            .output_collection_id
+            .unwrap();
+        let mut tombstones = 0;
+        for _ in 0..100 {
+            let got = frontend
+                .get(
+                    GetRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        output,
+                        None,
+                        None,
+                        None,
+                        0,
+                        chroma_types::IncludeList(vec![chroma_types::Include::Metadata]),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            tombstones = got
+                .metadatas
+                .iter()
+                .flatten()
+                .flatten()
+                .filter(|metadata| metadata.get("is_delete") == Some(&MetadataValue::Bool(true)))
+                .count();
+            if tombstones > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(tombstones, 1);
+    }
+
+    // Each run reads the output of the run before it once applied: fifty writes at once, each with its window queued
+    // before the output of the first run reaches the compaction manager, are all counted.
+    #[tokio::test]
+    async fn record_counter_counts_fifty_writes_at_once() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 3_600).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "rapid_input").await;
+        attach_record_counter(&mut frontend, &collection).await;
+        futures::future::join_all((0..50).map(|id| {
+            let mut frontend = frontend.clone();
+            let collection = collection.clone();
+            async move { add_record(&mut frontend, &collection, &format!("r{id}")).await }
+        }))
+        .await;
+        assert_eq!(
+            wait_for_total_count(&mut frontend, &collection, 50).await,
+            50
+        );
+    }
+
     fn index_folders(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut folders: Vec<_> = std::fs::read_dir(root)
             .unwrap()
