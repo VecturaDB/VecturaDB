@@ -234,7 +234,7 @@ class FastAPI(Server):
 
         self.router = ChromaAPIRouter()
 
-        self.setup_v1_routes()
+        self.setup_v1_deprecation_route()
         self.setup_v2_routes()
 
         self._app.include_router(self.router)
@@ -1527,6 +1527,25 @@ class FastAPI(Server):
     # =========================================================================
     # OLD ROUTES FOR BACKWARDS COMPATIBILITY — WILL BE REMOVED
     # =========================================================================
+    def setup_v1_deprecation_route(self) -> None:
+        # As the Rust server: the v1 routes authorize a collection without its
+        # tenant and database, so every v1 request is answered with 410.
+        self.router.add_api_route(
+            "/api/v1/{path:path}",
+            self.v1_deprecation_notice,
+            methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+            include_in_schema=False,
+        )
+
+    async def v1_deprecation_notice(self, path: str) -> ORJSONResponse:
+        return ORJSONResponse(
+            status_code=status.HTTP_410_GONE,
+            content={
+                "error": "Unimplemented",
+                "message": "The v1 API is deprecated. Please use /v2 apis",
+            },
+        )
+
     def setup_v1_routes(self) -> None:
         self.router.add_api_route("/api/v1", self.root, methods=["GET"])
         self.router.add_api_route("/api/v1/reset", self.reset, methods=["POST"])
