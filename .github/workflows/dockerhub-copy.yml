@@ -1,0 +1,44 @@
+# Copies a version already on ghcr.io/vecturadb/vecturadb to docker.io/vecturadb/vecturadb without a new build, with its
+# tags of each architecture and, if asked, its channel tag (preview or latest): the same digests on both registries.
+name: Copy an image to Docker Hub
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version on ghcr.io, without the v (for example 1.0.0-preview.6)"
+        required: true
+      channel:
+        description: "Channel tag to move to it on docker.io: preview, latest, or none"
+        required: true
+        default: none
+
+permissions:
+  contents: read
+
+jobs:
+  copy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Copy
+        env:
+          IMAGE: ghcr.io/vecturadb/vecturadb
+          HUB: docker.io/vecturadb/vecturadb
+          VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          case "$CHANNEL" in preview|latest|none) ;; *) echo "channel: preview, latest or none"; exit 1;; esac
+          for arch in amd64 arm64; do
+            docker buildx imagetools create -t "$HUB:$VERSION-$arch" "$IMAGE:$VERSION-$arch"
+          done
+          tags=(-t "$HUB:$VERSION")
+          [ "$CHANNEL" = none ] || tags+=(-t "$HUB:$CHANNEL")
+          docker buildx imagetools create "${tags[@]}" "$IMAGE:$VERSION"
+          test "$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest.Digest}}')" = \
+            "$(docker buildx imagetools inspect "$HUB:$VERSION" --format '{{json .Manifest.Digest}}')"
+          docker buildx imagetools inspect "$HUB:$VERSION"
