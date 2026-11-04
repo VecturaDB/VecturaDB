@@ -226,8 +226,8 @@ pub struct HydratedInputBatch<'me, 'q> {
 }
 
 /// The executor of an asynchronous attached function, by its function_id, as from_attached_function of the worker:
-/// dummy_async and count_to_file_async, this one on the storage given; None for one the single node does not run, as
-/// http_generate and http_currents until Federico decides whether they are on by default (D2b).
+/// dummy_async and count_to_file_async, this one on the storage given; None for one the single node does not run:
+/// http_generate and http_currents, part of Foundations, a service of Chroma Cloud (Federico, 04/11).
 pub fn async_executor(
     attached_function: &AttachedFunction,
     storage: Option<chroma_storage::Storage>,
