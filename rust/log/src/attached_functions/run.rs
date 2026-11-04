@@ -16,6 +16,7 @@ use super::{sync_executor, HydratedInputBatch, OutputRecords};
 use crate::local_compaction_manager::BackfillMessage;
 use crate::{Log, PushLogsError};
 use async_trait::async_trait;
+use backon::{BackoffBuilder, ExponentialBuilder};
 use chroma_blockstore::provider::BlockfileProvider;
 use chroma_error::ChromaError;
 use chroma_segment::blockfile_record::{RecordSegmentReaderShard, RecordSegmentWriterShard};
@@ -34,7 +35,7 @@ use chroma_types::{
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::AtomicU32;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // How long the window of an attach waits for its function to be ready.
@@ -75,8 +76,10 @@ pub async fn behind(
          JOIN max_seq_id ON max_seq_id.segment_id = segments.id \
          WHERE attached_functions.is_deleted = FALSE AND attached_functions.is_ready = TRUE \
          AND functions.is_async = FALSE AND attached_functions.completion_offset < CAST(max_seq_id.seq_id AS INTEGER) \
+         AND attached_functions.failure_count < $1 \
          GROUP BY attached_functions.input_collection_id",
     )
+    .bind(MAX_FAILURE_COUNT)
     .fetch_all(sqlite_db.get_conn())
     .await
     .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)?;
@@ -185,6 +188,29 @@ pub struct FunctionRunner {
     pub backfill: Option<Box<dyn ReceiverForMessage<BackfillMessage>>>,
     /// The storage of the single node, which count_to_file_async writes to: its data folder, or S3 when configured.
     pub storage: Option<chroma_storage::Storage>,
+    /// The next try of the synchronous functions of the collections whose last run failed.
+    pub sync_retries: SyncRetries,
+    /// The first wait after a failed run of synchronous functions: the timer of the compaction manager.
+    pub sync_retry_delay: Duration,
+}
+
+/// The collections whose synchronous functions failed their last run, with the time of their next try.
+pub type SyncRetries = Arc<Mutex<HashMap<CollectionUuid, tokio::time::Instant>>>;
+
+// The wait after the given failures in a row of the synchronous functions of a collection (Federico, 04/11: an
+// exponential backoff with jitter and a maximum, then as distributed Chroma): the first is the timer, each doubles, with
+// a jitter of up to as much again. At MAX_FAILURE_COUNT failures the functions stop, as distributed Chroma stops
+// compacting a collection after max_failure_count failures (scheduler.rs). The longest wait is 5 minutes, which a timer
+// of the default 10 s does not reach before the stop. The failures are those of the function in SQLite, which a run that
+// succeeds resets.
+fn sync_retry_wait(first: Duration, failures: i32) -> Option<Duration> {
+    ExponentialBuilder::default()
+        .with_min_delay(first)
+        .with_max_delay(Duration::from_secs(300))
+        .with_max_times(MAX_FAILURE_COUNT as usize)
+        .with_jitter()
+        .build()
+        .nth(failures.max(1) as usize - 1)
 }
 
 impl FunctionRunner {
@@ -202,6 +228,63 @@ impl FunctionRunner {
             .into_iter()
             .filter(|function| !function.is_async)
             .collect())
+    }
+
+    /// Whether the synchronous functions of a collection whose last run failed can be tried again.
+    fn sync_retry_due(&self, collection_id: CollectionUuid) -> bool {
+        self.sync_retries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&collection_id)
+            .is_none_or(|next| *next <= tokio::time::Instant::now())
+    }
+
+    // Whether a synchronous function of the collection is stopped after MAX_FAILURE_COUNT failures: as distributed
+    // Chroma stops compacting the collection, an apply counts no version until the function is detached.
+    async fn has_stopped_sync_function(
+        &self,
+        collection_id: CollectionUuid,
+    ) -> Result<bool, Box<dyn ChromaError>> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM attached_functions JOIN functions ON functions.id = attached_functions.function_id \
+             WHERE attached_functions.input_collection_id = $1 AND attached_functions.is_deleted = FALSE \
+             AND functions.is_async = FALSE AND attached_functions.failure_count >= $2)",
+        )
+        .bind(collection_id.to_string())
+        .bind(MAX_FAILURE_COUNT)
+        .fetch_one(self.sqlite_db.get_conn())
+        .await
+        .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)
+    }
+
+    // A failed run: one more failure of each ready synchronous function of the collection, as FailAttachedFunction of
+    // distributed Chroma, and its next try after the wait for its failures; none at the stop.
+    async fn fail_sync_functions(
+        &self,
+        collection_id: CollectionUuid,
+    ) -> Result<(), Box<dyn ChromaError>> {
+        let mut most = 0;
+        for function in self.ready_sync_functions(collection_id).await? {
+            let failures = self
+                .sysdb
+                .clone()
+                .fail_attached_function(chroma_types::chroma_proto::FailAttachedFunctionRequest {
+                    attached_function_id: function.id.0.to_string(),
+                    collection_id: collection_id.to_string(),
+                })
+                .await
+                .map_err(|e| Box::new(chroma_error::TonicError(e)) as Box<dyn ChromaError>)?;
+            most = most.max(failures);
+        }
+        if most < MAX_FAILURE_COUNT {
+            if let Some(wait) = sync_retry_wait(self.sync_retry_delay, most) {
+                self.sync_retries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(collection_id, tokio::time::Instant::now() + wait);
+            }
+        }
+        Ok(())
     }
 
     // Whether a synchronous function of the collection is attached and not ready yet: the window of its attach waits
@@ -226,7 +309,19 @@ impl FunctionRunner {
         if window.asynchronous {
             return self.run_asynchronous(window).await;
         }
-        let ran = self.run_synchronous(&window).await?;
+        let input_id = window.input.collection.collection_id;
+        // A collection whose functions failed waits for their next try, and one whose function stopped counts nothing:
+        // the run of the timer on the function behind covers the records of the window.
+        if !self.sync_retry_due(input_id) || self.has_stopped_sync_function(input_id).await? {
+            return Ok(());
+        }
+        let ran = match self.run_synchronous(&window).await {
+            Ok(ran) => ran,
+            Err(err) => {
+                self.fail_sync_functions(input_id).await?;
+                return Err(err);
+            }
+        };
         // As the register of distributed Chroma flushes the input collection with the output of its synchronous
         // functions (FinishAttachedFunctionOperator), one more version of the input once their output is applied: a
         // reader that waits for the version reads the output. A run that fails counts nothing, as a compaction of

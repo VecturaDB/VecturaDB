@@ -176,6 +176,7 @@ pub struct LocalCompactionManager {
     shutdown_grace: Duration,
     // The synchronous attached functions: see FunctionRuns.
     function_runs: FunctionRuns,
+    sync_retries: attached_functions::run::SyncRetries,
     // The storage of local_compaction_manager: storage, when set, for the files of the attached functions.
     function_storage: Option<chroma_storage::Storage>,
 }
@@ -447,6 +448,7 @@ impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
             background: tokio_util::task::TaskTracker::new(),
             shutdown_grace: Duration::from_secs(config.shutdown_grace_sec),
             function_runs: FunctionRuns::default(),
+            sync_retries: Default::default(),
             function_storage,
         };
         registry.register(res.clone());
@@ -1264,6 +1266,8 @@ impl LocalCompactionManager {
             sysdb: self.sysdb.clone(),
             sqlite_db: self.sqlite_db.clone(),
             backfill: None,
+            sync_retries: self.sync_retries.clone(),
+            sync_retry_delay: self.compaction_interval,
             storage: self.function_storage.clone().or_else(|| {
                 self.hnsw_segment_manager
                     .spann_provider()

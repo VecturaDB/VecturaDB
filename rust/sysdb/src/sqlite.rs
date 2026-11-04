@@ -1433,15 +1433,15 @@ impl SqliteSysDb {
     // The update of the completion offset of FlushCollectionCompactionsAndAttachedFunction of the coordinator (its
     // Update of the store, go/pkg/sysdb/metastore/db/dao/task.go): the rows of the attached function, of every input, not
     // deleted; none is ErrAttachedFunctionNotFound. The single node flushes no collection with it: the output of a
-    // function goes through the log of its output collection.
+    // function goes through the log of its output collection. A run that succeeds resets the failures of the function.
     pub(crate) async fn update_attached_function_completion_offset(
         &self,
         attached_function_id: AttachedFunctionUuid,
         completion_offset: u64,
     ) -> Result<(), tonic::Status> {
         let updated = sqlx::query(
-            "UPDATE attached_functions SET completion_offset = $1, updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
-             WHERE id = $2 AND is_deleted = FALSE",
+            "UPDATE attached_functions SET completion_offset = $1, failure_count = 0, \
+             updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') WHERE id = $2 AND is_deleted = FALSE",
         )
         .bind(completion_offset as i64)
         .bind(attached_function_id.0.to_string())

@@ -104,6 +104,7 @@ impl Fixture {
             background: tokio_util::task::TaskTracker::new(),
             shutdown_grace: Duration::from_secs(30),
             function_runs: Default::default(),
+            sync_retries: Default::default(),
             function_storage: None,
         });
         Self {
@@ -258,6 +259,7 @@ impl Fixture {
             background: background.clone(),
             shutdown_grace: Duration::from_secs(30),
             function_runs: Default::default(),
+            sync_retries: Default::default(),
             function_storage: None,
         });
         background
@@ -1812,6 +1814,7 @@ async fn replaced_spann_versions_are_forgotten_after_the_grace() {
         background: tokio_util::task::TaskTracker::new(),
         shutdown_grace: Duration::from_secs(30),
         function_runs: Default::default(),
+        sync_retries: Default::default(),
         function_storage: None,
     };
     let collection = Collection::test_collection(3);
