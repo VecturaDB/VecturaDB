@@ -193,6 +193,33 @@ class AuthzResource:
     collection: Optional[str]
 
 
+def user_can_access_resource(
+    user: UserIdentity, action: AuthzAction, resource: AuthzResource
+) -> bool:
+    """
+    Whether the resource is in the tenant and the databases of the user, with
+    the rules of the API keys of the Rust server (rust/frontend/src/token_auth.rs):
+    a user of a tenant sees that tenant only, and a user of some databases sees
+    those databases only; such a user may get its tenant and list its
+    databases, but not create or delete a database. A user with no tenant, or
+    with the tenant "*", is not limited.
+    """
+    if user.tenant is None or user.tenant == "*":
+        return True
+    # Tenants and the whole server belong to no tenant user.
+    if action in (AuthzAction.CREATE_TENANT, AuthzAction.RESET):
+        return False
+    if resource.tenant != user.tenant:
+        return False
+    if user.databases is None or "*" in user.databases:
+        return True
+    if action in (AuthzAction.GET_TENANT, AuthzAction.LIST_DATABASES):
+        return True
+    if action in (AuthzAction.CREATE_DATABASE, AuthzAction.DELETE_DATABASE):
+        return False
+    return resource.database in user.databases
+
+
 class ServerAuthorizationProvider(Component):
     """
     ServerAuthorizationProvider is responsible for authorizing requests. If a
