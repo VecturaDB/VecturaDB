@@ -196,7 +196,7 @@ Chroma 1.5.9 opens a data path with attached functions, and serves its collectio
 A client that needs to know which server it talks to reads `GET /api/v2/pre-flight-checks`. VecturaDB answers with the fields of Chroma and adds a `server` block, for example:
 
 ```json
-{"max_batch_size": 5461, "supports_base64_encoding": true, "server": {"name": "VecturaDB", "version": "1.0.0-preview.N", "features": ["sparse_vector_index", "bm25", "search", "fork", "api_keys", "indexing_status", "spann"]}}
+{"max_batch_size": 5461, "supports_base64_encoding": true, "server": {"name": "VecturaDB", "version": "1.0.0-preview.N", "features": ["sparse_vector_index", "bm25", "search", "fork", "api_keys", "indexing_status", "attached_functions", "spann", "conditional_transactions"]}}
 ```
 
 `features` lists what VecturaDB has beyond single-node Chroma:
@@ -207,7 +207,9 @@ A client that needs to know which server it talks to reads `GET /api/v2/pre-flig
 - `fork`: collection fork and fork count;
 - `api_keys`: API keys, as on Chroma Cloud;
 - `indexing_status`: the indexing status of a collection, as on Chroma Cloud;
-- `spann`: SPANN indexes for the collections that ask for them, as on distributed Chroma; absent with `executor: local: spann: false`.
+- `attached_functions`: the attached functions of distributed Chroma;
+- `spann`: SPANN indexes for the collections that ask for them, as on distributed Chroma; absent with `executor: local: spann: false`;
+- `conditional_transactions`: the conditional transactions of distributed Chroma; absent with `enable_transactions: false`.
 
 With [API keys](docs/mintlify/guides/deploy/client-server-mode.mdx), only a request with a valid key gets the block. Chroma does not send the block, and the clients of Chroma ignore it. `GET /api/v2/version` answers `1.0.0`, as Chroma does.
 
