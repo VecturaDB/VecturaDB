@@ -1,12 +1,15 @@
 use crate::utils::{CliError, UtilsError};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input, Select};
+use std::io::IsTerminal;
 
 pub trait Terminal {
     fn println(&mut self, msg: &str);
     fn prompt_input(&mut self) -> Result<String, CliError>;
     fn prompt_select(&mut self, items: &[String]) -> Result<usize, CliError>;
     fn prompt_confirm(&mut self, prompt: &str) -> Result<bool, CliError>;
+    /// Whether someone can answer a question here: not in a Docker command without -it, or in a script.
+    fn can_ask(&self) -> bool;
 }
 
 pub struct SystemTerminal;
@@ -39,6 +42,10 @@ impl Terminal for SystemTerminal {
             .map_err(|_| UtilsError::UserInputFailed)?;
         Ok(confirmed)
     }
+
+    fn can_ask(&self) -> bool {
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    }
 }
 
 #[cfg(test)]
@@ -50,6 +57,7 @@ pub mod test_terminal {
         pub output: Vec<String>,
         inputs: Vec<String>,
         input_index: usize,
+        can_ask: bool,
     }
 
     impl TestTerminal {
@@ -58,7 +66,13 @@ pub mod test_terminal {
                 output: Vec::new(),
                 inputs: Vec::new(),
                 input_index: 0,
+                can_ask: true,
             }
+        }
+
+        pub fn without_prompts(mut self) -> Self {
+            self.can_ask = false;
+            self
         }
 
         pub fn with_inputs(mut self, inputs: Vec<&str>) -> Self {
@@ -96,6 +110,10 @@ pub mod test_terminal {
         fn prompt_confirm(&mut self, _prompt: &str) -> Result<bool, CliError> {
             let input = self.next_input()?;
             Ok(input.to_lowercase() == "y" || input.to_lowercase() == "yes")
+        }
+
+        fn can_ask(&self) -> bool {
+            self.can_ask
         }
     }
 }

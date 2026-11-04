@@ -20,6 +20,15 @@ chroma copy --from-local collections [collection names]
 - `db` - The name of the Chroma Cloud DB with the collections you want to copy. If not provided, the CLI will prompt you to select a DB from those available on your active [profile](./profile).
 - `host` - The host of your local Chroma server. This argument conflicts with `path`.
 - `path` - The path of your local Chroma data. If provided, the CLI will use the data path to start a local Chroma server at an available port for browsing. This argument conflicts with `host`.
+- `resume` - On the collections already on the target, adds the records they do not have, and leaves the others as they are.
+- `force` - Makes the collections already on the target exact copies of the source: adds what they do not have, writes again what is different, removes what is not on the source and, with another schema, creates them again.
+- `yes` - With `resume` or `force`, does not ask for each collection. Without a terminal, the CLI cannot ask, and leaves those collections as they are unless you pass it.
+
+### A collection already on the target
+
+Before it writes anything, the CLI compares every collection already on the target with its source, record by record, and tells you how many records are the same, missing, different and only on the target. A collection that is the same is left alone. For the others, the CLI asks what to do, also when you pass `resume` or `force`. To go on with a copy that stopped, run the same command with `resume`.
+
+The CLI waits when a server refuses a write for now, when a server fails and when the network falls, and tells you why it waits.
 
 ### Copy from Local to Chroma Cloud
 
