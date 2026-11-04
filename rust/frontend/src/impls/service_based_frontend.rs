@@ -5758,7 +5758,16 @@ mod tests {
 
     // A frontend with its HNSW indexes in files under `root`, and its SQLite database there too, as `chroma run`.
     async fn persistent_frontend(root: &std::path::Path) -> ServiceBasedFrontend {
+        persistent_frontend_with(root, false).await
+    }
+
+    // With allow_reset, which count_to_file_async, a function of the tests of distributed Chroma, asks for.
+    async fn persistent_frontend_with(
+        root: &std::path::Path,
+        allow_reset: bool,
+    ) -> ServiceBasedFrontend {
         let mut config = FrontendConfig::sqlite_in_memory();
+        config.allow_reset = allow_reset;
         config.sqlitedb = Some(chroma_sqlite::config::SqliteDBConfig {
             url: Some(root.join("chroma.sqlite3").to_str().unwrap().to_string()),
             ..Default::default()
@@ -6004,6 +6013,133 @@ mod tests {
             completion_offset > 0,
             "completion offset {completion_offset}"
         );
+    }
+
+    async fn attach_count_to_file(
+        frontend: &mut ServiceBasedFrontend,
+        collection: &Collection,
+        path: &str,
+    ) {
+        frontend
+            .attach_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                AttachFunctionRequest::try_new(
+                    "file_counter".to_string(),
+                    chroma_types::FUNCTION_COUNT_TO_FILE_ASYNC_NAME.to_string(),
+                    "file_counts".to_string(),
+                    serde_json::json!({ "s3_path": path }),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // The count that count_to_file_async writes to the storage of the single node, once it reaches the one expected.
+    async fn wait_for_file_count(file: &std::path::Path, expected: i64) -> Option<i64> {
+        let mut count = None;
+        for _ in 0..150 {
+            count = std::fs::read_to_string(file)
+                .ok()
+                .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                .and_then(|state| state["count"].as_i64());
+            if count == Some(expected) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        count
+    }
+
+    // An asynchronous function runs on the single node as from the queue of distributed Chroma: attached to a collection
+    // that has records, it counts them (its backfill); then the writes after, an id added again once and a delete taken
+    // off, against the state of the records kept before each apply.
+    #[tokio::test]
+    async fn count_to_file_async_counts_the_records_of_its_input_collection() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = persistent_frontend_with(root.path(), true).await;
+        let collection = create_collection_for(&mut frontend, TENANT, DATABASE, "file_input").await;
+        add_record(&mut frontend, &collection, "a").await;
+        add_record(&mut frontend, &collection, "b").await;
+        attach_count_to_file(&mut frontend, &collection, "s3://any-bucket/counts/a.json").await;
+        let file = root.path().join("counts/a.json");
+        assert_eq!(wait_for_file_count(&file, 2).await, Some(2));
+        add_record(&mut frontend, &collection, "c").await;
+        add_record(&mut frontend, &collection, "a").await;
+        assert_eq!(wait_for_file_count(&file, 3).await, Some(3));
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    Some(vec!["b".to_string()]),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wait_for_file_count(&file, 2).await, Some(2));
+        // The state kept before the applies goes once the function has run past it.
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut kept = -1;
+        for _ in 0..100 {
+            kept = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM attached_function_prior")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            if kept == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(kept, 0);
+    }
+
+    // An asynchronous function that keeps failing is dead-lettered after 5 failures, as the consumer of distributed
+    // Chroma does: here a path the storage cannot take.
+    #[tokio::test]
+    async fn an_asynchronous_function_that_keeps_failing_is_dead_lettered() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = persistent_frontend_with(root.path(), true).await;
+        let collection = create_collection_for(&mut frontend, TENANT, DATABASE, "dlq_input").await;
+        attach_count_to_file(&mut frontend, &collection, "s3://bucket-without-key/").await;
+        add_record(&mut frontend, &collection, "a").await;
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut failures = 0;
+        for _ in 0..600 {
+            failures = sqlx::query_scalar::<_, i32>(
+                "SELECT failure_count FROM attached_functions WHERE input_collection_id = $1",
+            )
+            .bind(collection.collection_id.to_string())
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            if failures >= 5 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(failures, 5);
+        // Dead-lettered: no more runs, and no more state kept for it.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let failures: i32 = sqlx::query_scalar(
+            "SELECT failure_count FROM attached_functions WHERE input_collection_id = $1",
+        )
+        .bind(collection.collection_id.to_string())
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(failures, 5);
     }
 
     // An attach to a collection with no record yet, then writes: they are counted.

@@ -55,6 +55,8 @@ pub struct FunctionWindow {
     /// numbers the records of every collection in one sequence, so the window of a collection starts after it, not
     /// after the record before its first.
     pub applied_before: u64,
+    /// A run of the asynchronous functions of the collection, up to `end`, where the others are of the synchronous ones.
+    pub asynchronous: bool,
 }
 
 /// The input collections of the ready synchronous functions behind the records applied to them, with the log offset of
@@ -171,6 +173,8 @@ pub struct FunctionRunner {
     pub sqlite_db: SqliteDb,
     /// The backfill of the compaction manager, which applies the output to the segments of its output collection.
     pub backfill: Option<Box<dyn ReceiverForMessage<BackfillMessage>>>,
+    /// The storage of the single node, which count_to_file_async writes to: its data folder, or S3 when configured.
+    pub storage: Option<chroma_storage::Storage>,
 }
 
 impl FunctionRunner {
@@ -190,8 +194,28 @@ impl FunctionRunner {
             .collect())
     }
 
+    // Whether a synchronous function of the collection is attached and not ready yet: the window of its attach waits
+    // for it, where one of an asynchronous function does not.
+    async fn has_sync_function_not_ready(
+        &self,
+        collection_id: CollectionUuid,
+    ) -> Result<bool, Box<dyn ChromaError>> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM attached_functions JOIN functions ON functions.id = attached_functions.function_id \
+             WHERE attached_functions.input_collection_id = $1 AND attached_functions.is_deleted = FALSE \
+             AND attached_functions.is_ready = FALSE AND functions.is_async = FALSE)",
+        )
+        .bind(collection_id.to_string())
+        .fetch_one(self.sqlite_db.get_conn())
+        .await
+        .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)
+    }
+
     /// Runs the ready synchronous functions of the input collection of a window on it.
     pub async fn run(&self, window: FunctionWindow) -> Result<(), Box<dyn ChromaError>> {
+        if window.asynchronous {
+            return self.run_asynchronous(window).await;
+        }
         let input_id = window.input.collection.collection_id;
         let mut functions = self.ready_sync_functions(input_id).await?;
         // The window of an attach waits for its function, which the frontend makes ready right after writing the records
@@ -201,7 +225,11 @@ impl FunctionRunner {
             .iter()
             .any(|(record, _)| record.record.operation == Operation::BackfillFn);
         let mut waited = 0;
-        while attaches && functions.is_empty() && waited < ATTACH_WAIT_SECONDS {
+        while attaches
+            && functions.is_empty()
+            && waited < ATTACH_WAIT_SECONDS
+            && self.has_sync_function_not_ready(input_id).await?
+        {
             tokio::time::sleep(Duration::from_secs(1)).await;
             waited += 1;
             functions = self.ready_sync_functions(input_id).await?;
@@ -552,4 +580,350 @@ async fn in_memory_record_segment(
         .map_err(|e| e.boxed())?;
     segment.file_path = writer.commit().await?.flush().await?;
     Ok(segment)
+}
+
+/// The maximum of failures of an asynchronous function before its work is dead-lettered, as max_failure_count of the
+/// consumer of distributed Chroma (rust/worker/src/fn_consumer/config.rs).
+pub const MAX_FAILURE_COUNT: i32 = 5;
+
+/// Whether a collection has an asynchronous attached function not deleted and not dead-lettered, ready or not yet: its
+/// applies keep the state before them.
+pub async fn has_live_async_functions(
+    sqlite_db: &SqliteDb,
+    collection_id: CollectionUuid,
+) -> Result<bool, Box<dyn ChromaError>> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM attached_functions JOIN functions ON functions.id = attached_functions.function_id \
+         WHERE attached_functions.input_collection_id = $1 AND attached_functions.is_deleted = FALSE \
+         AND functions.is_async = TRUE AND attached_functions.failure_count < $2)",
+    )
+    .bind(collection_id.to_string())
+    .bind(MAX_FAILURE_COUNT)
+    .fetch_one(sqlite_db.get_conn())
+    .await
+    .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)
+}
+
+/// The state before an apply of the records it touches, in the transaction of the apply (00017).
+pub async fn record_prior(
+    conn: &mut sqlx::SqliteConnection,
+    collection_id: CollectionUuid,
+    logs: &Chunk<LogRecord>,
+    before: &[ProjectionRecord],
+) -> Result<(), Box<dyn ChromaError>> {
+    let sqlx_error = |e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>;
+    let Some(window_start) = logs.iter().map(|(record, _)| record.log_offset).min() else {
+        return Ok(());
+    };
+    let collection = collection_id.to_string();
+    sqlx::query(
+        "INSERT OR IGNORE INTO attached_function_prior_since (input_collection_id, since) VALUES ($1, $2)",
+    )
+    .bind(&collection)
+    .bind(window_start)
+    .execute(&mut *conn)
+    .await
+    .map_err(sqlx_error)?;
+    let before = before
+        .iter()
+        .map(|record| (record.id.as_str(), record))
+        .collect::<HashMap<_, _>>();
+    let mut ids = logs
+        .iter()
+        .map(|(record, _)| record.record.id.as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        let record = before.get(id);
+        let metadata = record
+            .and_then(|record| record.metadata.as_ref())
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                Box::new(chroma_error::TonicError(tonic::Status::internal(
+                    e.to_string(),
+                ))) as Box<dyn ChromaError>
+            })?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO attached_function_prior \
+             (input_collection_id, window_start, id, existed, metadata, document) VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&collection)
+        .bind(window_start)
+        .bind(id)
+        .bind(record.is_some())
+        .bind(metadata)
+        .bind(record.and_then(|record| record.document.clone()))
+        .execute(&mut *conn)
+        .await
+        .map_err(sqlx_error)?;
+    }
+    Ok(())
+}
+
+/// The input collections whose asynchronous functions, ready and not dead-lettered, are behind the records applied to
+/// them, with the log offset of the last record applied; and the state kept before the applies of collections that no
+/// longer have such a function goes, as their last function was detached or dead-lettered.
+pub async fn async_due(
+    sqlite_db: &SqliteDb,
+) -> Result<Vec<(CollectionUuid, u64)>, Box<dyn ChromaError>> {
+    let sqlx_error = |e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>;
+    let live = "SELECT attached_functions.input_collection_id FROM attached_functions \
+                JOIN functions ON functions.id = attached_functions.function_id \
+                WHERE attached_functions.is_deleted = FALSE AND functions.is_async = TRUE \
+                AND attached_functions.failure_count < $1";
+    for table in ["attached_function_prior", "attached_function_prior_since"] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE input_collection_id NOT IN ({live})"
+        ))
+        .bind(MAX_FAILURE_COUNT)
+        .execute(sqlite_db.get_conn())
+        .await
+        .map_err(sqlx_error)?;
+    }
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT attached_functions.input_collection_id, MAX(CAST(max_seq_id.seq_id AS INTEGER)) \
+         FROM attached_functions \
+         JOIN functions ON functions.id = attached_functions.function_id \
+         JOIN segments ON segments.collection = attached_functions.input_collection_id AND segments.scope = 'METADATA' \
+         JOIN max_seq_id ON max_seq_id.segment_id = segments.id \
+         WHERE attached_functions.is_deleted = FALSE AND attached_functions.is_ready = TRUE \
+         AND functions.is_async = TRUE AND attached_functions.failure_count < $1 \
+         AND attached_functions.completion_offset < CAST(max_seq_id.seq_id AS INTEGER) \
+         GROUP BY attached_functions.input_collection_id",
+    )
+    .bind(MAX_FAILURE_COUNT)
+    .fetch_all(sqlite_db.get_conn())
+    .await
+    .map_err(sqlx_error)?;
+    rows.into_iter()
+        .map(|(id, applied)| {
+            CollectionUuid::from_str(&id)
+                .map(|id| (id, applied.max(0) as u64))
+                .map_err(|e| {
+                    Box::new(chroma_error::TonicError(tonic::Status::internal(
+                        e.to_string(),
+                    ))) as Box<dyn ChromaError>
+                })
+        })
+        .collect()
+}
+
+impl FunctionRunner {
+    // The asynchronous functions of a collection, as the consumer of distributed Chroma runs one item of its queue
+    // (rust/worker/src/execution/orchestration/function_execution.rs): the records after the completion offset,
+    // materialized against their state at it, or, for a function behind what the collection keeps of it, as its
+    // backfill; then TryFinishAsyncAttachedFunctionInvocation, or FailAttachedFunction on an error, which after
+    // MAX_FAILURE_COUNT failures dead-letters it. The queue of the single node is the rows of attached_functions
+    // (Federico, 04/11), where distributed Chroma keeps a queue of its own.
+    async fn run_asynchronous(&self, window: FunctionWindow) -> Result<(), Box<dyn ChromaError>> {
+        let input_id = window.input.collection.collection_id;
+        let functions = self
+            .sysdb
+            .clone()
+            .get_attached_functions(None, Some(input_id), vec![], true)
+            .await
+            .map_err(|e| e.boxed())?
+            .into_iter()
+            .filter(|function| function.is_async && function.failure_count < MAX_FAILURE_COUNT);
+        for function in functions {
+            if function.completion_offset >= window.end {
+                continue;
+            }
+            match self.run_one_asynchronous(&window, &function).await {
+                Ok(()) => {}
+                Err(err) => {
+                    tracing::warn!(attached_function_id = %function.id, error = %err, "An asynchronous attached function failed");
+                    self.sysdb
+                        .clone()
+                        .fail_attached_function(
+                            chroma_types::chroma_proto::FailAttachedFunctionRequest {
+                                attached_function_id: function.id.0.to_string(),
+                                collection_id: input_id.to_string(),
+                            },
+                        )
+                        .await
+                        .map_err(|e| {
+                            Box::new(chroma_error::TonicError(e)) as Box<dyn ChromaError>
+                        })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_one_asynchronous(
+        &self,
+        window: &FunctionWindow,
+        function: &chroma_types::AttachedFunction,
+    ) -> Result<(), Box<dyn ChromaError>> {
+        let input = &window.input;
+        let input_id = input.collection.collection_id;
+        let invalid = |e: String| {
+            Box::new(chroma_error::TonicError(tonic::Status::invalid_argument(e)))
+                as Box<dyn ChromaError>
+        };
+        let Some(executor) =
+            super::async_executor(function, self.storage.clone()).map_err(invalid)?
+        else {
+            return Err(invalid(format!(
+                "the single node does not run the attached function {}",
+                function.function_id
+            )));
+        };
+        let database = DatabaseName::new(input.collection.database.clone())
+            .ok_or_else(|| invalid("invalid database name of an input collection".to_string()))?;
+        let completion_offset = function.completion_offset;
+        let logs = self
+            .log
+            .clone()
+            .read(
+                &input.collection.tenant,
+                database,
+                input_id,
+                completion_offset as i64,
+                -1,
+                None,
+            )
+            .await?
+            .into_iter()
+            .filter(|record| record.log_offset as u64 <= window.end)
+            .collect::<Vec<_>>();
+        let since: Option<i64> = sqlx::query_scalar(
+            "SELECT since FROM attached_function_prior_since WHERE input_collection_id = $1",
+        )
+        .bind(input_id.to_string())
+        .fetch_optional(self.sqlite_db.get_conn())
+        .await
+        .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)?;
+        let first = logs.first().map(|record| record.log_offset);
+        // As distributed Chroma runs a function behind what it keeps of the collection as its backfill: on every current
+        // record, as new, with no output read.
+        let covered = match (first, since) {
+            (None, _) => true,
+            (Some(first), Some(since)) => since <= first,
+            (Some(_), None) => false,
+        };
+        let output = match function.output_collection_id {
+            Some(output_id) => Some(
+                self.sysdb
+                    .clone()
+                    .get_collection_with_segments(None, output_id)
+                    .await
+                    .map_err(|e| e.boxed())?,
+            ),
+            None => None,
+        };
+        let (records, end) = if !covered {
+            let (current, end) = self.current_records(input).await?;
+            let records = self.execute_backfill(input, current, &*executor).await?;
+            (records, end.max(window.end))
+        } else if logs.is_empty() {
+            (Vec::new(), window.end)
+        } else {
+            let logs = Chunk::new(Arc::from(logs));
+            let before = self.prior(input_id, completion_offset).await?;
+            let run = FunctionWindow {
+                input: input.clone(),
+                logs,
+                before,
+                end: window.end,
+                applied_before: completion_offset,
+                asynchronous: true,
+            };
+            let reader = output.as_ref().map(|output| SqliteOutputRecords {
+                sqlite_db: self.sqlite_db.clone(),
+                output: output.clone(),
+            });
+            let records = self
+                .execute_window(
+                    &run,
+                    &*executor,
+                    reader.as_ref().map(|r| r as &dyn OutputRecords),
+                )
+                .await?;
+            (records, window.end)
+        };
+        if let Some(output) = &output {
+            if !records.is_empty() {
+                self.push_output(output, records).await?;
+                if let Some(backfill) = &self.backfill {
+                    backfill
+                        .send(
+                            BackfillMessage {
+                                collection_id: output.collection.collection_id,
+                            },
+                            None,
+                        )
+                        .await
+                        .map_err(|e| e.boxed())?;
+                    self.wait_for_apply(output).await?;
+                }
+            }
+        }
+        self.sysdb
+            .clone()
+            .try_finish_async_attached_function_invocation(
+                chroma_types::chroma_proto::TryFinishAsyncAttachedFunctionInvocationRequest {
+                    attached_function_id: function.id.0.to_string(),
+                    collection_id: input_id.to_string(),
+                    new_completion_offset: end,
+                },
+            )
+            .await
+            .map_err(|e| Box::new(chroma_error::TonicError(e)) as Box<dyn ChromaError>)?;
+        // The state before the applies that every asynchronous function of the collection has run past goes.
+        sqlx::query(
+            "DELETE FROM attached_function_prior WHERE input_collection_id = $1 AND window_start <= \
+             (SELECT MIN(attached_functions.completion_offset) FROM attached_functions \
+              JOIN functions ON functions.id = attached_functions.function_id \
+              WHERE attached_functions.input_collection_id = $1 AND attached_functions.is_deleted = FALSE \
+              AND functions.is_async = TRUE AND attached_functions.failure_count < $2)",
+        )
+        .bind(input_id.to_string())
+        .bind(MAX_FAILURE_COUNT)
+        .execute(self.sqlite_db.get_conn())
+        .await
+        .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)?;
+        Ok(())
+    }
+
+    // The records as they were at the completion offset, from the state kept before the applies after it: for each id,
+    // the state before the first apply after the offset that touched it; those that did not exist then are left out.
+    async fn prior(
+        &self,
+        input_id: CollectionUuid,
+        completion_offset: u64,
+    ) -> Result<Vec<ProjectionRecord>, Box<dyn ChromaError>> {
+        let rows: Vec<(String, bool, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, existed, metadata, document FROM attached_function_prior AS p \
+             WHERE input_collection_id = $1 AND window_start > $2 AND window_start = \
+             (SELECT MIN(window_start) FROM attached_function_prior AS q \
+              WHERE q.input_collection_id = p.input_collection_id AND q.id = p.id AND q.window_start > $2)",
+        )
+        .bind(input_id.to_string())
+        .bind(completion_offset as i64)
+        .fetch_all(self.sqlite_db.get_conn())
+        .await
+        .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)?;
+        rows.into_iter()
+            .filter(|(_, existed, _, _)| *existed)
+            .map(|(id, _, metadata, document)| {
+                Ok(ProjectionRecord {
+                    id,
+                    document,
+                    embedding: None,
+                    metadata: metadata
+                        .map(|metadata| serde_json::from_str::<Metadata>(&metadata))
+                        .transpose()
+                        .map_err(|e| {
+                            Box::new(chroma_error::TonicError(tonic::Status::internal(
+                                e.to_string(),
+                            ))) as Box<dyn ChromaError>
+                        })?,
+                })
+            })
+            .collect()
+    }
 }

@@ -779,12 +779,24 @@ impl LocalCompactionManager {
                     before,
                     end,
                     applied_before: mt_max_seq_id,
+                    asynchronous: false,
                 })
             } else {
                 None
             }
         } else {
             None
+        };
+        // An asynchronous function runs later, from its queue, on the records after its completion offset: the state
+        // before this apply is kept for it, in the transaction of the apply (attached_functions::run::record_prior).
+        let keeps_prior = match &function_window {
+            Some(_) => attached_functions::run::has_live_async_functions(
+                &self.sqlite_db,
+                message.collection_id,
+            )
+            .await
+            .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?,
+            None => false,
         };
         mt_data_chunk.set_visibility(mt_visibility);
         hnsw_data_chunk.set_visibility(hnsw_visibility);
@@ -819,6 +831,16 @@ impl LocalCompactionManager {
                     .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
             }
         }
+        if let (true, Some(window)) = (keeps_prior, &function_window) {
+            attached_functions::run::record_prior(
+                &mut tx,
+                message.collection_id,
+                &window.logs,
+                &window.before,
+            )
+            .await
+            .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?;
+        }
         // As a compaction of distributed Chroma, an apply of records is one more version of the collection; a SPANN
         // collection counts its flushes instead (flush_compaction_in), and a replay that applies nothing does not count.
         if applies_records && !spann {
@@ -834,7 +856,21 @@ impl LocalCompactionManager {
         if let Some(window) = function_window {
             let mut runner = self.function_runner();
             runner.backfill = Some(ctx.receiver::<BackfillMessage>());
+            // The asynchronous functions of the collection run after its synchronous ones, in the same queue, up to the
+            // end of this apply; the round of the timer runs them too when they are behind (async_due).
+            let asynchronous = keeps_prior.then(|| FunctionWindow {
+                input: window.input.clone(),
+                logs: Chunk::new(Arc::from(Vec::new())),
+                before: Vec::new(),
+                end: window.end,
+                applied_before: window.end,
+                asynchronous: true,
+            });
             self.function_runs.send(&self.background, &runner, window);
+            if let Some(asynchronous) = asynchronous {
+                self.function_runs
+                    .send(&self.background, &runner, asynchronous);
+            }
         }
         if spann {
             self.hnsw_segment_manager
@@ -935,6 +971,7 @@ impl Handler<ScheduledCompactMessage> for LocalCompactionManager {
                                 before: Vec::new(),
                                 end: applied,
                                 applied_before: applied,
+                                asynchronous: false,
                             },
                         ),
                         Err(err) => {
@@ -945,6 +982,40 @@ impl Handler<ScheduledCompactMessage> for LocalCompactionManager {
             }
             Err(err) => {
                 tracing::warn!(error = %err, "The attached functions behind could not be read")
+            }
+        }
+        // The asynchronous functions behind the records applied to their input, which their queue, the rows of
+        // attached_functions (Federico, 04/11), keeps: as the consumer of distributed Chroma polls its queue.
+        match attached_functions::run::async_due(&self.sqlite_db).await {
+            Ok(due) => {
+                let mut runner = self.function_runner();
+                runner.backfill = Some(ctx.receiver::<BackfillMessage>());
+                for (collection_id, applied) in due {
+                    match self
+                        .sysdb
+                        .get_collection_with_segments(None, collection_id)
+                        .await
+                    {
+                        Ok(input) => self.function_runs.send(
+                            &self.background,
+                            &runner,
+                            FunctionWindow {
+                                input,
+                                logs: Chunk::new(Arc::from(Vec::new())),
+                                before: Vec::new(),
+                                end: applied,
+                                applied_before: applied,
+                                asynchronous: true,
+                            },
+                        ),
+                        Err(err) => {
+                            tracing::warn!(collection_id = %collection_id, error = %err, "The input of an asynchronous attached function is not found")
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "The asynchronous attached functions behind could not be read")
             }
         }
         let collections = match self.spann_collections_to_compact().await {
@@ -1173,6 +1244,11 @@ impl LocalCompactionManager {
             sysdb: self.sysdb.clone(),
             sqlite_db: self.sqlite_db.clone(),
             backfill: None,
+            storage: self
+                .hnsw_segment_manager
+                .spann_provider()
+                .and_then(|provider| provider.blockfile_provider.storage())
+                .map(|storage| (*storage).clone()),
         }
     }
 

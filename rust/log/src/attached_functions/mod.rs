@@ -9,10 +9,12 @@
 //! RecordSegmentReaderShard), which the output collection of the single node has not; the executors read it here
 //! through OutputRecords, which that reader implements as the worker reads it, and the single node with its SQLite.
 
+mod count_to_file_async;
 mod revision_history;
 pub mod run;
 mod statistics;
 
+pub use count_to_file_async::CountToFileAsyncExecutor;
 pub use revision_history::RevisionHistoryExecutor;
 pub use statistics::{CounterFunctionFactory, StatisticsFunctionExecutor};
 
@@ -22,8 +24,9 @@ use chroma_segment::blockfile_record::{RecordSegmentReaderOptions, RecordSegment
 use chroma_segment::types::HydratedMaterializedLogRecord;
 use chroma_types::{
     AttachedFunction, Chunk, CollectionUuid, LogRecord, MaterializedLogOperation, Metadata,
-    Operation, OperationRecord, UpdateMetadataValue, FUNCTION_RECORD_COUNTER_ID,
-    FUNCTION_REVISION_HISTORY_ID, FUNCTION_STATISTICS_ID,
+    Operation, OperationRecord, UpdateMetadataValue, FUNCTION_COUNT_TO_FILE_ASYNC_ID,
+    FUNCTION_DUMMY_ASYNC_ID, FUNCTION_RECORD_COUNTER_ID, FUNCTION_REVISION_HISTORY_ID,
+    FUNCTION_STATISTICS_ID,
 };
 use futures::StreamExt;
 use std::sync::Arc;
@@ -185,6 +188,30 @@ impl AttachedFunctionExecutor for CountAttachedFunction {
     }
 }
 
+/// A dummy attached function for testing that logs a message and returns empty output.
+#[derive(Debug)]
+pub struct DummyAttachedFunction;
+
+#[async_trait]
+impl AttachedFunctionExecutor for DummyAttachedFunction {
+    async fn execute(
+        &self,
+        input_batches: Vec<HydratedInputBatch<'_, '_>>,
+        _output_reader: Option<&dyn OutputRecords>,
+    ) -> Result<Chunk<LogRecord>, Box<dyn ChromaError>> {
+        tracing::info!(
+            "DummyAttachedFunction executing with {} input records",
+            input_batches
+                .iter()
+                .map(|batch| batch.records.len())
+                .sum::<usize>()
+        );
+
+        // Return empty output records
+        Ok(Chunk::new(vec![].into()))
+    }
+}
+
 /// Hydrated records for one input collection, passed to the executor after shard hydration.
 pub struct HydratedInputBatch<'me, 'q> {
     pub input_collection_id: CollectionUuid,
@@ -196,6 +223,23 @@ pub struct HydratedInputBatch<'me, 'q> {
     pub database_name: Option<String>,
     pub pulled_log_offset: u64,
     pub records: Chunk<HydratedMaterializedLogRecord<'me, 'q>>,
+}
+
+/// The executor of an asynchronous attached function, by its function_id, as from_attached_function of the worker:
+/// dummy_async and count_to_file_async, this one on the storage given; None for one the single node does not run, as
+/// http_generate and http_currents until Federico decides whether they are on by default (D2b).
+pub fn async_executor(
+    attached_function: &AttachedFunction,
+    storage: Option<chroma_storage::Storage>,
+) -> Result<Option<Arc<dyn AttachedFunctionExecutor>>, String> {
+    Ok(match attached_function.function_id {
+        FUNCTION_DUMMY_ASYNC_ID => Some(Arc::new(DummyAttachedFunction)),
+        FUNCTION_COUNT_TO_FILE_ASYNC_ID => Some(Arc::new(
+            CountToFileAsyncExecutor::from_attached_function(attached_function, storage)
+                .map_err(|e| format!("CountToFileAsyncExecutor: {e}"))?,
+        )),
+        _ => None,
+    })
 }
 
 /// The executor of a synchronous attached function, by its function_id, as from_attached_function of the worker;
