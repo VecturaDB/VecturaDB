@@ -13,8 +13,8 @@ use chroma::{ChromaCollection, ChromaHttpClient};
 use chroma_types::operator::Key;
 use chroma_types::plan::SearchPayload;
 use chroma_types::{
-    Metadata, MetadataValue, Schema, SearchResponse, UpdateMetadata, UpdateMetadataValue,
-    ValueTypes,
+    GetResponse, Include, IncludeList, Metadata, MetadataValue, Schema, SearchResponse,
+    UpdateMetadata, UpdateMetadataValue, ValueTypes,
 };
 use clap::Parser;
 use crossterm::style::Stylize;
@@ -356,7 +356,8 @@ fn is_quota(message: &str) -> bool {
 }
 
 /// Whether waiting can solve an error: a refusal for now, a server that fails or restarts, the network. Waiting does
-/// not solve a key that is not valid, a collection that is not there, a request that is not valid or a quota.
+/// not solve a key that is not valid, a collection that is not there, a request that is not valid, a quota or an
+/// operation that the server does not have (501): Chroma 1.5.9 answers a search with it.
 fn can_wait_for(error: &ChromaHttpClientError) -> bool {
     let status = match error {
         ChromaHttpClientError::RetryAfter(message, _) => return !is_quota(message),
@@ -375,7 +376,7 @@ fn can_wait_for(error: &ChromaHttpClientError) -> bool {
     };
     status == StatusCode::TOO_MANY_REQUESTS
         || status == StatusCode::REQUEST_TIMEOUT
-        || status.is_server_error()
+        || (status.is_server_error() && status != StatusCode::NOT_IMPLEMENTED)
 }
 
 /// Sends a request until it gets an answer, or an error that waiting does not solve, and says why it waits. It waits as
@@ -536,6 +537,22 @@ fn records_of(response: SearchResponse) -> Vec<Record> {
         .collect()
 }
 
+fn records_of_get(response: GetResponse) -> Vec<Record> {
+    let mut documents = response.documents.unwrap_or_default().into_iter();
+    let mut embeddings = response.embeddings.unwrap_or_default().into_iter();
+    let mut metadatas = response.metadatas.unwrap_or_default().into_iter();
+    response
+        .ids
+        .into_iter()
+        .map(|id| Record {
+            id,
+            document: documents.next().flatten(),
+            embedding: embeddings.next(),
+            metadata: metadatas.next().flatten(),
+        })
+        .collect()
+}
+
 fn search_of_records(limit: u32, offset: u32) -> SearchPayload {
     SearchPayload::default().limit(Some(limit), offset).select([
         Key::Document,
@@ -544,8 +561,8 @@ fn search_of_records(limit: u32, offset: u32) -> SearchPayload {
     ])
 }
 
-/// A page of the source, and what the target holds of it when the copy asks. The records of the target come from a
-/// search as those of the source, so that both sides of a comparison come in the same form.
+/// A page of the source, and what the target holds of it when the copy asks. The target is read with a get, which every
+/// server has: Chroma 1.5.9 answers a search with 501.
 struct Page {
     offset: u32,
     records: Vec<Record>,
@@ -569,12 +586,16 @@ async fn read_page(
     let mut on_target = HashMap::new();
     if look_on_target && !records.is_empty() {
         let ids: Vec<String> = records.iter().map(|record| record.id.clone()).collect();
-        let search = search_of_records(ids.len() as u32, 0).r#where(Key::field("#id").is_in(ids));
+        let include = IncludeList(vec![
+            Include::Document,
+            Include::Embedding,
+            Include::Metadata,
+        ]);
         let response = until_done("the target", progress, || {
-            target.search(vec![search.clone()])
+            target.get(Some(ids.clone()), None, None, None, Some(include.clone()))
         })
         .await?;
-        on_target = records_of(response)
+        on_target = records_of_get(response)
             .into_iter()
             .map(|record| (record.id.clone(), record))
             .collect();
@@ -888,12 +909,17 @@ async fn only_on_target_in_page(
     step: u32,
     progress: &Progress,
 ) -> Result<(u64, Vec<String>), ChromaHttpClientError> {
-    let search = SearchPayload::default().limit(Some(step), offset);
     let page = until_done("the target", progress, || {
-        target.search(vec![search.clone()])
+        target.get(
+            None,
+            None,
+            Some(step),
+            Some(offset),
+            Some(IncludeList::empty()),
+        )
     })
     .await?;
-    let ids = page.ids.into_iter().next().unwrap_or_default();
+    let ids = page.ids;
     if ids.is_empty() {
         return Ok((0, ids));
     }
@@ -1040,6 +1066,7 @@ async fn look_at_target(
     source: &ChromaCollection,
     target: &ChromaHttpClient,
     options: CopyOptions,
+    target_holds_spann: bool,
     term: &mut dyn Terminal,
 ) -> Result<Option<Existing>, ChromaHttpClientError> {
     let name = source.name();
@@ -1067,8 +1094,12 @@ async fn look_at_target(
         &progress,
     )
     .await?;
+    // A server that does not say it holds SPANN, as Chroma 1.5.9, gives HNSW with its own settings to a collection whose
+    // source has SPANN: it is the same collection.
+    let dense_index = target_holds_spann || !has_spann(source.schema());
     let schema_differs = options.compare_schemas
-        && (chosen_settings(source.schema()) != chosen_settings(collection.schema())
+        && (chosen_settings(source.schema(), dense_index)
+            != chosen_settings(collection.schema(), dense_index)
             || other_dimensions(source, &collection));
     Ok(Some(Existing {
         collection,
@@ -1081,9 +1112,22 @@ async fn look_at_target(
 
 /// What of a schema someone has chosen. A key of the metadata of the records enters the schema by itself, with the settings
 /// of the defaults, when an index first sees it (`Schema::ensure_key_from_metadata`): on the source and on the target at
-/// different moments, so those keys do not say that two schemas are different.
-fn chosen_settings(schema: &Option<Schema>) -> Option<Schema> {
+/// different moments, so those keys do not say that two schemas are different. Without `dense_index`, the settings of
+/// SPANN and of HNSW are not a choice either.
+fn chosen_settings(schema: &Option<Schema>, dense_index: bool) -> Option<Schema> {
     let mut schema = schema.clone()?;
+    if !dense_index {
+        for types in std::iter::once(&mut schema.defaults).chain(schema.keys.values_mut()) {
+            if let Some(index) = types
+                .float_list
+                .as_mut()
+                .and_then(|list| list.vector_index.as_mut())
+            {
+                index.config.hnsw = None;
+                index.config.spann = None;
+            }
+        }
+    }
     let defaults = schema.defaults.clone();
     schema.keys.retain(|_, types| {
         if types.string == defaults.string {
@@ -1107,6 +1151,15 @@ fn chosen_settings(schema: &Option<Schema>) -> Option<Schema> {
         *types != ValueTypes::default()
     });
     Some(schema)
+}
+
+fn has_spann(schema: &Option<Schema>) -> bool {
+    schema.as_ref().is_some_and(|schema| {
+        std::iter::once(&schema.defaults)
+            .chain(schema.keys.values())
+            .filter_map(|types| types.float_list.as_ref()?.vector_index.as_ref())
+            .any(|index| index.config.spann.is_some())
+    })
 }
 
 /// Whether the embeddings of the two collections have different sizes: the records of one do not go in the other.
@@ -1311,12 +1364,21 @@ async fn copy_collections(
         start_copy_prompt(collections.len()).bold().blue()
     ));
 
+    // What the target says it holds, in the server block of its pre-flight checks. A server that says nothing of
+    // itself, as Chroma 1.5.9, or that does not answer them, holds what Chroma 1.5.9 holds.
+    let target_holds_spann = options.compare_schemas
+        && until_done("the target", &waiting, || target.server_features())
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|feature| feature == "spann");
+
     // First the checks, of all the collections, then the questions, all together, and only then the writes: a collection
     // that cannot be copied does not stop the others.
     let mut not_copied = vec![];
     let mut compared = Vec::with_capacity(collections.len());
     for collection in &collections {
-        match look_at_target(collection, &target, options, term).await {
+        match look_at_target(collection, &target, options, target_holds_spann, term).await {
             Ok(existing) => compared.push((collection, existing)),
             Err(error) => not_copied.push(format!(
                 "Collection {}: {error}. When that is solved, run the same command again to go on from there",
@@ -1637,16 +1699,22 @@ mod tests {
         pub struct Server {
             pub collections: Vec<StoredCollection>,
             pub add_failures: VecDeque<Failure>,
-            pub search_failures: VecDeque<Failure>,
+            pub read_failures: VecDeque<Failure>,
             /// The answer of the next creation, once the collection is created.
             pub create_failures: VecDeque<Failure>,
             /// The first pages take the longest to read.
             pub first_pages_are_slow: bool,
-            /// How long every search takes.
-            pub search_delay: Duration,
-            pub searches: usize,
-            pub searches_now: usize,
-            pub most_searches_at_once: usize,
+            /// How long every read takes, a search or a get.
+            pub read_delay: Duration,
+            /// A server without the Search API, as Chroma 1.5.9: it answers a search with 501.
+            pub without_search: bool,
+            /// A server that gives HNSW with its own settings to a new collection that asks for SPANN, as Chroma 1.5.9.
+            pub spann_becomes_hnsw: bool,
+            /// The features of the server block of the pre-flight checks. Chroma has no block.
+            pub features: Option<Vec<String>>,
+            pub reads: usize,
+            pub reads_now: usize,
+            pub most_reads_at_once: usize,
             /// Records that arrive on this server after the first count.
             pub after_first_count: Vec<Record>,
             /// The ids of every write that arrived, in the order they arrived.
@@ -1742,6 +1810,25 @@ mod tests {
                         .into_response();
                 }
                 server.creations.push(metadata.clone());
+                let mut schema = schema;
+                if server.spann_becomes_hnsw {
+                    for schema in schema.iter_mut() {
+                        for types in
+                            std::iter::once(&mut schema.defaults).chain(schema.keys.values_mut())
+                        {
+                            let Some(index) = types
+                                .float_list
+                                .as_mut()
+                                .and_then(|list| list.vector_index.as_mut())
+                            else {
+                                continue;
+                            };
+                            if index.config.spann.take().is_some() {
+                                index.config.hnsw = Some(Default::default());
+                            }
+                        }
+                    }
+                }
                 let mut collection = StoredCollection::new(&name, vec![]);
                 collection.schema = schema;
                 collection.metadata = metadata;
@@ -1811,6 +1898,28 @@ mod tests {
             Json(json!(count))
         }
 
+        /// What a search and a get have in common: they are counted, they take their time, and they can fail.
+        async fn read(server: &Shared, offset: usize) -> Option<Failure> {
+            let (failure, slow, delay) = {
+                let mut server = server.lock().unwrap();
+                server.reads += 1;
+                server.reads_now += 1;
+                server.most_reads_at_once = server.most_reads_at_once.max(server.reads_now);
+                (
+                    server.read_failures.pop_front(),
+                    server.first_pages_are_slow,
+                    server.read_delay,
+                )
+            };
+            if slow {
+                let delay = 300u64.saturating_sub(offset as u64 * 3);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            tokio::time::sleep(delay).await;
+            server.lock().unwrap().reads_now -= 1;
+            failure
+        }
+
         async fn search(
             State(server): State<Shared>,
             Path((_, _, id)): Path<(String, String, String)>,
@@ -1819,26 +1928,17 @@ mod tests {
             let search = &body["searches"][0];
             let limit = search["limit"]["limit"].as_u64().unwrap() as usize;
             let offset = search["limit"]["offset"].as_u64().unwrap() as usize;
-            let (failure, slow, delay) = {
-                let mut server = server.lock().unwrap();
-                server.searches += 1;
-                server.searches_now += 1;
-                server.most_searches_at_once =
-                    server.most_searches_at_once.max(server.searches_now);
-                (
-                    server.search_failures.pop_front(),
-                    server.first_pages_are_slow,
-                    server.search_delay,
-                )
-            };
-            if slow {
-                let delay = 300u64.saturating_sub(offset as u64 * 3);
-                tokio::time::sleep(Duration::from_millis(delay)).await;
-            }
-            tokio::time::sleep(delay).await;
-            server.lock().unwrap().searches_now -= 1;
-            if let Some(failure) = failure {
+            if let Some(failure) = read(&server, offset).await {
                 return answer(failure).await;
+            }
+            if server.lock().unwrap().without_search {
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(failure_body(
+                        "Error executing plan: Not implemented: Search operation is not implemented for local executor",
+                    )),
+                )
+                    .into_response();
             }
             let mut server = server.lock().unwrap();
             let collection = by_id(&mut server, &id);
@@ -1863,6 +1963,56 @@ mod tests {
                 "select": [[]],
             }))
             .into_response()
+        }
+
+        async fn get_records(
+            State(server): State<Shared>,
+            Path((_, _, id)): Path<(String, String, String)>,
+            Json(body): Json<Value>,
+        ) -> Response {
+            let offset = body["offset"].as_u64().unwrap_or_default() as usize;
+            if let Some(failure) = read(&server, offset).await {
+                return answer(failure).await;
+            }
+            let mut server = server.lock().unwrap();
+            let collection = by_id(&mut server, &id);
+            let found: Vec<&Record> = match body["ids"].as_array() {
+                Some(ids) => collection
+                    .records
+                    .iter()
+                    .filter(|r| ids.iter().any(|id| id.as_str() == Some(r.id.as_str())))
+                    .collect(),
+                None => {
+                    let limit = body["limit"]
+                        .as_u64()
+                        .map_or(usize::MAX, |limit| limit as usize);
+                    collection.records.iter().skip(offset).take(limit).collect()
+                }
+            };
+            let include: Vec<String> = serde_json::from_value(body["include"].clone()).unwrap();
+            let included = |what: &str| include.iter().any(|field| field == what);
+            Json(json!({
+                "ids": found.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+                "documents": included("documents")
+                    .then(|| found.iter().map(|r| r.document.clone()).collect::<Vec<_>>()),
+                "embeddings": included("embeddings")
+                    .then(|| found.iter().map(|r| r.embedding.clone()).collect::<Vec<_>>()),
+                "metadatas": included("metadatas")
+                    .then(|| found.iter().map(|r| r.metadata.clone()).collect::<Vec<_>>()),
+                "uris": null,
+                "include": include,
+            }))
+            .into_response()
+        }
+
+        /// Chroma's answer, and the server block when the server has one.
+        async fn pre_flight_checks(State(server): State<Shared>) -> Json<Value> {
+            let mut checks = json!({"max_batch_size": 1000, "supports_base64_encoding": true});
+            if let Some(features) = &server.lock().unwrap().features {
+                checks["server"] =
+                    json!({"name": "VecturaDB", "version": "test", "features": features});
+            }
+            Json(checks)
         }
 
         fn sent_records(body: &Value) -> Vec<Record> {
@@ -1955,6 +2105,7 @@ mod tests {
             let shared = Arc::new(Mutex::new(server));
             const COLLECTIONS: &str = "/api/v2/tenants/{tenant}/databases/{database}/collections";
             let app = Router::new()
+                .route("/api/v2/pre-flight-checks", get(pre_flight_checks))
                 .route(COLLECTIONS, post(create).get(list))
                 .route(
                     &format!("{COLLECTIONS}/{{collection}}"),
@@ -1964,6 +2115,10 @@ mod tests {
                 .route(
                     &format!("{COLLECTIONS}/{{collection}}/search"),
                     post(search),
+                )
+                .route(
+                    &format!("{COLLECTIONS}/{{collection}}/get"),
+                    post(get_records),
                 )
                 .route(&format!("{COLLECTIONS}/{{collection}}/add"), post(add))
                 .route(
@@ -2144,7 +2299,7 @@ mod tests {
             Failure::Status(500),
         ];
         target_server.lock().unwrap().add_failures = failures.into_iter().collect();
-        source_server.lock().unwrap().search_failures = failures.into_iter().collect();
+        source_server.lock().unwrap().read_failures = failures.into_iter().collect();
         let (result, _) = copy_books(&source, &target).await;
         result.unwrap();
         assert_eq!(records_on(&target_server, "books"), records(0..250));
@@ -2607,8 +2762,8 @@ mod tests {
         let mut there = records(0..950);
         there.extend(records(1000..1003));
         target_with(&target_server, "books", there);
-        source_server.lock().unwrap().search_delay = Duration::from_millis(50);
-        target_server.lock().unwrap().search_delay = Duration::from_millis(50);
+        source_server.lock().unwrap().read_delay = Duration::from_millis(50);
+        target_server.lock().unwrap().read_delay = Duration::from_millis(50);
         let source = source.get_collection("books").await.unwrap();
         let target = target.get_collection("books").await.unwrap();
         let progress = Progress::new("Looking".to_string(), 953, 0);
@@ -2618,8 +2773,8 @@ mod tests {
         assert_eq!(ids, ["r1000", "r1001", "r1002"]);
         assert_eq!(progress.bar.position(), 953);
         for server in [&source_server, &target_server] {
-            let most = server.lock().unwrap().most_searches_at_once;
-            assert!((2..=5).contains(&most), "{most} searches at once");
+            let most = server.lock().unwrap().most_reads_at_once;
+            assert!((2..=5).contains(&most), "{most} reads at once");
         }
     }
 
@@ -2637,8 +2792,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids, ["r5000"]);
-        let searches = target_server.lock().unwrap().searches;
-        assert!(searches <= 5, "{searches} pages of 21 read");
+        let reads = target_server.lock().unwrap().reads;
+        assert!(reads <= 5, "{reads} pages of 21 read");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2695,16 +2850,16 @@ mod tests {
         assert!(on_target.ensure_key_from_metadata("n", chroma_types::MetadataValueType::Int));
         assert_ne!(on_source, on_target);
         assert_eq!(
-            chosen_settings(&Some(on_source.clone())),
-            chosen_settings(&Some(on_target.clone()))
+            chosen_settings(&Some(on_source.clone()), true),
+            chosen_settings(&Some(on_target.clone()), true)
         );
         // A key with settings of its own is a choice.
         let mut chosen = on_target;
         let topic = chosen.keys.get_mut("topic").unwrap();
         topic.string.as_mut().unwrap().string_inverted_index = None;
         assert_ne!(
-            chosen_settings(&Some(on_source)),
-            chosen_settings(&Some(chosen))
+            chosen_settings(&Some(on_source), true),
+            chosen_settings(&Some(chosen), true)
         );
     }
 
@@ -2815,5 +2970,103 @@ mod tests {
         let (result, _) = again_with(&source, &target, OnExisting::Resume).await;
         result.unwrap();
         assert_eq!(records_on(&target_server, "books"), records(0..250));
+    }
+
+    /// A copy that waits forever would hang the test instead of failing it.
+    async fn within_30_s<T>(copy: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(30), copy)
+            .await
+            .expect("the copy did not end in 30 s")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_target_without_the_search_api_is_compared_all_the_same() {
+        let (source, _source_server, target, target_server) =
+            source_and_target(records(0..250)).await;
+        target_server.lock().unwrap().without_search = true;
+        let (result, _) = within_30_s(copy_books(&source, &target)).await;
+        result.unwrap();
+        let (result, term) = within_30_s(copy_books(&source, &target)).await;
+        result.unwrap();
+        assert!(said(&term, "is already copied"), "{:?}", term.output);
+        target_server.lock().unwrap().collections[0]
+            .records
+            .extend(records(1000..1003));
+        let (result, term) = within_30_s(again_with(&source, &target, OnExisting::Force)).await;
+        result.unwrap();
+        assert!(
+            said(&term, "0 records added, 0 written again, 3 removed"),
+            "{:?}",
+            term.output
+        );
+        assert_eq!(records_on(&target_server, "books"), records(0..250));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_operation_that_a_server_does_not_have_is_not_waited_for() {
+        // Chroma 1.5.9 as the source: it answers a search with 501.
+        let (source, source_server, target, _target_server) =
+            source_and_target(records(0..250)).await;
+        source_server.lock().unwrap().without_search = true;
+        let (result, _) = within_30_s(copy_books(&source, &target)).await;
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("Search operation is not implemented"),
+            "{error}"
+        );
+        let reads = source_server.lock().unwrap().reads;
+        assert!(reads <= 3, "{reads} reads of 3 pages");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn where_the_target_does_not_hold_spann_its_hnsw_is_the_same_collection() {
+        // Chroma 1.5.9 says nothing of itself, and VecturaDB 1.0.0-preview.5 does not say spann.
+        for features in [None, Some(vec!["search".to_string()])] {
+            let (source, source_server, target, target_server) =
+                source_and_target(records(0..150)).await;
+            source_server.lock().unwrap().collections[0].schema =
+                Some(Schema::new_default(chroma_types::KnnIndex::Spann));
+            {
+                let mut server = target_server.lock().unwrap();
+                server.spann_becomes_hnsw = true;
+                server.features = features;
+            }
+            let (result, _) = copy_books(&source, &target).await;
+            result.unwrap();
+            let (result, term) = again_with(&source, &target, OnExisting::Force).await;
+            result.unwrap();
+            assert!(said(&term, "is already copied"), "{:?}", term.output);
+            assert_eq!(target_server.lock().unwrap().creations.len(), 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn where_the_target_holds_spann_force_makes_an_hnsw_collection_again() {
+        let (source, source_server, target, target_server) =
+            source_and_target(records(0..150)).await;
+        source_server.lock().unwrap().collections[0].schema =
+            Some(Schema::new_default(chroma_types::KnnIndex::Spann));
+        target_with(&target_server, "books", records(0..150));
+        {
+            let mut server = target_server.lock().unwrap();
+            server.collections[0].schema = Some(Schema::new_default(chroma_types::KnnIndex::Hnsw));
+            server.features = Some(vec!["search".to_string(), "spann".to_string()]);
+        }
+        let (result, term) = again_with(&source, &target, OnExisting::Force).await;
+        result.unwrap();
+        assert!(
+            said(&term, "Its schema or its dimensions are different"),
+            "{:?}",
+            term.output
+        );
+        assert!(
+            said(&term, "deleted, with its 150 records"),
+            "{:?}",
+            term.output
+        );
+        assert_eq!(
+            target_server.lock().unwrap().collections[0].schema,
+            Some(Schema::new_default(chroma_types::KnnIndex::Spann))
+        );
     }
 }

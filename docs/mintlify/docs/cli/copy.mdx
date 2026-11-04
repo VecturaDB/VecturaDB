@@ -28,6 +28,8 @@ chroma copy --from-local collections [collection names]
 
 Before it writes anything, the CLI compares every collection already on the target with its source, record by record, and tells you how many records are the same, missing, different and only on the target. A collection that is the same is left alone. For the others, the CLI asks what to do, also when you pass `resume` or `force`. To go on with a copy that stopped, run the same command with `resume`.
 
+A server that does not say `spann` among the features of its pre-flight checks, such as Chroma 1.5.9, gives HNSW to a collection that has SPANN on the source. For the CLI, that is the same schema.
+
 The CLI waits when a server refuses a write for now, when a server fails and when the network falls, and tells you why it waits.
 
 ### Copy from Local to Chroma Cloud
