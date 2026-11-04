@@ -80,7 +80,7 @@ Linux (x86_64 and arm64) and macOS (x64 and arm64):
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/VecturaDB/VecturaDB/main/rust/cli/install/install.sh | bash
-chroma run --path ./data
+vecturadb run --path ./data
 ```
 
 Windows (x64), in PowerShell:
@@ -89,7 +89,7 @@ Windows (x64), in PowerShell:
 iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/VecturaDB/VecturaDB/main/rust/cli/install/install.ps1'))
 ```
 
-The scripts install the newest release, previews included. Every binary is also in the [releases](https://github.com/VecturaDB/VecturaDB/releases). The binary keeps the name `chroma`.
+The scripts install the newest release, previews included. Every binary is also in the [releases](https://github.com/VecturaDB/VecturaDB/releases). The command is `vecturadb`. To have it also as `chroma`, set `VECTURADB_CHROMA_ALIAS=1` for the script.
 
 ## The SQLite database of the data path
 
@@ -102,15 +102,19 @@ SQLite keeps WAL to the processes of one machine. For a data path on a network f
 The CLI copies collections from Chroma Cloud into a running VecturaDB:
 
 ```bash
-chroma login --api-key <your Chroma Cloud API key>
-chroma copy --from-cloud --to-local --host http://localhost:8000 --db <database> --all
+vecturadb login --api-key <your Chroma Cloud API key>
+vecturadb copy --from-cloud --to-local --host http://127.0.0.1:8000 --db <database> --all
 ```
 
-To copy only some collections, use `--collections <name>` once per collection instead of `--all`. The collections must not exist yet in VecturaDB.
+To copy only some collections, use `--collections <name>` once per collection instead of `--all`.
 
-The copy stops at the first collection it cannot create. The collections copied before it stay in VecturaDB: copy the rest with `--collections`. Collections whose metadata holds the legacy `hnsw:*` settings fail with `Cannot set both collection config and schema simultaneously`; Chroma gives the same error.
+What arrives: every record with its document, metadata, embedding and URI, the metadata of the collection, and its schema, sparse and BM25 indexes included. Sparse and BM25 searches give the same scores as on Chroma Cloud. The dense index arrives as on Chroma Cloud: SPANN, with the same settings. Collections whose metadata holds the legacy `hnsw:*` settings arrive with them.
 
-What arrives: every record with its document, metadata, embedding and URI, the metadata of the collection, and its schema, sparse and BM25 indexes included. Sparse and BM25 searches give the same scores as on Chroma Cloud. The settings of the dense index do not arrive: Chroma Cloud uses SPANN, VecturaDB uses HNSW with its default settings.
+The copy waits when VecturaDB asks it to, when a server fails and when the network falls, and says why. A collection that cannot be copied does not stop the others: at the end the CLI says what happened to it, and exits with code 1.
+
+Run again, the same command compares every collection already in VecturaDB with Chroma Cloud, record by record, before it writes anything, and reports how many records are the same, missing, different and only in VecturaDB. A collection that is the same is left alone. For the others the CLI asks what to do. Where nobody can answer, add `--resume --yes` to add the records they do not have, or `--force --yes` to make them exact copies of Chroma Cloud: `--force` also removes the records that are not on Chroma Cloud.
+
+The steps, with Docker and without, are in [Leaving Chroma Cloud: to VecturaDB](https://vecturadb.org/leaving-chroma-cloud/to-vecturadb). The same command copies into Chroma 1.5.9: see [to Chroma 1.5.9](https://vecturadb.org/leaving-chroma-cloud/to-chroma-single-node).
 
 ## SPANN index
 
