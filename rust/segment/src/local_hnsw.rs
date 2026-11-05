@@ -365,13 +365,9 @@ impl LocalHnswSegmentReader {
                         },
                     });
                 }
-                if HNSW_INDEX_FILES
-                    .iter()
-                    .any(|name| index_folder.join(name).exists())
-                {
-                    persistence::validate_files(&index_folder, None)
-                        .map_err(|_| LocalHnswSegmentReaderError::HnswIndexLoadError)?;
-                }
+                // No pickle and no position in SQLite: no save was published, and the files there are those that the
+                // creation of the index wrote with no sync, empty or cut after a power cut. The log has every record, so
+                // they are not read, as in Chroma 1.5.9.
                 // Return uninitialized reader.
                 Err(LocalHnswSegmentReaderError::UninitializedSegment)
             }
@@ -1121,15 +1117,9 @@ impl LocalHnswSegmentWriter {
                         },
                     });
                 }
-                // With no committed watermark or pickle, replay starts at zero.
-                // Validate native bytes before reinitializing an interrupted first save.
-                if HNSW_INDEX_FILES
-                    .iter()
-                    .any(|name| index_folder.join(name).exists())
-                {
-                    persistence::validate_files(&index_folder, None)
-                        .map_err(|_| LocalHnswSegmentWriterError::HnswIndexLoadError)?;
-                }
+                // With no committed watermark or pickle, replay starts at zero, and the index is written again from it.
+                // The files there are not read: no save was published, and those that the creation of the index wrote
+                // with no sync come back empty or cut after a power cut, as in Chroma 1.5.9.
                 // Initialize index.
                 let index_config = IndexConfig::new(
                     dimensionality as i32,

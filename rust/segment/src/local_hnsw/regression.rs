@@ -373,6 +373,57 @@ async fn initialized_files_without_pickle_are_valid_until_first_persist() {
     );
 }
 
+// A power cut before the first save: the files that the creation of the index wrote with no sync come back empty or cut,
+// with no pickle and no position in SQLite. Nothing of them was published, so the index is built again from the log, as
+// Chroma 1.5.9 did, which did not read them.
+#[tokio::test]
+async fn files_cut_by_a_power_cut_before_the_first_save_are_built_again() {
+    for keep in [0, 7] {
+        let (root, sqlite, collection, segment, mut writer) = fixture().await;
+        writer
+            .apply_log_chunk(Chunk::new(vec![record(1, 1, 0)].into()))
+            .await
+            .unwrap();
+        writer.index.close().await;
+        drop(writer);
+        let folder = root.path().join(segment.id.to_string());
+        for name in HNSW_INDEX_FILES {
+            let bytes = std::fs::read(folder.join(name)).unwrap();
+            std::fs::write(folder.join(name), &bytes[..keep.min(bytes.len())]).unwrap();
+        }
+        let persist_path = Some(root.path().to_str().unwrap().to_string());
+        let reader = LocalHnswSegmentReader::from_segment(
+            &collection,
+            &segment,
+            3,
+            persist_path.clone(),
+            sqlite.clone(),
+        )
+        .await;
+        assert!(
+            matches!(reader, Err(LocalHnswSegmentReaderError::UninitializedSegment)),
+            "reader with {keep} bytes"
+        );
+        let mut reopened =
+            LocalHnswSegmentWriter::from_segment(&collection, &segment, 3, persist_path, sqlite)
+                .await
+                .unwrap();
+        reopened
+            .apply_log_chunk(Chunk::new(vec![record(1, 1, 0), record(2, 2, 0)].into()))
+            .await
+            .unwrap();
+        let reader = LocalHnswSegmentReader::from_index(reopened.index.clone());
+        assert_eq!(
+            reader
+                .query_embedding(&[], vec![1.0; 3], 2)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+}
+
 // Simulate a process dying at each publication boundary without invoking a
 // destructor that could hide an incomplete checkpoint.
 #[tokio::test]
