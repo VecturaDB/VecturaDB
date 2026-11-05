@@ -263,6 +263,19 @@ jobs:
       ARCH: arm64
     steps: *image-steps
 
+  power-loss:
+    name: Power cut after a restore (LazyFS)
+    needs: cli-linux
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cli-linux-x86_64
+      - run: chmod +x vecturadb-linux-x86_64 && docker build -t powerloss vecturadb/powerloss
+      # FUSE needs the device and the mount of the container: privileged
+      - run: timeout 600 docker run --rm --privileged -v "$PWD/vecturadb-linux-x86_64:/vecturadb:ro" powerloss 6
+
   rust-tests:
     name: Rust tests (single-node)
     runs-on: ubuntu-24.04

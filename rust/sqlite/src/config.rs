@@ -110,6 +110,28 @@ impl SqliteDBConfig {
 
 impl Injectable for SqliteDb {}
 
+/// Syncs the database file, its log and its folder, those there are: on Windows a folder cannot be opened to sync it.
+async fn sync_existing(path: &Path) -> std::io::Result<()> {
+    let mut files = vec![path.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        files.push(name.into());
+    }
+    for file in files {
+        match tokio::fs::File::open(&file).await {
+            Ok(f) => f.sync_all().await?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        tokio::fs::File::open(parent).await?.sync_all().await?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Configurable<SqliteDBConfig, SqliteCreationError> for SqliteDb {
     async fn try_from_config(
@@ -136,6 +158,11 @@ impl Configurable<SqliteDBConfig, SqliteCreationError> for SqliteDb {
             if let Some(parent) = path.parent() {
                 create_dir_all(parent).await?;
             }
+            // A database copied in just before the start (a restore with cp) can still be only in the page cache. In WAL
+            // the writes go to the log and the database file is not written again until a checkpoint, so a power cut
+            // after the start loses it, with every collection; with the rollback journal of Chroma each write rewrote
+            // and synced it. The files there are and their folder are synced at the open.
+            sync_existing(path).await?;
             let journal_mode = match config.journal_mode {
                 JournalMode::Wal => SqliteJournalMode::Wal,
                 JournalMode::Delete => SqliteJournalMode::Delete,
