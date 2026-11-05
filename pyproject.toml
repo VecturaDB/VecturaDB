@@ -5,7 +5,7 @@ name = "VecturaDB"
 dynamic = ["version"]
 
 authors = [{ name = "VecturaDB contributors" }]
-description = "Vector database compatible with the Chroma API, bringing Chroma Cloud's features to open source. Independent project. Not affiliated with, endorsed by or sponsored by Chroma Inc. CHROMA is a registered trademark of Chroma Inc., used here only to describe compatibility."
+description = "Vector database compatible with the Chroma API: the features of Chroma Cloud, that is, of distributed Chroma, on a single node. Independent project. Not affiliated with, endorsed by or sponsored by Chroma Inc. CHROMA is a registered trademark of Chroma Inc., used here only to describe compatibility."
 readme = "README.md"
 requires-python = ">=3.9"
 classifiers = ["Programming Language :: Python :: 3", "License :: OSI Approved :: Apache Software License", "Operating System :: OS Independent"]
