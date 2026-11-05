@@ -9,13 +9,15 @@ kubernetes>=28.1.0
 mmh3>=4.0.1
 numpy>=1.22.5
 onnxruntime>=1.14.1,<1.29
-opentelemetry-api>=1.24.0
+opentelemetry-api>=1.45.1; python_version >= "3.10"
+opentelemetry-api>=1.24.0; python_version < "3.10"
 opentelemetry-exporter-otlp-proto-grpc>=1.24.0
 opentelemetry-sdk>=1.24.0
-orjson>=3.11.5
+orjson>=3.11.6; python_version >= "3.10"
+orjson>=3.11.5; python_version < "3.10"
 overrides>=7.3.1
 pybase64>=1.4.1
-pydantic>=2.0
+pydantic>=2.4.0
 pydantic-settings>=2.0
 pypika>=0.48.9
 PyYAML>=6.0.0
