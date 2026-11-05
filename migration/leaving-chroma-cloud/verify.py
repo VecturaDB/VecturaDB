@@ -52,10 +52,13 @@ for name in sys.argv[3:]:
     }
     # Three queries with the embeddings of the first three records. Records at the same distance can come back in
     # any order, so the check compares the distances of the top 3; the ids are printed when they differ.
+    # An empty collection has no embeddings to query with: the count and the ids already compare it.
     queries = [a[i][2].tolist() for i in sorted(a)[:3]]
-    qa = source.query(query_embeddings=queries, n_results=3, include=["distances"])
-    qb = target.query(query_embeddings=queries, n_results=3, include=["distances"])
-    same = np.allclose(np.asarray(qa["distances"]), np.asarray(qb["distances"]), atol=1e-5)
+    same = True
+    if queries:
+        qa = source.query(query_embeddings=queries, n_results=3, include=["distances"])
+        qb = target.query(query_embeddings=queries, n_results=3, include=["distances"])
+        same = np.allclose(np.asarray(qa["distances"]), np.asarray(qb["distances"]), atol=1e-5)
     checks["dense queries, same top 3 distances"] = same
     ok = (checks["count"][0] == checks["count"][1] and checks["ids"] and checks["documents"] and same_meta
           and checks["uris"] and max_diff < 1e-6 and same)
