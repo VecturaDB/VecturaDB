@@ -101,6 +101,24 @@ jobs:
           docker buildx imagetools create --annotation "index:org.opencontainers.image.description=$DESCRIPTION" \
             -t "$IMAGE:$VERSION" -t "$IMAGE:$CHANNEL" "$IMAGE:$VERSION-amd64" "$IMAGE:$VERSION-arm64"
           docker buildx imagetools inspect "$IMAGE:$VERSION"
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # The same tags on Docker Hub, copied from ghcr.io without a new build: the same digests on both.
+      - name: The same tags on docker.io
+        env:
+          IMAGE: ghcr.io/vecturadb/vecturadb
+          HUB: docker.io/vecturadb/vecturadb
+          VERSION: ${{ needs.version.outputs.version }}
+          CHANNEL: ${{ needs.version.outputs.prerelease == 'true' && 'preview' || 'latest' }}
+        run: |
+          for arch in amd64 arm64; do
+            docker buildx imagetools create -t "$HUB:$VERSION-$arch" "$IMAGE:$VERSION-$arch"
+          done
+          docker buildx imagetools create -t "$HUB:$VERSION" -t "$HUB:$CHANNEL" "$IMAGE:$VERSION"
+          test "$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest.Digest}}')" = \
+            "$(docker buildx imagetools inspect "$HUB:$VERSION" --format '{{json .Manifest.Digest}}')"
 
   github-release:
     needs: [version, ci]
