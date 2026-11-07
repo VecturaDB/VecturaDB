@@ -462,7 +462,7 @@ impl Record {
     fn difference(&self, other: &Record) -> Option<&'static str> {
         if self.document != other.document {
             Some("document")
-        } else if self.embedding != other.embedding {
+        } else if !same_embedding(self.embedding.as_deref(), other.embedding.as_deref()) {
             Some("embedding")
         } else if self.metadata() != other.metadata() {
             Some("metadata")
@@ -487,6 +487,27 @@ impl Record {
                 .map(|(key, value)| (key.clone(), update_value(value.clone()))),
         );
         (!metadata.is_empty()).then_some(metadata)
+    }
+}
+
+/// The tolerances of `np.allclose`, with which the tests of Chroma take an embedding read back as the one written
+/// (`_field_matches` in chromadb/test/property/invariants.py). HNSW with the cosine space keeps every embedding normalized,
+/// with its length, and gives back their product, whose last bit can change.
+const RELATIVE_TOLERANCE: f64 = 1e-5;
+const ABSOLUTE_TOLERANCE: f64 = 1e-8;
+
+/// Whether the embedding read on the other side is the one written on this side, as `np.allclose(read, written)` says.
+fn same_embedding(written: Option<&[f32]>, read: Option<&[f32]>) -> bool {
+    match (written, read) {
+        (Some(written), Some(read)) => {
+            written.len() == read.len()
+                && written.iter().zip(read).all(|(&written, &read)| {
+                    let (written, read) = (f64::from(written), f64::from(read));
+                    (read - written).abs()
+                        <= ABSOLUTE_TOLERANCE + RELATIVE_TOLERANCE * written.abs()
+                })
+        }
+        (written, read) => written == read,
     }
 }
 
@@ -1615,6 +1636,24 @@ mod tests {
     }
 
     #[test]
+    fn an_embedding_is_the_same_within_the_tolerances_of_np_allclose() {
+        let same = |written: &[f32], read: &[f32]| same_embedding(Some(written), Some(read));
+        assert!(same(
+            &[1.0, 0.2, 0.5],
+            &[1.0, f32::from_bits(0x3E4C_CCCC), 0.5]
+        ));
+        assert!(same(&[2.0], &[2.0 + 2.0 * 0.9e-5]));
+        assert!(!same(&[2.0], &[2.0 + 2.0 * 1.1e-5]));
+        // A number near zero has the absolute tolerance.
+        assert!(same(&[0.0], &[0.9e-8]));
+        assert!(!same(&[0.0], &[1.1e-8]));
+        assert!(!same(&[1.0, 0.2, 0.5], &[1.0, 0.3, 0.5]));
+        assert!(!same(&[1.0, 0.2], &[1.0, 0.2, 0.5]));
+        assert!(!same_embedding(Some(&[1.0]), None));
+        assert!(same_embedding(None, None));
+    }
+
+    #[test]
     fn an_upsert_takes_away_the_keys_the_source_no_longer_has() {
         let mut found = record(1);
         found.metadata = with_metadata(&[
@@ -1722,6 +1761,9 @@ mod tests {
             pub without_search: bool,
             /// A server that gives HNSW with its own settings to a new collection that asks for SPANN, as Chroma 1.5.9.
             pub spann_becomes_hnsw: bool,
+            /// A server whose index keeps every embedding normalized, with its length, and gives back their product, as HNSW
+            /// with the cosine space.
+            pub rebuilds_embeddings: bool,
             /// The features of the server block of the pre-flight checks. Chroma has no block.
             pub features: Option<Vec<String>>,
             pub reads: usize,
@@ -1987,6 +2029,7 @@ mod tests {
                 return answer(failure).await;
             }
             let mut server = server.lock().unwrap();
+            let rebuilds = server.rebuilds_embeddings;
             let collection = by_id(&mut server, &id);
             let found: Vec<&Record> = match body["ids"].as_array() {
                 Some(ids) => collection
@@ -2003,6 +2046,10 @@ mod tests {
             };
             let include: Vec<String> = serde_json::from_value(body["include"].clone()).unwrap();
             let included = |what: &str| include.iter().any(|field| field == what);
+            let embedding = |record: &Record| match &record.embedding {
+                Some(embedding) if rebuilds => Some(as_the_index_gives_it(embedding)),
+                embedding => embedding.clone(),
+            };
             // As a get of Chroma (`GetResponse` from a `GetResult`): the URI of a record comes apart from its metadata, which
             // leave the keys of Chroma.
             let uri = |record: &Record| match record.metadata.as_ref()?.get(CHROMA_URI_KEY)? {
@@ -2022,7 +2069,7 @@ mod tests {
                 "documents": included("documents")
                     .then(|| found.iter().map(|r| r.document.clone()).collect::<Vec<_>>()),
                 "embeddings": included("embeddings")
-                    .then(|| found.iter().map(|r| r.embedding.clone()).collect::<Vec<_>>()),
+                    .then(|| found.iter().map(|r| embedding(r)).collect::<Vec<_>>()),
                 "metadatas": included("metadatas")
                     .then(|| found.iter().map(|r| metadata(r)).collect::<Vec<_>>()),
                 "uris": included("uris")
@@ -2030,6 +2077,15 @@ mod tests {
                 "include": include,
             }))
             .into_response()
+        }
+
+        /// An embedding as HNSW with the cosine space gives it back: `normalize_vector` and `getDataByLabel` in
+        /// hnswlib/hnswalg.h, of the hnswlib of Chroma 1.5.9 and of VecturaDB. The last bit of a number can change.
+        pub fn as_the_index_gives_it(embedding: &[f32]) -> Vec<f32> {
+            let norm = embedding.iter().fold(0.0f32, |norm, x| norm + x * x);
+            let length = norm.sqrt();
+            let inverse = 1.0f32 / (length + 1e-30f32);
+            embedding.iter().map(|x| x * inverse * length).collect()
         }
 
         /// Chroma's answer, and the server block when the server has one.
@@ -2165,7 +2221,7 @@ mod tests {
         }
     }
 
-    use server::{start, Failure, Server, Shared, StoredCollection};
+    use server::{as_the_index_gives_it, start, Failure, Server, Shared, StoredCollection};
 
     /// A source with one collection of these records, and an empty target.
     async fn source_and_target(
@@ -3119,5 +3175,32 @@ mod tests {
         assert!(said(&term, "is already copied"), "{:?}", term.output);
         assert!(target_server.lock().unwrap().upserts.is_empty());
         assert_eq!(records_on(&target_server, "books"), books);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_embedding_that_the_index_of_the_target_gives_back_rounded_is_the_same() {
+        // As Chroma 1.5.9 gave back [1.0, 0.2, 0.5], copied from Chroma Cloud to a collection with the cosine space.
+        assert_eq!(
+            as_the_index_gives_it(&[1.0, 0.2, 0.5]),
+            [1.0, f32::from_bits(0x3E4C_CCCC), 0.5]
+        );
+        let books: Vec<Record> = (0..250)
+            .map(|i| Record {
+                embedding: Some(vec![1.0, (i % 5) as f32 * 0.2, 0.5]),
+                ..record(i)
+            })
+            .collect();
+        let (source, _source_server, target, target_server) =
+            source_and_target(books.clone()).await;
+        target_server.lock().unwrap().rebuilds_embeddings = true;
+        let (result, _) = copy_books(&source, &target).await;
+        result.unwrap();
+        let (result, term) = copy_books(&source, &target).await;
+        result.unwrap();
+        assert!(said(&term, "is already copied"), "{:?}", term.output);
+        let (result, term) = again_with(&source, &target, OnExisting::Force).await;
+        result.unwrap();
+        assert!(said(&term, "is already copied"), "{:?}", term.output);
+        assert!(target_server.lock().unwrap().upserts.is_empty());
     }
 }
