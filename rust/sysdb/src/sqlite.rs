@@ -200,6 +200,7 @@ impl SqliteSysDb {
                 Some(database_name.clone()),
                 None,
                 0,
+                false,
             )
             .await
             .map_err(|e| e.boxed())?;
@@ -395,6 +396,7 @@ impl SqliteSysDb {
                 Some(database.clone()),
                 None,
                 0,
+                false,
             )
             .await
             .map_err(CreateCollectionError::Get)?;
@@ -544,7 +546,16 @@ impl SqliteSysDb {
         let mut schema_str = None;
         if let Some(configuration) = configuration {
             let collections = self
-                .get_collections_with_conn(&mut *tx, Some(collection_id), None, None, None, None, 0)
+                .get_collections_with_conn(
+                    &mut *tx,
+                    Some(collection_id),
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                    false,
+                )
                 .await;
             let collections = collections.unwrap();
             let collection = collections.into_iter().next().unwrap();
@@ -726,6 +737,7 @@ impl SqliteSysDb {
             database_string,
             limit,
             offset,
+            true,
         )
         .await
     }
@@ -758,6 +770,7 @@ impl SqliteSysDb {
             Some(database.clone()),
             Some(1),
             0,
+            true,
         )
         .await
         .map_err(|e| GetCollectionByCrnError::Internal(e.boxed()))?
@@ -853,6 +866,7 @@ impl SqliteSysDb {
                 None,
                 None,
                 0,
+                false,
             )
             .await
             .map_err(|e| e.boxed())?;
@@ -924,6 +938,7 @@ impl SqliteSysDb {
                 None,
                 None,
                 0,
+                false,
             )
             .await
             .map_err(|e| ForkCollectionError::Internal(e.boxed()))?
@@ -938,6 +953,7 @@ impl SqliteSysDb {
                 Some(source.database.clone()),
                 None,
                 0,
+                false,
             )
             .await
             .map_err(|e| ForkCollectionError::Internal(e.boxed()))?;
@@ -1005,9 +1021,10 @@ impl SqliteSysDb {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| ForkCollectionError::Internal(e.into()))?;
+        // The target is copying until finish_fork: hidden from the reads of the users (00019).
         sqlx::query(
-            "INSERT INTO collection_forks (target_collection_id, source_collection_id, root_collection_id) \
-             VALUES ($1, $2, $3)",
+            "INSERT INTO collection_forks (target_collection_id, source_collection_id, root_collection_id, \
+             copying) VALUES ($1, $2, $3, TRUE)",
         )
         .bind(target_collection_id.to_string())
         .bind(source_collection_id.to_string())
@@ -1023,6 +1040,54 @@ impl SqliteSysDb {
         self.get_collection_with_segments(target_collection_id)
             .await
             .map_err(|e| ForkCollectionError::Internal(e.boxed()))
+    }
+
+    /// The target of a fork whose copy has ended, shown to the users in one go (00019).
+    pub(crate) async fn finish_fork(
+        &self,
+        target_collection_id: CollectionUuid,
+    ) -> Result<(), Box<dyn ChromaError>> {
+        sqlx::query("UPDATE collection_forks SET copying = FALSE WHERE target_collection_id = $1")
+            .bind(target_collection_id.to_string())
+            .execute(self.db.get_conn())
+            .await
+            .map_err(|e| -> Box<dyn ChromaError> { e.into() })?;
+        Ok(())
+    }
+
+    /// The targets of the forks still copying: at the start, those that a stop left halfway.
+    pub(crate) async fn unfinished_forks(
+        &self,
+    ) -> Result<Vec<CollectionUuid>, Box<dyn ChromaError>> {
+        let targets: Vec<String> = sqlx::query_scalar(
+            "SELECT target_collection_id FROM collection_forks WHERE copying \
+             ORDER BY target_collection_id",
+        )
+        .fetch_all(self.db.get_conn())
+        .await
+        .map_err(|e| -> Box<dyn ChromaError> { e.into() })?;
+        targets
+            .iter()
+            .map(|target| {
+                CollectionUuid::from_str(target).map_err(|e| -> Box<dyn ChromaError> {
+                    Box::new(GetCollectionsError::CollectionId(e))
+                })
+            })
+            .collect()
+    }
+
+    /// The row of the lineage of a fork that never happened, as one whose copy failed or that a stop left halfway: such
+    /// a fork does not count among the forks of its lineage.
+    pub(crate) async fn forget_fork(
+        &self,
+        target_collection_id: CollectionUuid,
+    ) -> Result<(), Box<dyn ChromaError>> {
+        sqlx::query("DELETE FROM collection_forks WHERE target_collection_id = $1")
+            .bind(target_collection_id.to_string())
+            .execute(self.db.get_conn())
+            .await
+            .map_err(|e| -> Box<dyn ChromaError> { e.into() })?;
+        Ok(())
     }
 
     /// The number of forks in the lineage of a collection, as distributed Chroma counts them
@@ -1762,6 +1827,8 @@ impl SqliteSysDb {
     }
 
     #[allow(clippy::too_many_arguments)]
+    // With visible_only, as a user reads the catalog: without the targets of the forks still copying (00019).
+    #[allow(clippy::too_many_arguments)]
     async fn get_collections_with_conn<'a, C>(
         &self,
         conn: C,
@@ -1771,6 +1838,7 @@ impl SqliteSysDb {
         database: Option<String>,
         limit: Option<u32>,
         offset: u32,
+        visible_only: bool,
     ) -> Result<Vec<Collection>, GetCollectionsError>
     where
         C: sqlx::Executor<'a, Database = sqlx::Sqlite>,
@@ -1808,6 +1876,11 @@ impl SqliteSysDb {
                     .add_option(collection_id.map(|collection_id| {
                         sea_query::Expr::col((table::Collections::Table, table::Collections::Id))
                             .eq(collection_id.to_string())
+                    }))
+                    .add_option(visible_only.then(|| {
+                        sea_query::Expr::cust(
+                            "NOT EXISTS (SELECT 1 FROM collection_forks WHERE                              collection_forks.target_collection_id = collections.id                              AND collection_forks.copying)",
+                        )
                     })),
             )
             .order_by(
