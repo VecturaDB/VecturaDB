@@ -275,6 +275,9 @@ jobs:
       - run: chmod +x vecturadb-linux-x86_64 && docker build -t powerloss vecturadb/powerloss
       # FUSE needs the device and the mount of the container: privileged
       - run: timeout 600 docker run --rm --privileged -v "$PWD/vecturadb-linux-x86_64:/vecturadb:ro" powerloss 6
+      # A power cut and a snapshot of the disk in the middle of the saves of the index
+      - run: timeout 600 docker run --rm --privileged --entrypoint bash -v "$PWD/vecturadb-linux-x86_64:/vecturadb:ro" powerloss /save.sh 5
+      - run: timeout 600 docker run --rm --privileged --entrypoint bash -v "$PWD/vecturadb-linux-x86_64:/vecturadb:ro" powerloss /snapshot.sh 5
 
   rust-tests:
     name: Rust tests (single-node)

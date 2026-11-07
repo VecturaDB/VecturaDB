@@ -7,5 +7,5 @@ RUN git clone https://github.com/dsrhaslab/lazyfs.git /lazyfs && cd /lazyfs && g
 FROM debian:stable-slim
 RUN apt-get update && apt-get install -y --no-install-recommends fuse3 python3 curl ca-certificates procps && rm -rf /var/lib/apt/lists/*
 COPY --from=lazyfs /lazyfs /lazyfs
-COPY restore.sh client.py /
+COPY restore.sh client.py save.sh snapshot.sh client_save.py /
 ENTRYPOINT ["bash", "/restore.sh"]
