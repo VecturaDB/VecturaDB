@@ -1475,4 +1475,47 @@ mod tests {
             }
         }
     }
+
+    // A request with an HNSW setting above its bound is refused, and the message names the setting, its value and the
+    // bound, for a setting in the configuration and for one in the hnsw:* metadata of Chroma before configurations.
+    #[test]
+    fn a_request_above_a_bound_of_hnsw_names_the_setting_its_value_and_the_bound() {
+        let configured = InternalCollectionConfiguration::try_from_config(
+            CollectionConfiguration {
+                hnsw: Some(HnswConfiguration {
+                    space: None,
+                    ef_construction: None,
+                    ef_search: None,
+                    max_neighbors: None,
+                    num_threads: None,
+                    resize_factor: None,
+                    sync_threshold: Some(30000),
+                    batch_size: None,
+                }),
+                spann: None,
+                embedding_function: None,
+            },
+            KnnIndex::Hnsw,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        let mut metadata = Metadata::new();
+        metadata.insert("hnsw:sync_threshold".to_string(), MetadataValue::Int(30000));
+        let legacy = InternalCollectionConfiguration::try_from_config(
+            CollectionConfiguration::default(),
+            KnnIndex::Hnsw,
+            Some(metadata),
+        )
+        .unwrap_err()
+        .to_string();
+        for message in [configured, legacy] {
+            assert!(
+                message.contains("sync_threshold")
+                    && message.contains("30000")
+                    && message.contains("4096"),
+                "{message}"
+            );
+        }
+    }
 }
