@@ -7738,25 +7738,10 @@ mod tests {
         }
     }
 
-    // Chroma 1.5.9 and the VecturaDB releases before SPANN delete a SPANN collection from the catalog and leave its
-    // files, with no row in index_cleanup: the sweep removes the folders of the segments that the catalog no longer
-    // has, and leaves those of the others.
-    #[tokio::test]
-    async fn the_sweep_removes_the_files_of_spann_segments_the_catalog_no_longer_has() {
-        let root = tempfile::tempdir().unwrap();
-        let saved = tempfile::tempdir().unwrap();
-        let mut frontend = frontend_with_spann(root.path(), true).await;
-        let kept = spann_collection_with_records(&mut frontend, "spann-kept").await;
-        let kept_files = files_under(root.path().join("tenant").as_path()).len();
-        spann_collection_with_records(&mut frontend, "spann-deleted-elsewhere").await;
-        copy_folder(&root.path().join("tenant"), &saved.path().join("tenant"));
-        frontend
-            .delete_collection(delete_collection_request("spann-deleted-elsewhere"))
-            .await
-            .unwrap();
-        // As after a deletion by a server that knows nothing of these files.
-        copy_folder(&saved.path().join("tenant"), &root.path().join("tenant"));
-        let path = root.path().join("chroma.sqlite3");
+    // The statements given, run on the database file of the test with a connection of its own, as another server on the
+    // same folder runs them: without foreign keys, as the servers open the database (sqlite/src/config.rs).
+    fn run_on_the_database_file(root: &std::path::Path, statements: Vec<String>) {
+        let path = root.join("chroma.sqlite3");
         std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -7766,27 +7751,191 @@ mod tests {
                     use sqlx::Connection;
                     let options = sqlx::sqlite::SqliteConnectOptions::new()
                         .filename(path)
+                        .foreign_keys(false)
                         .busy_timeout(std::time::Duration::from_secs(5));
                     let mut connection = sqlx::SqliteConnection::connect_with(&options)
                         .await
                         .unwrap();
-                    sqlx::query("DELETE FROM index_cleanup")
-                        .execute(&mut connection)
-                        .await
-                        .unwrap();
+                    for statement in statements {
+                        sqlx::query(&statement)
+                            .execute(&mut connection)
+                            .await
+                            .unwrap();
+                    }
                 })
         })
         .join()
         .unwrap();
-        assert!(files_under(root.path().join("tenant").as_path()).len() > kept_files);
+    }
+
+    // Whether the catalog in a database file has a collection of that name; not when the file has no catalog yet.
+    fn catalog_has(path: &std::path::Path, name: &str) -> bool {
+        let (path, name) = (path.to_path_buf(), name.to_string());
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    use sqlx::Connection;
+                    let options = sqlx::sqlite::SqliteConnectOptions::new().filename(path);
+                    let mut connection = sqlx::SqliteConnection::connect_with(&options)
+                        .await
+                        .unwrap();
+                    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM collections WHERE name = ?")
+                        .bind(name)
+                        .fetch_one(&mut connection)
+                        .await
+                        .is_ok_and(|count| count > 0)
+                })
+        })
+        .join()
+        .unwrap()
+    }
+
+    // The database of a frontend closed, as at a stop: the log written back, and the database file alone.
+    async fn close_the_database(registry: &Registry) {
+        registry.get::<SqliteDb>().unwrap().close().await;
+    }
+
+    // A database file put in place of the one of the folder, as a restore puts back a copy: without the log of the file
+    // that it replaces.
+    fn put_back(root: &std::path::Path, copy: &std::path::Path) {
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(root.join(format!("chroma.sqlite3{suffix}")));
+        }
+        std::fs::copy(copy, root.join("chroma.sqlite3")).unwrap();
+    }
+
+    // The files of the SPANN segments of a collection, under the data path.
+    fn spann_files_of(
+        root: &std::path::Path,
+        collection: CollectionUuid,
+    ) -> Vec<std::path::PathBuf> {
+        let mut files: Vec<_> = files_under(&root.join("tenant"))
+            .into_iter()
+            .filter(|file| file.to_string_lossy().contains(&collection.to_string()))
+            .collect();
+        files.sort();
+        files
+    }
+
+    // Chroma 1.5.9 and the VecturaDB releases before SPANN delete a SPANN collection from the catalog and leave its
+    // files, with nothing that records the deletion: absence from the catalog alone never authorizes deleting files, as
+    // index_cleanup says of the indexes (sqlite/migrations/sysdb/00011), so the sweep leaves them, and those of the others.
+    #[tokio::test]
+    async fn the_sweep_keeps_the_files_of_spann_segments_the_catalog_no_longer_has() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        let kept = spann_collection_with_records(&mut frontend, "spann-kept").await;
+        let elsewhere =
+            spann_collection_with_records(&mut frontend, "spann-deleted-elsewhere").await;
+        let (kept_files, elsewhere_files) = (
+            spann_files_of(root.path(), kept),
+            spann_files_of(root.path(), elsewhere),
+        );
+        assert!(!elsewhere_files.is_empty());
+        // As a deletion by a server that knows nothing of these files: the rows of the catalog, and nothing else.
+        run_on_the_database_file(
+            root.path(),
+            vec![
+                format!("DELETE FROM segments WHERE collection = '{elsewhere}'"),
+                format!("DELETE FROM collections WHERE id = '{elsewhere}'"),
+            ],
+        );
         frontend.executor.cleanup_deleted_indexes().await.unwrap();
-        let left = files_under(root.path().join("tenant").as_path());
-        assert_eq!(left.len(), kept_files);
-        assert!(left
-            .iter()
-            .all(|file| file.to_string_lossy().contains(&kept.to_string())));
+        assert_eq!(spann_files_of(root.path(), elsewhere), elsewhere_files);
+        assert_eq!(spann_files_of(root.path(), kept), kept_files);
         assert_eq!(
             query_ids(&mut frontend, kept, vec![3.0, 3f32.sin()], 1).await,
+            vec!["r3".to_string()]
+        );
+    }
+
+    // A database file put back from a copy taken before a SPANN collection was made, as a restore of a backup: that
+    // catalog does not have the collection, and nothing says that it was deleted, so its files stay; with the database
+    // file of after put back, the collection reads again.
+    #[tokio::test]
+    async fn a_catalog_put_back_from_before_a_spann_collection_keeps_its_files() {
+        let root = tempfile::tempdir().unwrap();
+        let copies = tempfile::tempdir().unwrap();
+        let (before, after) = (copies.path().join("before"), copies.path().join("after"));
+        let registry = Registry::new();
+        let mut frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+        spann_collection_with_records(&mut frontend, "spann-before").await;
+        close_the_database(&registry).await;
+        drop(frontend);
+        std::fs::copy(root.path().join("chroma.sqlite3"), &before).unwrap();
+
+        let registry = Registry::new();
+        let mut frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+        let made = spann_collection_with_records(&mut frontend, "spann-after").await;
+        let files = spann_files_of(root.path(), made);
+        assert!(!files.is_empty());
+        close_the_database(&registry).await;
+        drop(frontend);
+        std::fs::copy(root.path().join("chroma.sqlite3"), &after).unwrap();
+
+        put_back(root.path(), &before);
+        let registry = Registry::new();
+        let frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+        frontend.executor.cleanup_deleted_indexes().await.unwrap();
+        assert_eq!(spann_files_of(root.path(), made), files);
+        close_the_database(&registry).await;
+        drop(frontend);
+
+        put_back(root.path(), &after);
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        assert_eq!(
+            query_ids(&mut frontend, made, vec![3.0, 3f32.sin()], 1).await,
+            vec!["r3".to_string()]
+        );
+    }
+
+    // The database file copied while the server runs, without its log, as a copy of the files of a folder taken at the
+    // wrong moment: the collections whose rows are still only in the log are not in the copy, and their files stay; with
+    // the whole database put back, they read again.
+    #[tokio::test]
+    async fn a_database_file_copied_without_its_log_keeps_the_spann_files() {
+        let root = tempfile::tempdir().unwrap();
+        let copies = tempfile::tempdir().unwrap();
+        let (hot, whole) = (copies.path().join("hot"), copies.path().join("whole"));
+        let registry = Registry::new();
+        let mut frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+        let first = spann_collection_with_records(&mut frontend, "spann-first").await;
+        let second = spann_collection_with_records(&mut frontend, "spann-second").await;
+        let files = (
+            spann_files_of(root.path(), first),
+            spann_files_of(root.path(), second),
+        );
+        assert!(!files.0.is_empty() && !files.1.is_empty());
+        std::fs::copy(root.path().join("chroma.sqlite3"), &hot).unwrap();
+        assert!(
+            !catalog_has(&hot, "spann-first"),
+            "the copy without the log has the collection: the test needs its rows only in the log"
+        );
+        close_the_database(&registry).await;
+        drop(frontend);
+        std::fs::copy(root.path().join("chroma.sqlite3"), &whole).unwrap();
+
+        put_back(root.path(), &hot);
+        let registry = Registry::new();
+        let frontend = frontend_with_spann_registry(root.path(), true, &registry).await;
+        frontend.executor.cleanup_deleted_indexes().await.unwrap();
+        assert_eq!(
+            (
+                spann_files_of(root.path(), first),
+                spann_files_of(root.path(), second)
+            ),
+            files
+        );
+        close_the_database(&registry).await;
+        drop(frontend);
+
+        put_back(root.path(), &whole);
+        let mut frontend = frontend_with_spann(root.path(), true).await;
+        assert_eq!(
+            query_ids(&mut frontend, first, vec![3.0, 3f32.sin()], 1).await,
             vec!["r3".to_string()]
         );
     }

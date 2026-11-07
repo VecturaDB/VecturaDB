@@ -280,6 +280,11 @@ async fn repairs_legacy_construction_settings_and_preserves_records_and_logs() {
                 .execute(&mut db)
                 .await
                 .unwrap();
+            // The folders of the SPANN segments that deletions leave to remove (00018).
+            sqlx::query("DROP TABLE blockfile_cleanup")
+                .execute(&mut db)
+                .await
+                .unwrap();
             sqlx::query("DROP TABLE collection_forks")
                 .execute(&mut db)
                 .await

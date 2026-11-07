@@ -200,6 +200,19 @@ async fn remove_blockfile_segment(
     Ok(())
 }
 
+// The bytes of the files in a folder and in its folders; none in a folder that is not there.
+async fn folder_bytes(folder: &Path) -> io::Result<u64> {
+    let mut bytes = 0;
+    let mut left = vec![folder.to_path_buf()];
+    while let Some(folder) = left.pop() {
+        for file in entries(&folder, false).await? {
+            bytes += tokio::fs::metadata(&file).await?.len();
+        }
+        left.extend(entries(&folder, true).await?);
+    }
+    Ok(bytes)
+}
+
 // The folders, or else the files, in a folder; none in a folder that is not there.
 async fn entries(path: &Path, folders: bool) -> io::Result<Vec<std::path::PathBuf>> {
     let mut entries = match tokio::fs::read_dir(path).await {
@@ -342,10 +355,15 @@ impl Configurable<LocalSegmentManagerConfig> for LocalSegmentManager {
             let cleaner = res.clone();
             res.cleanup_task = Some(Arc::new(CleanupTask(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+                let mut first = true;
                 loop {
                     interval.tick().await;
                     if let Err(err) = cleaner.cleanup_deleted_indexes().await {
                         tracing::warn!(error = %err, "failed to clean up deleted HNSW indexes");
+                    }
+                    // Once, at the start: what a deletion recorded is gone by now.
+                    if std::mem::take(&mut first) {
+                        cleaner.report_unknown_blockfile_segments().await;
                     }
                 }
             }))));
@@ -641,7 +659,7 @@ impl LocalSegmentManager {
 
     /// The blockfiles of a deleted segment of a SPANN collection, removed with the folders of its collection that it
     /// leaves empty; nothing for a segment that the catalog still has. Those that a stop leaves behind go with the sweep
-    /// of the folders of segments that the catalog no longer has.
+    /// of blockfile_cleanup, where the deletion recorded them.
     pub async fn delete_blockfile_segment_files(
         &self,
         collection_id: CollectionUuid,
@@ -887,7 +905,7 @@ impl LocalSegmentManager {
         }
         // The rows that collection deletions leave wait for this sweep: one statement per 500 of them.
         let forgotten = self.forget_deleted_hnsw_indexes(&removed).await;
-        if let Err(err) = self.remove_orphan_blockfile_segments().await {
+        if let Err(err) = self.remove_listed_blockfile_segments().await {
             tracing::warn!(error = %err, "cleanup of SPANN files failed; will retry");
             first_error.get_or_insert(err);
         }
@@ -897,20 +915,81 @@ impl LocalSegmentManager {
         }
     }
 
-    // The folders of the segments of SPANN collections that the catalog no longer has, removed: a server that knows
-    // nothing of them, Chroma 1.5.9 or a VecturaDB release before SPANN, deletes a SPANN collection and leaves its files.
-    // A segment has its row before its first file, so a folder without a row is what a deletion left. The empty folders
-    // of a collection go only when the catalog no longer has the collection, which no flush writes to.
-    async fn remove_orphan_blockfile_segments(&self) -> Result<(), LocalSegmentManagerError> {
+    // The folders of the segments of SPANN collections that a deletion recorded in blockfile_cleanup, removed, each in
+    // the folder of its collection, with the folders of that collection that it leaves empty; then their rows, one
+    // statement per 500. A row whose removal fails stays for the next sweep. Only what a deletion recorded goes: absence
+    // from the catalog alone never authorizes deleting files (sqlite/migrations/sysdb/00011 and 00018).
+    async fn remove_listed_blockfile_segments(&self) -> Result<(), LocalSegmentManagerError> {
+        let listed: Vec<(String, String)> = sqlx::query_as(
+            "SELECT segment_id, collection_id FROM blockfile_cleanup ORDER BY segment_id",
+        )
+        .fetch_all(self.sqlite.get_conn())
+        .await?;
+        let mut first_error = None;
+        let mut removed = Vec::new();
+        for (segment_id, collection_id) in listed {
+            let result = match (
+                uuid::Uuid::parse_str(&segment_id),
+                uuid::Uuid::parse_str(&collection_id),
+            ) {
+                (Ok(segment), Ok(collection)) => match &self.persist_root {
+                    // A segment that the catalog has again is not the one deleted: its row goes, its files stay.
+                    Some(_) if self.segment_exists(SegmentUuid(segment)).await? => Ok(()),
+                    Some(root) => remove_blockfile_segment(
+                        Path::new(root),
+                        CollectionUuid(collection),
+                        SegmentUuid(segment),
+                    )
+                    .await
+                    .map_err(LocalSegmentManagerError::from),
+                    None => Ok(()),
+                },
+                (Err(err), _) | (_, Err(err)) => {
+                    Err(io::Error::new(io::ErrorKind::InvalidData, err).into())
+                }
+            };
+            match result {
+                Ok(()) => removed.push(segment_id),
+                Err(err) => {
+                    tracing::warn!(segment_id = %segment_id, error = %err, "cleanup of SPANN files failed; will retry");
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+        for batch in removed.chunks(500) {
+            let (sql, values) = sea_query::Query::delete()
+                .from_table(sea_query::Alias::new("blockfile_cleanup"))
+                .and_where(
+                    sea_query::Expr::col(sea_query::Alias::new("segment_id"))
+                        .is_in(batch.iter().cloned()),
+                )
+                .build_sqlx(sea_query::SqliteQueryBuilder);
+            sqlx::query_with(&sql, values)
+                .execute(self.sqlite.get_conn())
+                .await?;
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// The folders of the segments of SPANN collections that the catalog does not have and that no deletion recorded in
+    /// blockfile_cleanup, with the bytes of their files, which stay on the disk. A server that knows nothing of SPANN, as
+    /// Chroma 1.5.9 or a VecturaDB release before SPANN, leaves them when it deletes a SPANN collection; a database file
+    /// put back from an older copy does not have the collections made after it, nor does a copy taken without its log.
+    pub async fn unknown_blockfile_segments(
+        &self,
+    ) -> Result<Vec<(std::path::PathBuf, u64)>, LocalSegmentManagerError> {
         let Some(root) = &self.persist_root else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let root = Path::new(root);
+        let mut unknown = Vec::new();
         for tenant in entries(&root.join("tenant"), true).await? {
             for database in entries(&tenant.join("database"), true).await? {
                 for collection in entries(&database.join("collection"), true).await? {
-                    let segments = collection.join("segment");
-                    for segment in entries(&segments, true).await? {
+                    for segment in entries(&collection.join("segment"), true).await? {
                         let Some(id) = segment
                             .file_name()
                             .and_then(|name| name.to_str())
@@ -918,39 +997,51 @@ impl LocalSegmentManager {
                         else {
                             continue;
                         };
-                        if self.segment_exists(SegmentUuid(id)).await? {
+                        let listed: bool = sqlx::query_scalar(
+                            "SELECT EXISTS(SELECT 1 FROM blockfile_cleanup WHERE segment_id = ?)",
+                        )
+                        .bind(id.to_string())
+                        .fetch_one(self.sqlite.get_conn())
+                        .await?;
+                        if listed || self.segment_exists(SegmentUuid(id)).await? {
                             continue;
                         }
-                        match tokio::fs::remove_dir_all(&segment).await {
-                            Ok(()) => {}
-                            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                            Err(err) => return Err(err.into()),
-                        }
-                    }
-                    let Some(collection_id) = collection
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .and_then(|name| uuid::Uuid::parse_str(name).ok())
-                    else {
-                        continue;
-                    };
-                    let collection_exists: bool =
-                        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?)")
-                            .bind(collection_id.to_string())
-                            .fetch_one(self.sqlite.get_conn())
-                            .await?;
-                    if !collection_exists {
-                        // A folder that still holds something stays.
-                        for empty in [segments, collection] {
-                            if tokio::fs::remove_dir(&empty).await.is_err() {
-                                break;
-                            }
-                        }
+                        let bytes = folder_bytes(&segment).await?;
+                        unknown.push((segment, bytes));
                     }
                 }
             }
         }
-        Ok(())
+        unknown.sort();
+        Ok(unknown)
+    }
+
+    // The folders that unknown_blockfile_segments finds, in the log at the start, with what to do with them.
+    async fn report_unknown_blockfile_segments(&self) {
+        match self.unknown_blockfile_segments().await {
+            Ok(unknown) if unknown.is_empty() => {}
+            Ok(unknown) => {
+                let bytes: u64 = unknown.iter().map(|(_, bytes)| bytes).sum();
+                let folders = unknown
+                    .iter()
+                    .map(|(folder, _)| folder.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tracing::warn!(
+                    "{} folders of SPANN segments that the catalog does not have stay on the disk, {} bytes: a server \
+                     that knows nothing of SPANN, as Chroma 1.5.9, leaves them when it deletes a SPANN collection, and a \
+                     database file put back from an older copy, or copied without its log, does not have the collections \
+                     made after it. They hold the vectors of those collections; remove them by hand once they are not \
+                     needed: {}",
+                    unknown.len(),
+                    bytes,
+                    folders
+                );
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "the folders of SPANN segments that the catalog does not have could not be listed")
+            }
+        }
     }
 
     pub async fn reset(&self) -> Result<(), LocalSegmentManagerError> {
@@ -1356,6 +1447,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending, 0);
+    }
+
+    // The sweep removes the folder of a SPANN segment that a deletion recorded in blockfile_cleanup, in the folder of its
+    // collection only, and the row; the folder of a segment that the catalog does not have and that no deletion recorded
+    // stays, and the listing of the start names it with the bytes of its files.
+    #[tokio::test]
+    async fn the_sweep_removes_what_a_deletion_recorded_and_lists_the_unknown_spann_folders() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        registry.register(get_new_sqlite_db().await);
+        let mut manager = LocalSegmentManager::try_from_config(
+            &LocalSegmentManagerConfig {
+                hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
+                persist_path: Some(root.path().to_str().unwrap().to_string()),
+            },
+            &registry,
+        )
+        .await
+        .unwrap();
+        manager.cleanup_task.take().unwrap().0.abort();
+        let collections = root
+            .path()
+            .join("tenant/default_tenant/database/00000000-0000-0000-0000-000000000000/collection");
+        let (deleted, unknown) = (CollectionUuid::new(), CollectionUuid::new());
+        let (deleted_segment, unknown_segment) = (SegmentUuid::new(), SegmentUuid::new());
+        let folder = |collection: CollectionUuid, segment: SegmentUuid| {
+            collections
+                .join(collection.to_string())
+                .join("segment")
+                .join(segment.to_string())
+        };
+        for (collection, segment, bytes) in [
+            (deleted, deleted_segment, 10),
+            (unknown, unknown_segment, 20),
+        ] {
+            std::fs::create_dir_all(folder(collection, segment).join("block")).unwrap();
+            std::fs::write(
+                folder(collection, segment).join("block").join("b"),
+                vec![0u8; bytes],
+            )
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO blockfile_cleanup (segment_id, collection_id) VALUES (?, ?)")
+            .bind(deleted_segment.to_string())
+            .bind(deleted.to_string())
+            .execute(manager.sqlite.get_conn())
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.unknown_blockfile_segments().await.unwrap(),
+            vec![(folder(unknown, unknown_segment), 20)]
+        );
+        manager.cleanup_deleted_indexes().await.unwrap();
+        assert!(!collections.join(deleted.to_string()).exists());
+        assert_eq!(
+            std::fs::read(folder(unknown, unknown_segment).join("block").join("b")).unwrap(),
+            vec![0u8; 20]
+        );
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blockfile_cleanup")
+            .fetch_one(manager.sqlite.get_conn())
+            .await
+            .unwrap();
+        assert_eq!(pending, 0);
+        assert_eq!(
+            manager.unknown_blockfile_segments().await.unwrap(),
+            vec![(folder(unknown, unknown_segment), 20)]
+        );
     }
 
     #[tokio::test]

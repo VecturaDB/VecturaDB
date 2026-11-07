@@ -2162,6 +2162,16 @@ impl SqliteSysDb {
         .bind(collection_id.to_string())
         .execute(&mut *conn)
         .await?;
+        // The folders of those blockfiles are under the folder of the collection: their rows keep it, so that the sweep
+        // removes them there, and only what a deletion recorded (00018).
+        sqlx::query(
+            "INSERT OR IGNORE INTO blockfile_cleanup (segment_id, collection_id) \
+             SELECT id, collection FROM segments WHERE collection = ? AND type IN \
+             ('urn:chroma:segment/vector/spann', 'urn:chroma:segment/record/blockfile')",
+        )
+        .bind(collection_id.to_string())
+        .execute(&mut *conn)
+        .await?;
 
         // Delete segments
         let (sql, values) = sea_query::Query::delete()
