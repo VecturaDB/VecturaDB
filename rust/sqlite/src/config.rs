@@ -119,9 +119,13 @@ async fn sync_existing(path: &Path) -> std::io::Result<()> {
         files.push(name.into());
     }
     for file in files {
-        match tokio::fs::File::open(&file).await {
+        match open_to_sync(&file).await {
             Ok(f) => f.sync_all().await?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            // A file that the process cannot write, as one restored read-only: Windows cannot sync it, and SQLite only
+            // reads it. Chroma 1.5.9, which synced nothing, opened it.
+            #[cfg(windows)]
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {}
             Err(err) => return Err(err),
         }
     }
@@ -130,6 +134,18 @@ async fn sync_existing(path: &Path) -> std::io::Result<()> {
         tokio::fs::File::open(parent).await?.sync_all().await?;
     }
     Ok(())
+}
+
+// A file opened to be synced. On Windows the sync is FlushFileBuffers, which needs a handle that can write: with one
+// opened to read it fails with "Access is denied" (os error 5). Elsewhere fsync syncs a file opened to read.
+#[cfg(windows)]
+async fn open_to_sync(file: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new().write(true).open(file).await
+}
+
+#[cfg(not(windows))]
+async fn open_to_sync(file: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::File::open(file).await
 }
 
 #[async_trait]
@@ -446,5 +462,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(written, 3);
+    }
+
+    // A database file opened again while it is open, as by a second process or after a kill, when its log and the index
+    // of its log are there too: the open syncs the three files, and reads the records that the log holds.
+    #[tokio::test]
+    async fn a_database_file_opened_again_while_open_reads_its_log() {
+        let (dir, path, first) = database_file(JournalMode::default()).await;
+        let files = files_of(dir.path());
+        assert!(files.contains(&"chroma.sqlite3-wal".to_string()));
+        assert!(files.contains(&"chroma.sqlite3-shm".to_string()));
+        let config = SqliteDBConfig {
+            url: Some(path.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        let second = SqliteDb::try_from_config(&config, &Registry::new())
+            .await
+            .unwrap();
+        let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM written")
+            .fetch_one(second.get_conn())
+            .await
+            .unwrap();
+        assert_eq!(written, 3);
+        second.close().await;
+        first.close().await;
+    }
+
+    // The sync at the open of a database file that the process cannot write, as one restored read-only: Chroma 1.5.9,
+    // which did not sync, opened it, so the sync does not stop the open.
+    #[tokio::test]
+    async fn a_database_file_opened_again_that_cannot_be_written_is_not_refused_by_the_sync() {
+        let (_dir, path, db) = database_file(JournalMode::default()).await;
+        db.close().await;
+        let writable = std::fs::metadata(&path).unwrap().permissions();
+        let mut read_only = writable.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&path, read_only).unwrap();
+        let synced = sync_existing(&path).await;
+        std::fs::set_permissions(&path, writable).unwrap();
+        synced.unwrap();
     }
 }
