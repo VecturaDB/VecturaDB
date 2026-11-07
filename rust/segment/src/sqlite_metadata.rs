@@ -2828,6 +2828,57 @@ mod tests {
         );
     }
 
+    // Chroma 1.5.9 knows nothing of the sparse tables: it deletes a record with the rows of embeddings alone, and SQLite
+    // gives the highest id freed to the next record. The sparse vector of the deleted record goes with it, and the record
+    // that takes its id has none, in its metadata or in the term table.
+    #[tokio::test]
+    async fn a_record_deleted_by_a_server_without_the_sparse_tables_takes_its_vector_away() {
+        let (reader, cas) = setup_with_logs(vec![
+            sparse_log(1, "kept", Operation::Add, Some(sparse_value(0.5))),
+            sparse_log(2, "deleted", Operation::Add, Some(sparse_value(1.0))),
+        ])
+        .await;
+        let segment = cas.metadata_segment.id.to_string();
+        // The statements of Chroma 1.5.9 (rust/segment/src/sqlite_metadata.rs at 1.5.9): the delete of a record, then
+        // the add of a new one without metadata.
+        let freed: i64 = sqlx::query_scalar(
+            "DELETE FROM embeddings WHERE segment_id = ? AND embedding_id = 'deleted' RETURNING id",
+        )
+        .bind(&segment)
+        .fetch_one(reader.db.get_conn())
+        .await
+        .unwrap();
+        let reused: i64 = sqlx::query_scalar(
+            "INSERT INTO embeddings (segment_id, embedding_id, seq_id) VALUES (?, 'new', 3) RETURNING id",
+        )
+        .bind(&segment)
+        .fetch_one(reader.db.get_conn())
+        .await
+        .unwrap();
+        assert_eq!(reused, freed, "the test needs the id given again");
+        let records = reader
+            .get(make_get_plan(&cas, None))
+            .await
+            .unwrap()
+            .result
+            .records;
+        let sparse_of = |id: &str| {
+            records
+                .iter()
+                .find(|record| record.id == id)
+                .unwrap()
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("sparse").cloned())
+        };
+        assert_eq!(sparse_of("new"), None);
+        assert!(sparse_of("kept").is_some());
+        assert!(sparse_terms(&reader.db)
+            .await
+            .iter()
+            .all(|(id, _, _)| id == "kept"));
+    }
+
     fn bm25_schema() -> chroma_types::Schema {
         use chroma_types::{
             KnnIndex, Schema, SparseIndexAlgorithm, SparseVectorIndexConfig, SparseVectorIndexType,
