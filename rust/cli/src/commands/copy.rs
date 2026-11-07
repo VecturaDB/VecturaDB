@@ -75,6 +75,8 @@ pub enum CopyError {
     NotAllCopied(String),
     #[error("Could not ask what to do with collection {0}")]
     NoAnswer(String),
+    #[error("{0}. No record of it was written, so the copy deleted the collection it had created")]
+    Deleted(String),
 }
 
 #[derive(Parser, Debug)]
@@ -1330,7 +1332,7 @@ async fn copy_collection(
                 existing.on_target
             ));
             let created = create_on_target(source, target, &waiting).await?;
-            write_collection(source, &created, None, options, term).await
+            write_new_collection(source, target, &created, options, term).await
         }
         Some((existing, what)) => {
             write_collection(
@@ -1344,9 +1346,42 @@ async fn copy_collection(
         }
         None => {
             let created = create_on_target(source, target, &waiting).await?;
-            write_collection(source, &created, None, options, term).await
+            write_new_collection(source, target, &created, options, term).await
         }
     }
+}
+
+/// Writes a collection that the copy has just created on the target. If the copy cannot go on and no record of it was
+/// written, as when Chroma 1.5.9 refuses a sparse vector in the metadata, the copy deletes it, so that the next copy, or
+/// another way to copy it, starts from nothing. With one record in it, the collection stays. The copy command of Chroma
+/// leaves it.
+async fn write_new_collection(
+    source: &ChromaCollection,
+    target: &ChromaHttpClient,
+    created: &ChromaCollection,
+    options: CopyOptions,
+    term: &mut dyn Terminal,
+) -> Result<(), CliError> {
+    let error = match write_collection(source, created, None, options, term).await {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    let waiting = Progress::new(format!("Collection {}", source.name()), 0, 0);
+    if !matches!(
+        until_done("the target", &waiting, || created.count()).await,
+        Ok(0)
+    ) {
+        return Err(error);
+    }
+    if until_done("the target", &waiting, || {
+        target.delete_collection(source.name())
+    })
+    .await
+    .is_err()
+    {
+        return Err(error);
+    }
+    Err(CopyError::Deleted(error.to_string()).into())
 }
 
 async fn copy_collections(
@@ -1457,8 +1492,12 @@ async fn copy_collections(
     }
     for (collection, existing) in to_write {
         if let Err(error) = copy_collection(collection, &target, existing, options, term).await {
+            let again = match &error {
+                CliError::Copy(CopyError::Deleted(_)) => "run the same command again",
+                _ => "run the same command again to go on from there",
+            };
             not_copied.push(format!(
-                "Collection {}: {error}. When that is solved, run the same command again to go on from there",
+                "Collection {}: {error}. When that is solved, {again}",
                 collection.name()
             ));
         }
@@ -1764,6 +1803,9 @@ mod tests {
             /// A server whose index keeps every embedding normalized, with its length, and gives back their product, as HNSW
             /// with the cosine space.
             pub rebuilds_embeddings: bool,
+            /// After this many writes, every add is refused with 501, as Chroma 1.5.9 refuses a sparse vector in the
+            /// metadata.
+            pub refuses_adds_after: Option<usize>,
             /// The features of the server block of the pre-flight checks. Chroma has no block.
             pub features: Option<Vec<String>>,
             pub reads: usize,
@@ -2118,7 +2160,13 @@ mod tests {
             Path((_, _, id)): Path<(String, String, String)>,
             Json(body): Json<Value>,
         ) -> Response {
-            let failure = server.lock().unwrap().add_failures.pop_front();
+            let failure = {
+                let mut server = server.lock().unwrap();
+                match server.refuses_adds_after {
+                    Some(after) if server.adds.len() >= after => Some(Failure::Status(501)),
+                    _ => server.add_failures.pop_front(),
+                }
+            };
             if let Some(failure) = failure {
                 return answer(failure).await;
             }
@@ -3202,5 +3250,50 @@ mod tests {
         result.unwrap();
         assert!(said(&term, "is already copied"), "{:?}", term.output);
         assert!(target_server.lock().unwrap().upserts.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_collection_with_no_record_written_is_deleted() {
+        let (source, _source_server, target, target_server) =
+            source_and_target(records(0..250)).await;
+        target_server.lock().unwrap().refuses_adds_after = Some(0);
+        let (result, _) = copy_books(&source, &target).await;
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("so the copy deleted the collection it had created. When that is solved, run the same command again"),
+            "{error}"
+        );
+        assert!(target_server.lock().unwrap().collections.is_empty());
+        target_server.lock().unwrap().refuses_adds_after = None;
+        let (result, term) = copy_books(&source, &target).await;
+        result.unwrap();
+        assert!(
+            !said(&term, "is already on the target"),
+            "{:?}",
+            term.output
+        );
+        assert_eq!(records_on(&target_server, "books"), records(0..250));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_collection_with_one_record_written_stays() {
+        let (source, _source_server, target, target_server) =
+            source_and_target(records(0..3)).await;
+        target_server.lock().unwrap().refuses_adds_after = Some(1);
+        let one_at_a_time = CopyOptions {
+            step: 1,
+            ..options(None, false)
+        };
+        let (result, _) = copy_books_with(
+            &source,
+            &target,
+            one_at_a_time,
+            TestTerminal::new().without_prompts(),
+        )
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("to go on from there"), "{error}");
+        assert!(!error.contains("deleted"), "{error}");
+        assert_eq!(records_on(&target_server, "books"), records(0..1));
     }
 }
