@@ -35,6 +35,8 @@ async fn fixture() -> (
     )
     .await
     .unwrap();
+    // These tests save at every sync_threshold, as before SAVE_INTERVAL.
+    writer.index.set_save_interval(Duration::ZERO).await;
     (root, sqlite, collection, segment, writer)
 }
 

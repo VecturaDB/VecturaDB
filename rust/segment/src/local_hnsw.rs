@@ -19,6 +19,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use chroma_cache::Weighted;
@@ -41,6 +42,13 @@ pub const METADATA_FILE: &str = "index_metadata.pickle";
 pub const HNSW_HEADER_FILE: &str = "header.bin";
 pub const HNSW_INDEX_FILES: [&str; 4] = chroma_index::hnsw_provider::FILES;
 const HNSW_PERSISTENCE_VERSION: i32 = 1;
+
+// The shortest time between two saves of an index by the same instance: a save syncs the files of the index, and a
+// save every sync_threshold records kept the index waiting for the disk most of the time under a steady load. The
+// records after the last save are in the log of SQLite, whose position for the segment moves only after a save, and
+// the next load applies them again, as after any stop between two saves. The first save of an instance waits for the
+// threshold only, as in Chroma 1.5.9: the files of an index never saved are not read at load.
+const SAVE_INTERVAL: Duration = Duration::from_secs(30);
 
 // Native HNSW uses four C-runtime streams per persistent index (and another
 // four temporarily while loading). Windows defaults to 512 streams per process.
@@ -357,6 +365,8 @@ impl LocalHnswSegmentReader {
                                 fail_resize: false,
                                 allow_reset: false,
                                 num_elements_since_last_persist: 0,
+                                last_persist: None,
+                                save_interval: SAVE_INTERVAL,
                                 last_seen_seq_id: current_seq_id,
                                 sync_threshold: hnsw_configuration.sync_threshold,
                                 persist_path: Some(index_folder_str.to_string()),
@@ -408,6 +418,8 @@ impl LocalHnswSegmentReader {
                             fail_resize: false,
                             allow_reset: false,
                             num_elements_since_last_persist: 0,
+                            last_persist: None,
+                            save_interval: SAVE_INTERVAL,
                             last_seen_seq_id: 0,
                             sync_threshold: hnsw_configuration.sync_threshold,
                             persist_path: None,
@@ -749,6 +761,10 @@ pub struct Inner {
     fail_resize: bool,
     allow_reset: bool,
     num_elements_since_last_persist: u64,
+    // When this instance last saved its index; None before its first save.
+    last_persist: Option<tokio::time::Instant>,
+    // SAVE_INTERVAL, shorter in tests.
+    save_interval: Duration,
     last_seen_seq_id: u64,
     sync_threshold: usize,
     persist_path: Option<String>,
@@ -759,7 +775,10 @@ impl Inner {
     fn needs_checkpoint(&self) -> bool {
         self.persist_path.is_some()
             && (self.recovery_checkpoint_pending
-                || self.num_elements_since_last_persist >= self.sync_threshold as u64)
+                || (self.num_elements_since_last_persist >= self.sync_threshold as u64
+                    && self
+                        .last_persist
+                        .is_none_or(|last| last.elapsed() >= self.save_interval)))
     }
 }
 
@@ -886,6 +905,13 @@ impl LocalHnswIndex {
     #[cfg(test)]
     pub(crate) async fn set_sync_threshold(&self, sync_threshold: usize) {
         self.inner.write().await.sync_threshold = sync_threshold;
+    }
+
+    /// The shortest time between two saves of this instance, SAVE_INTERVAL otherwise: for tests that save more than
+    /// once.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn set_save_interval(&self, save_interval: Duration) {
+        self.inner.write().await.save_interval = save_interval;
     }
 
     /// The last applied log offset and the number of vectors in the index.
@@ -1109,6 +1135,8 @@ impl LocalHnswSegmentWriter {
                                 fail_resize: false,
                                 allow_reset: false,
                                 num_elements_since_last_persist: 0,
+                                last_persist: None,
+                                save_interval: SAVE_INTERVAL,
                                 last_seen_seq_id: current_seq_id,
                                 sync_threshold: hnsw_configuration.sync_threshold,
                                 persist_path: Some(index_folder_str.to_string()),
@@ -1159,6 +1187,8 @@ impl LocalHnswSegmentWriter {
                             fail_resize: false,
                             allow_reset: false,
                             num_elements_since_last_persist: 0,
+                            last_persist: None,
+                            save_interval: SAVE_INTERVAL,
                             last_seen_seq_id: 0,
                             sync_threshold: hnsw_configuration.sync_threshold,
                             persist_path: Some(index_folder_str.to_string()),
@@ -1203,6 +1233,8 @@ impl LocalHnswSegmentWriter {
                             fail_resize: false,
                             allow_reset: false,
                             num_elements_since_last_persist: 0,
+                            last_persist: None,
+                            save_interval: SAVE_INTERVAL,
                             last_seen_seq_id: 0,
                             sync_threshold: hnsw_configuration.sync_threshold,
                             persist_path: None,
@@ -1436,6 +1468,7 @@ impl LocalHnswSegmentWriter {
                 .await?;
             guard.num_elements_since_last_persist = 0;
             guard.recovery_checkpoint_pending = false;
+            guard.last_persist = Some(tokio::time::Instant::now());
         }
 
         guard.last_seen_seq_id = max_seq_id;
@@ -1911,6 +1944,8 @@ mod tests {
                     fail_resize: false,
                     allow_reset: false,
                     num_elements_since_last_persist: 0,
+                    last_persist: None,
+                    save_interval: SAVE_INTERVAL,
                     last_seen_seq_id: 0,
                     sync_threshold: 1000,
                     persist_path: None,
@@ -2072,5 +2107,88 @@ mod tests {
             .validate_persisted_checkpoint(&path, 1)
             .await
             .is_err());
+    }
+
+    // A save every sync_threshold records kept the index waiting for the disk under a steady load: after its first save,
+    // an instance saves again only once SAVE_INTERVAL has passed since it, however many records come in between, which
+    // stay in memory. The position of the segment in SQLite, which a save moves, tells the saves apart.
+    #[tokio::test]
+    async fn saves_after_the_first_wait_for_the_save_interval() {
+        let sqlite = get_new_sqlite_db().await;
+        let persist_dir = tempfile::tempdir().expect("persist dir");
+        let persist_path = persist_dir.path().to_str().expect("utf-8 path").to_string();
+        let mut collection = Collection::test_collection(3);
+        collection.schema = Some(Schema::new_default(KnnIndex::Hnsw));
+        let vector_segment = Segment {
+            id: SegmentUuid::new(),
+            r#type: SegmentType::HnswLocalPersisted,
+            scope: SegmentScope::VECTOR,
+            collection: collection.collection_id,
+            metadata: None,
+            file_path: Default::default(),
+        };
+        let mut writer = super::LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &vector_segment,
+            3,
+            Some(persist_path.clone()),
+            sqlite.clone(),
+        )
+        .await
+        .expect("writer");
+        writer.index.set_sync_threshold(2).await;
+        // The records first and first + 1, as two records of the log.
+        let chunk = |first: i64| {
+            Chunk::new(
+                (first..first + 2)
+                    .map(|log_offset| LogRecord {
+                        log_offset,
+                        record: OperationRecord {
+                            id: format!("id-{log_offset}"),
+                            embedding: Some(vec![log_offset as f32, 2.0, 3.0]),
+                            encoding: None,
+                            metadata: None,
+                            document: None,
+                            operation: Operation::Add,
+                        },
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        };
+        let saved = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT CAST(seq_id AS INTEGER) FROM max_seq_id WHERE segment_id = ?",
+            )
+            .bind(vector_segment.id.to_string())
+            .fetch_optional(sqlite.get_conn())
+            .await
+            .expect("max_seq_id")
+        };
+
+        writer.apply_log_chunk(chunk(1)).await.expect("apply log");
+        assert_eq!(saved().await, Some(2), "the first save, at the threshold");
+        for first in [3, 5, 7] {
+            writer
+                .apply_log_chunk(chunk(first))
+                .await
+                .expect("apply log");
+            assert_eq!(
+                saved().await,
+                Some(2),
+                "no save within the interval, at the records {first} and {}",
+                first + 1
+            );
+        }
+        assert_eq!(writer.index.applied_state().await, (8, 8));
+
+        writer.index.set_save_interval(super::Duration::ZERO).await;
+        writer.apply_log_chunk(chunk(9)).await.expect("apply log");
+        assert_eq!(
+            saved().await,
+            Some(10),
+            "a save once the interval has passed"
+        );
+        writer.index.close().await;
     }
 }

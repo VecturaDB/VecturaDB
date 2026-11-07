@@ -1765,6 +1765,11 @@ mod tests {
             io::ErrorKind::NotFound
         );
         writer.index.set_sync_threshold(1).await;
+        // The deletion below saves too, as before SAVE_INTERVAL.
+        writer
+            .index
+            .set_save_interval(std::time::Duration::ZERO)
+            .await;
         writer.apply_log_chunk(add(1, "a")).await.unwrap();
         manager
             .validate_persisted_checkpoint(&segment.id, 0)
@@ -1945,6 +1950,11 @@ mod tests {
         let second = second.unwrap();
         assert!(Arc::ptr_eq(&first.index.inner, &second.index.inner));
         first.index.set_sync_threshold(1).await;
+        // A save at every record, as before SAVE_INTERVAL.
+        first
+            .index
+            .set_save_interval(std::time::Duration::ZERO)
+            .await;
         first.apply_log_chunk(add(1, "a")).await.unwrap();
 
         // Evict while a caller still holds the index. The listener closes its
