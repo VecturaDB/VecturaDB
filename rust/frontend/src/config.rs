@@ -42,6 +42,7 @@ fn default_segment_manager_config() -> Option<LocalSegmentManagerConfig> {
             },
         ),
         persist_path: None,
+        hnsw_min_save_interval_seconds: None,
     })
 }
 
@@ -189,6 +190,10 @@ pub struct FrontendServerConfig {
     pub stdout_tracing: bool,
     #[serde(default = "default_persist_path")]
     pub persist_path: String,
+    /// The shortest time, in seconds, between two saves of a local HNSW index after its first one, whatever
+    /// `sync_threshold` says: 30 without it; 0 saves at every threshold, as Chroma 1.5.9 does, in the background.
+    #[serde(default)]
+    pub hnsw_min_save_interval_seconds: Option<u64>,
     #[serde(default = "default_sqlite_filename")]
     pub sqlite_filename: String,
     #[serde(default)]
@@ -352,6 +357,36 @@ mod tests {
         assert_eq!(
             read("local_compaction_manager:\n  max_compaction_size: 500\n"),
             500
+        );
+    }
+
+    // hnsw_min_save_interval_seconds of the server reaches the segment manager, which takes 30 seconds without it; a
+    // value in the block of the segment manager (segment_manager, at the top of the file: the frontend block is flattened
+    // into the server one) wins, as persist_path does.
+    #[test]
+    fn the_min_save_interval_of_the_server_reaches_the_segment_manager() {
+        use figment::providers::{Format, Yaml};
+        let read = |yaml: &str| {
+            let default =
+                super::DefaultConfigurationsFolder::get(super::DEFAULT_SINGLE_NODE_CONFIG_FILENAME)
+                    .unwrap()
+                    .data;
+            let config: FrontendServerConfig =
+                figment::Figment::from(Yaml::string(std::str::from_utf8(&default).unwrap()))
+                    .merge(Yaml::string(yaml))
+                    .extract()
+                    .unwrap();
+            crate::local_frontend_config(&config)
+                .segment_manager
+                .unwrap()
+                .hnsw_min_save_interval_seconds
+        };
+        assert_eq!(read("port: 8000\n"), None);
+        assert_eq!(read("hnsw_min_save_interval_seconds: 0\n"), Some(0));
+        assert_eq!(read("hnsw_min_save_interval_seconds: 45\n"), Some(45));
+        assert_eq!(
+            read("hnsw_min_save_interval_seconds: 45\nsegment_manager:\n  hnsw_min_save_interval_seconds: 5\n"),
+            Some(5)
         );
     }
 

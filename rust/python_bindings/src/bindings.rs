@@ -445,12 +445,13 @@ pub fn cli(py: Python<'_>, py_args: Option<Vec<String>>) -> ChromaPyResult<()> {
 #[pymethods]
 impl Bindings {
     #[new]
-    #[pyo3(signature = (allow_reset, sqlite_db_config, hnsw_cache_size, persist_path=None))]
+    #[pyo3(signature = (allow_reset, sqlite_db_config, hnsw_cache_size, persist_path=None, hnsw_min_save_interval_seconds=None))]
     pub fn py_new(
         allow_reset: bool,
         sqlite_db_config: SqliteDBConfig,
         hnsw_cache_size: usize,
         persist_path: Option<String>,
+        hnsw_min_save_interval_seconds: Option<u64>,
     ) -> ChromaPyResult<Self> {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
@@ -467,6 +468,7 @@ impl Bindings {
         let segment_manager_config = LocalSegmentManagerConfig {
             hnsw_index_pool_cache_config: cache_config,
             persist_path,
+            hnsw_min_save_interval_seconds,
         };
 
         // TODO: consume the log configuration from the input python
@@ -1679,7 +1681,7 @@ mod tests {
             migration_mode: MigrationMode::Apply,
             ..Default::default()
         };
-        let bindings = Bindings::py_new(true, sqlite_db_config, 16, Some(persist_path))
+        let bindings = Bindings::py_new(true, sqlite_db_config, 16, Some(persist_path), None)
             .expect("persistent bindings");
 
         (temp_dir, bindings)

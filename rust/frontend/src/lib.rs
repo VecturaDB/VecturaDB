@@ -60,13 +60,9 @@ pub async fn frontend_service_entrypoint(
     frontend_service_entrypoint_with_config(auth, quota_enforcer, &config, init_otel_tracing).await;
 }
 
-pub async fn frontend_service_entrypoint_with_config_system_registry(
-    auth: Arc<dyn auth::AuthenticateAndAuthorize>,
-    quota_enforcer: Arc<dyn QuotaEnforcer>,
-    system: System,
-    registry: Registry,
-    config: &FrontendServerConfig,
-) {
+/// The configuration of the frontend from the one of the server: on a single node, the folder of the data, the SQLite
+/// file in it and the shortest time between two saves of a local HNSW index, where the frontend block gives none.
+pub fn local_frontend_config(config: &FrontendServerConfig) -> FrontendConfig {
     let mut fe_cfg = config.frontend.clone();
     if let (Some(sql_cfg), Some(local_segman_cfg)) =
         (fe_cfg.sqlitedb.as_mut(), fe_cfg.segment_manager.as_mut())
@@ -79,6 +75,11 @@ pub async fn frontend_service_entrypoint_with_config_system_registry(
                 .expect("Persist path should be valid")
                 .to_string(),
         );
+        if let Some(seconds) = config.hnsw_min_save_interval_seconds {
+            local_segman_cfg
+                .hnsw_min_save_interval_seconds
+                .get_or_insert(seconds);
+        }
         sql_cfg.url.get_or_insert(
             sqlite_url
                 .to_str()
@@ -86,6 +87,17 @@ pub async fn frontend_service_entrypoint_with_config_system_registry(
                 .to_string(),
         );
     }
+    fe_cfg
+}
+
+pub async fn frontend_service_entrypoint_with_config_system_registry(
+    auth: Arc<dyn auth::AuthenticateAndAuthorize>,
+    quota_enforcer: Arc<dyn QuotaEnforcer>,
+    system: System,
+    registry: Registry,
+    config: &FrontendServerConfig,
+) {
+    let fe_cfg = local_frontend_config(config);
 
     let frontend = Frontend::try_from_config(&(fe_cfg, system.clone()), &registry)
         .await

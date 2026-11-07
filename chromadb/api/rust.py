@@ -131,6 +131,7 @@ class RustBindingsAPI(ServerAPI):
             sqlite_db_config=sqlite_config,
             persist_path=persist_path,
             hnsw_cache_size=self.hnsw_cache_size,
+            hnsw_min_save_interval_seconds=self._system.settings.chroma_hnsw_min_save_interval_seconds,
         )
 
     @override

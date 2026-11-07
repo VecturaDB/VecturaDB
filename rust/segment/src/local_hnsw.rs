@@ -47,8 +47,9 @@ const HNSW_PERSISTENCE_VERSION: i32 = 1;
 // save every sync_threshold records kept the index waiting for the disk most of the time under a steady load. The
 // records after the last save are in the log of SQLite, whose position for the segment moves only after a save, and
 // the next load applies them again, as after any stop between two saves. The first save of an instance waits for the
-// threshold only, as in Chroma 1.5.9: the files of an index never saved are not read at load.
-const SAVE_INTERVAL: Duration = Duration::from_secs(30);
+// threshold only, as in Chroma 1.5.9: the files of an index never saved are not read at load. The default of
+// hnsw_min_save_interval_seconds of the segment manager, which sets it on every index it opens.
+pub(crate) const SAVE_INTERVAL: Duration = Duration::from_secs(30);
 
 // Native HNSW uses four C-runtime streams per persistent index (and another
 // four temporarily while loading). Windows defaults to 512 streams per process.
@@ -776,7 +777,7 @@ pub struct Inner {
     num_elements_since_last_persist: u64,
     // When this instance last saved its index; None before its first save.
     last_persist: Option<tokio::time::Instant>,
-    // SAVE_INTERVAL, shorter in tests.
+    // SAVE_INTERVAL, or hnsw_min_save_interval_seconds of the segment manager; shorter in tests.
     save_interval: Duration,
     last_seen_seq_id: u64,
     sync_threshold: usize,
@@ -998,9 +999,8 @@ impl LocalHnswIndex {
         self.inner.write().await.sync_threshold = sync_threshold;
     }
 
-    /// The shortest time between two saves of this instance, SAVE_INTERVAL otherwise: for tests that save more than
-    /// once.
-    #[cfg(any(test, feature = "test-hooks"))]
+    /// The shortest time between two saves of this instance after its first one, SAVE_INTERVAL otherwise: the segment
+    /// manager sets its hnsw_min_save_interval_seconds, and tests that save more than once set it shorter.
     pub async fn set_save_interval(&self, save_interval: Duration) {
         self.inner.write().await.save_interval = save_interval;
     }
