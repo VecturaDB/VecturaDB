@@ -1,6 +1,8 @@
-# write <batches>: one collection "col", batches of 100 records of 3 dimensions, printing each batch acknowledged.
+# write <batches> [<pause after>]: one collection "col", batches of 100 records of 3 dimensions, printing each batch
+# acknowledged; after the batch <pause after>, a pause of 31 seconds, past the 30 seconds that a local HNSW index waits
+# after a save before the next (SAVE_INTERVAL), so that the batch after it saves the index again.
 # read <batches>: every acknowledged record read back with its embedding, and a query on each 100th one.
-import json, sys, urllib.request, urllib.error
+import json, sys, time, urllib.request, urllib.error
 B = "http://127.0.0.1:8000/api/v2/tenants/default_tenant/databases/default_database"
 def call(m, p, body=None):
     r = urllib.request.Request(B + p, method=m, data=None if body is None else json.dumps(body).encode(), headers={"Content-Type": "application/json"})
@@ -10,10 +12,13 @@ def call(m, p, body=None):
 emb = lambda i: [i / 3000, (i % 7) / 7, (i % 11) / 11]
 if sys.argv[1] == "write":
     c = call("POST", "/collections", {"name": "col", "get_or_create": True})
+    pause_after = int(sys.argv[3]) if len(sys.argv) > 3 else 0
     for b in range(int(sys.argv[2])):
         ids = range(b * 100, b * 100 + 100)
         call("POST", f"/collections/{c['id']}/add", {"ids": [f"r{i}" for i in ids], "embeddings": [emb(i) for i in ids]})
         print(b + 1, flush=True)
+        if b + 1 == pause_after:
+            time.sleep(31)
 else:
     n = int(sys.argv[2]) * 100
     c = call("GET", "/collections/col")

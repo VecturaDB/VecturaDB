@@ -1,7 +1,8 @@
 #!/bin/bash
 # $1 rounds. A snapshot of the disk while the server writes, as the backup of a volume: under
 # LazyFS what was not synced stays in its cache, so the folder below it is what a snapshot takes. Each round: batches of
-# 100 records across the saves; after the batch $k, with the writes going on, that folder copied; the copy started by a
+# 100 records across the saves, the first at 1000 records, the next at the batch after a pause of 31 seconds that follows
+# the batch 20 (client_save.py); after the batch $k, with the writes going on, that folder copied; the copy started by a
 # second server on a plain folder, and every record acknowledged before the copy read back with its embedding.
 set -u
 cat > /lz.toml <<T
@@ -26,7 +27,7 @@ for r in $(seq "$1"); do
   /lazyfs/lazyfs/build/lazyfs /data --config-path /lz.toml -o allow_other -o modules=subdir -o subdir=/real >/tmp/lz.log 2>&1 & sleep 2
   up /cfg.yaml || exit 1
   k=$((8 + RANDOM % 15))
-  python3 /client_save.py write 25 > /tmp/acks & w=$!
+  python3 /client_save.py write 25 20 > /tmp/acks & w=$!
   until [ "$(tail -1 /tmp/acks 2>/dev/null || echo 0)" -ge "$k" ] 2>/dev/null; do sleep 0.05; done
   n=$(tail -1 /tmp/acks); cp -a /real /snap
   kill $w 2>/dev/null; wait $w 2>/dev/null; pkill -9 -f "vecturadb run"; sleep 1; fusermount3 -u /data; sleep 1
