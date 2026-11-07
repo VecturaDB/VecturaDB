@@ -1,4 +1,9 @@
 use crate::{
+    bounds_message, HnswConfiguration, HnswParametersFromSegmentError, InternalHnswConfiguration,
+    InternalSpannConfiguration, Metadata, Schema, Segment, SpannConfiguration,
+    UpdateHnswConfiguration, UpdateSpannConfiguration, VectorIndexConfig, EMBEDDING_KEY,
+};
+use crate::{
     collection_schema::is_embedding_function_default, default_batch_size, default_construction_ef,
     default_construction_ef_spann, default_initial_lambda, default_m, default_m_spann,
     default_merge_threshold, default_nreplica_count, default_num_centers_to_merge_to,
@@ -7,11 +12,6 @@ use crate::{
     default_search_rng_epsilon, default_search_rng_factor, default_space, default_split_threshold,
     default_sync_threshold, default_write_nprobe, default_write_rng_epsilon,
     default_write_rng_factor,
-};
-use crate::{
-    HnswConfiguration, HnswParametersFromSegmentError, InternalHnswConfiguration,
-    InternalSpannConfiguration, Metadata, Schema, Segment, SpannConfiguration,
-    UpdateHnswConfiguration, UpdateSpannConfiguration, VectorIndexConfig, EMBEDDING_KEY,
 };
 use chroma_error::{ChromaError, ErrorCodes};
 use serde::{Deserialize, Serialize};
@@ -309,6 +309,8 @@ impl InternalCollectionConfiguration {
                         };
                         let hnsw_params = temp_config.get_hnsw_config_from_legacy_metadata(&metadata)?;
                         if let Some(hnsw_params) = hnsw_params {
+                            // The hnsw:* metadata of a request, within the bounds of a request.
+                            hnsw_params.validate().map_err(HnswParametersFromSegmentError::InvalidParameters)?;
                             hnsw = hnsw_params;
                         }
                         let spann_config = InternalSpannConfiguration {
@@ -329,6 +331,8 @@ impl InternalCollectionConfiguration {
                         };
                         let hnsw_params = internal_config.get_hnsw_config_from_legacy_metadata(&metadata)?;
                         if let Some(hnsw_params) = hnsw_params {
+                            // The hnsw:* metadata of a request, within the bounds of a request.
+                            hnsw_params.validate().map_err(HnswParametersFromSegmentError::InvalidParameters)?;
                             internal_config.vector_index = VectorIndexConfiguration::Hnsw(hnsw_params);
                         }
                         Ok(internal_config)
@@ -413,7 +417,21 @@ impl TryFrom<CollectionConfiguration> for InternalCollectionConfiguration {
 impl TryFrom<&Schema> for InternalCollectionConfiguration {
     type Error = String;
 
+    // The schema of a request: its HNSW settings within their bounds.
     fn try_from(schema: &Schema) -> Result<Self, Self::Error> {
+        Self::from_schema(schema, false)
+    }
+}
+
+impl InternalCollectionConfiguration {
+    /// The configuration of a collection read from the disk, from its schema: its HNSW settings checked as Chroma 1.5.9
+    /// checked them, so that a collection that Chroma 1.5.9 stored above the bounds of a request is read
+    /// (InternalHnswConfiguration::validate_persisted).
+    pub fn from_persisted_schema(schema: &Schema) -> Result<Self, String> {
+        Self::from_schema(schema, true)
+    }
+
+    fn from_schema(schema: &Schema, persisted: bool) -> Result<Self, String> {
         let vector_config = schema
             .keys
             .get(EMBEDDING_KEY)
@@ -444,10 +462,14 @@ impl TryFrom<&Schema> for InternalCollectionConfiguration {
                     .to_string(),
             ),
             (Some(hnsw_config), None) => {
-                hnsw_config
-                    .validate()
-                    .map_err(|err| format!("Invalid HNSW configuration: {err}"))?;
-                let internal_hnsw = (space.as_ref(), Some(&hnsw_config)).into();
+                let internal_hnsw: InternalHnswConfiguration =
+                    (space.as_ref(), Some(&hnsw_config)).into();
+                if persisted {
+                    internal_hnsw.validate_persisted()
+                } else {
+                    hnsw_config.validate()
+                }
+                .map_err(|err| format!("Invalid HNSW configuration: {}", bounds_message(&err)))?;
                 Ok(InternalCollectionConfiguration {
                     vector_index: VectorIndexConfiguration::Hnsw(internal_hnsw),
                     embedding_function,
@@ -475,7 +497,8 @@ impl TryFrom<&Schema> for InternalCollectionConfiguration {
 pub enum CollectionConfigurationToInternalConfigurationError {
     #[error("Multiple vector index configurations provided")]
     MultipleVectorIndexConfigurations,
-    #[error("Failed to parse hnsw parameters from segment metadata")]
+    // The setting, its value and its bound (bounds_message), also for a configuration, which is no metadata of a segment.
+    #[error("{0}")]
     HnswParametersFromSegmentError(#[from] HnswParametersFromSegmentError),
 }
 

@@ -9,10 +9,40 @@ use validator::Validate;
 pub enum HnswParametersFromSegmentError {
     #[error("Invalid metadata: {0}")]
     InvalidMetadata(#[from] serde_json::Error),
-    #[error("Invalid parameters: {0}")]
+    #[error("Invalid HNSW configuration: {}", bounds_message(.0))]
     InvalidParameters(#[from] validator::ValidationErrors),
     #[error("Incompatible vector index types")]
     IncompatibleVectorIndexTypes,
+}
+
+/// The HNSW settings outside their bounds, as a request reads them: "sync_threshold 30000 is above the maximum of 4096",
+/// one for each setting, in the order of their names.
+pub fn bounds_message(errors: &validator::ValidationErrors) -> String {
+    let number = |value: Option<&serde_json::Value>| value.and_then(serde_json::Value::as_f64);
+    let mut parts: Vec<String> = errors
+        .field_errors()
+        .into_iter()
+        .flat_map(|(field, errors)| {
+            errors.iter().map(move |error| {
+                let value = error.params.get("value");
+                let shown = value.map(|value| value.to_string()).unwrap_or_default();
+                let (min, max) = (error.params.get("min"), error.params.get("max"));
+                match (number(value), number(min), number(max)) {
+                    (Some(value), _, Some(bound)) if value > bound => format!(
+                        "{field} {shown} is above the maximum of {}",
+                        max.map(|max| max.to_string()).unwrap_or_default()
+                    ),
+                    (Some(value), Some(bound), _) if value < bound => format!(
+                        "{field} {shown} is below the minimum of {}",
+                        min.map(|min| min.to_string()).unwrap_or_default()
+                    ),
+                    _ => format!("{field} {shown} is not valid"),
+                }
+            })
+        })
+        .collect();
+    parts.sort();
+    parts.join("; ")
 }
 
 impl ChromaError for HnswParametersFromSegmentError {
@@ -205,6 +235,29 @@ impl Default for HnswConfiguration {
 }
 
 impl InternalHnswConfiguration {
+    /// The checks of Chroma 1.5.9 on the HNSW settings of a collection already on the disk, the minimums of
+    /// sync_threshold and batch_size, and one more: max_neighbors of 2 or more, as an index with 1 gives wrong
+    /// neighbours (on Chroma 1.5.9 too, which opens it). Chroma 1.5.9 accepted settings outside the bounds that Chroma
+    /// #7825 put on requests, and reads its collections again; so does the single node. The bounds stay on the
+    /// settings that a request sends.
+    pub fn validate_persisted(&self) -> Result<(), validator::ValidationErrors> {
+        #[derive(Validate)]
+        struct Persisted {
+            #[validate(range(min = 2))]
+            max_neighbors: usize,
+            #[validate(range(min = 2))]
+            sync_threshold: usize,
+            #[validate(range(min = 2))]
+            batch_size: usize,
+        }
+        Persisted {
+            max_neighbors: self.max_neighbors,
+            sync_threshold: self.sync_threshold,
+            batch_size: self.batch_size,
+        }
+        .validate()
+    }
+
     pub(crate) fn from_legacy_segment_metadata(
         segment_metadata: &Option<Metadata>,
     ) -> Result<Self, HnswParametersFromSegmentError> {
@@ -248,7 +301,9 @@ impl InternalHnswConfiguration {
                 sync_threshold: parsed.sync_threshold,
                 batch_size: parsed.batch_size,
             };
-            params.validate()?;
+            // The metadata of a segment is on the disk, and a request of the hnsw:* metadata is checked with the bounds
+            // after it is read (InternalCollectionConfiguration::try_from_config).
+            params.validate_persisted()?;
             Ok(params)
         } else {
             Ok(InternalHnswConfiguration::default())
@@ -306,9 +361,21 @@ mod tests {
                 .is_ok(),
                 valid
             );
+            // The hnsw:* metadata of a segment is on the disk, read with the minimum of M and none of its maximum; the
+            // same metadata in a request has the bounds.
             let metadata = Metadata::from([("hnsw:M".into(), MetadataValue::Int(m as i64))]);
             assert_eq!(
-                InternalHnswConfiguration::from_legacy_segment_metadata(&Some(metadata)).is_ok(),
+                InternalHnswConfiguration::from_legacy_segment_metadata(&Some(metadata.clone()))
+                    .is_ok(),
+                m >= 2
+            );
+            assert_eq!(
+                crate::InternalCollectionConfiguration::try_from_config(
+                    crate::CollectionConfiguration::default(),
+                    crate::KnnIndex::Hnsw,
+                    Some(metadata),
+                )
+                .is_ok(),
                 valid
             );
         }
