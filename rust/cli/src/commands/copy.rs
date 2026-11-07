@@ -14,7 +14,7 @@ use chroma_types::operator::Key;
 use chroma_types::plan::SearchPayload;
 use chroma_types::{
     GetResponse, Include, IncludeList, Metadata, MetadataValue, Schema, SearchResponse,
-    UpdateMetadata, UpdateMetadataValue, ValueTypes,
+    UpdateMetadata, UpdateMetadataValue, ValueTypes, CHROMA_URI_KEY,
 };
 use clap::Parser;
 use crossterm::style::Stylize;
@@ -75,6 +75,8 @@ pub enum CopyError {
     NotAllCopied(String),
     #[error("Could not ask what to do with collection {0}")]
     NoAnswer(String),
+    #[error("{0}. No record of it was written, so the copy deleted the collection it had created")]
+    Deleted(String),
 }
 
 #[derive(Parser, Debug)]
@@ -462,7 +464,7 @@ impl Record {
     fn difference(&self, other: &Record) -> Option<&'static str> {
         if self.document != other.document {
             Some("document")
-        } else if self.embedding != other.embedding {
+        } else if !same_embedding(self.embedding.as_deref(), other.embedding.as_deref()) {
             Some("embedding")
         } else if self.metadata() != other.metadata() {
             Some("metadata")
@@ -487,6 +489,27 @@ impl Record {
                 .map(|(key, value)| (key.clone(), update_value(value.clone()))),
         );
         (!metadata.is_empty()).then_some(metadata)
+    }
+}
+
+/// The tolerances of `np.allclose`, with which the tests of Chroma take an embedding read back as the one written
+/// (`_field_matches` in chromadb/test/property/invariants.py). HNSW with the cosine space keeps every embedding normalized,
+/// with its length, and gives back their product, whose last bit can change.
+const RELATIVE_TOLERANCE: f64 = 1e-5;
+const ABSOLUTE_TOLERANCE: f64 = 1e-8;
+
+/// Whether the embedding read on the other side is the one written on this side, as `np.allclose(read, written)` says.
+fn same_embedding(written: Option<&[f32]>, read: Option<&[f32]>) -> bool {
+    match (written, read) {
+        (Some(written), Some(read)) => {
+            written.len() == read.len()
+                && written.iter().zip(read).all(|(&written, &read)| {
+                    let (written, read) = (f64::from(written), f64::from(read));
+                    (read - written).abs()
+                        <= ABSOLUTE_TOLERANCE + RELATIVE_TOLERANCE * written.abs()
+                })
+        }
+        (written, read) => written == read,
     }
 }
 
@@ -537,18 +560,29 @@ fn records_of(response: SearchResponse) -> Vec<Record> {
         .collect()
 }
 
+/// The records of a get, as a search gives them: a get gives the URI of a record apart, a search in its metadata, where the
+/// write path stores it (`to_records`).
 fn records_of_get(response: GetResponse) -> Vec<Record> {
     let mut documents = response.documents.unwrap_or_default().into_iter();
     let mut embeddings = response.embeddings.unwrap_or_default().into_iter();
+    let mut uris = response.uris.unwrap_or_default().into_iter();
     let mut metadatas = response.metadatas.unwrap_or_default().into_iter();
     response
         .ids
         .into_iter()
-        .map(|id| Record {
-            id,
-            document: documents.next().flatten(),
-            embedding: embeddings.next(),
-            metadata: metadatas.next().flatten(),
+        .map(|id| {
+            let mut metadata = metadatas.next().flatten();
+            if let Some(uri) = uris.next().flatten() {
+                metadata
+                    .get_or_insert_with(Metadata::new)
+                    .insert(CHROMA_URI_KEY.to_string(), MetadataValue::Str(uri));
+            }
+            Record {
+                id,
+                document: documents.next().flatten(),
+                embedding: embeddings.next(),
+                metadata,
+            }
         })
         .collect()
 }
@@ -590,6 +624,7 @@ async fn read_page(
             Include::Document,
             Include::Embedding,
             Include::Metadata,
+            Include::Uri,
         ]);
         let response = until_done("the target", progress, || {
             target.get(Some(ids.clone()), None, None, None, Some(include.clone()))
@@ -1297,7 +1332,7 @@ async fn copy_collection(
                 existing.on_target
             ));
             let created = create_on_target(source, target, &waiting).await?;
-            write_collection(source, &created, None, options, term).await
+            write_new_collection(source, target, &created, options, term).await
         }
         Some((existing, what)) => {
             write_collection(
@@ -1311,9 +1346,42 @@ async fn copy_collection(
         }
         None => {
             let created = create_on_target(source, target, &waiting).await?;
-            write_collection(source, &created, None, options, term).await
+            write_new_collection(source, target, &created, options, term).await
         }
     }
+}
+
+/// Writes a collection that the copy has just created on the target. If the copy cannot go on and no record of it was
+/// written, as when Chroma 1.5.9 refuses a sparse vector in the metadata, the copy deletes it, so that the next copy, or
+/// another way to copy it, starts from nothing. With one record in it, the collection stays. The copy command of Chroma
+/// leaves it.
+async fn write_new_collection(
+    source: &ChromaCollection,
+    target: &ChromaHttpClient,
+    created: &ChromaCollection,
+    options: CopyOptions,
+    term: &mut dyn Terminal,
+) -> Result<(), CliError> {
+    let error = match write_collection(source, created, None, options, term).await {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    let waiting = Progress::new(format!("Collection {}", source.name()), 0, 0);
+    if !matches!(
+        until_done("the target", &waiting, || created.count()).await,
+        Ok(0)
+    ) {
+        return Err(error);
+    }
+    if until_done("the target", &waiting, || {
+        target.delete_collection(source.name())
+    })
+    .await
+    .is_err()
+    {
+        return Err(error);
+    }
+    Err(CopyError::Deleted(error.to_string()).into())
 }
 
 async fn copy_collections(
@@ -1424,8 +1492,12 @@ async fn copy_collections(
     }
     for (collection, existing) in to_write {
         if let Err(error) = copy_collection(collection, &target, existing, options, term).await {
+            let again = match &error {
+                CliError::Copy(CopyError::Deleted(_)) => "run the same command again",
+                _ => "run the same command again to go on from there",
+            };
             not_copied.push(format!(
-                "Collection {}: {error}. When that is solved, run the same command again to go on from there",
+                "Collection {}: {error}. When that is solved, {again}",
                 collection.name()
             ));
         }
@@ -1603,6 +1675,24 @@ mod tests {
     }
 
     #[test]
+    fn an_embedding_is_the_same_within_the_tolerances_of_np_allclose() {
+        let same = |written: &[f32], read: &[f32]| same_embedding(Some(written), Some(read));
+        assert!(same(
+            &[1.0, 0.2, 0.5],
+            &[1.0, f32::from_bits(0x3E4C_CCCC), 0.5]
+        ));
+        assert!(same(&[2.0], &[2.0 + 2.0 * 0.9e-5]));
+        assert!(!same(&[2.0], &[2.0 + 2.0 * 1.1e-5]));
+        // A number near zero has the absolute tolerance.
+        assert!(same(&[0.0], &[0.9e-8]));
+        assert!(!same(&[0.0], &[1.1e-8]));
+        assert!(!same(&[1.0, 0.2, 0.5], &[1.0, 0.3, 0.5]));
+        assert!(!same(&[1.0, 0.2], &[1.0, 0.2, 0.5]));
+        assert!(!same_embedding(Some(&[1.0]), None));
+        assert!(same_embedding(None, None));
+    }
+
+    #[test]
     fn an_upsert_takes_away_the_keys_the_source_no_longer_has() {
         let mut found = record(1);
         found.metadata = with_metadata(&[
@@ -1656,7 +1746,7 @@ mod tests {
         use axum::response::{IntoResponse, Response};
         use axum::routing::{get, post};
         use axum::{Json, Router};
-        use chroma_types::{Collection, CollectionUuid, Schema};
+        use chroma_types::{Collection, CollectionUuid, Schema, CHROMA_KEY};
         use serde_json::{json, Value};
         use std::collections::VecDeque;
 
@@ -1710,6 +1800,12 @@ mod tests {
             pub without_search: bool,
             /// A server that gives HNSW with its own settings to a new collection that asks for SPANN, as Chroma 1.5.9.
             pub spann_becomes_hnsw: bool,
+            /// A server whose index keeps every embedding normalized, with its length, and gives back their product, as HNSW
+            /// with the cosine space.
+            pub rebuilds_embeddings: bool,
+            /// After this many writes, every add is refused with 501, as Chroma 1.5.9 refuses a sparse vector in the
+            /// metadata.
+            pub refuses_adds_after: Option<usize>,
             /// The features of the server block of the pre-flight checks. Chroma has no block.
             pub features: Option<Vec<String>>,
             pub reads: usize,
@@ -1975,6 +2071,7 @@ mod tests {
                 return answer(failure).await;
             }
             let mut server = server.lock().unwrap();
+            let rebuilds = server.rebuilds_embeddings;
             let collection = by_id(&mut server, &id);
             let found: Vec<&Record> = match body["ids"].as_array() {
                 Some(ids) => collection
@@ -1991,18 +2088,46 @@ mod tests {
             };
             let include: Vec<String> = serde_json::from_value(body["include"].clone()).unwrap();
             let included = |what: &str| include.iter().any(|field| field == what);
+            let embedding = |record: &Record| match &record.embedding {
+                Some(embedding) if rebuilds => Some(as_the_index_gives_it(embedding)),
+                embedding => embedding.clone(),
+            };
+            // As a get of Chroma (`GetResponse` from a `GetResult`): the URI of a record comes apart from its metadata, which
+            // leave the keys of Chroma.
+            let uri = |record: &Record| match record.metadata.as_ref()?.get(CHROMA_URI_KEY)? {
+                MetadataValue::Str(uri) => Some(uri.clone()),
+                _ => None,
+            };
+            let metadata = |record: &Record| {
+                record.metadata.clone().map(|metadata| {
+                    metadata
+                        .into_iter()
+                        .filter(|(key, _)| !key.starts_with(CHROMA_KEY))
+                        .collect::<Metadata>()
+                })
+            };
             Json(json!({
                 "ids": found.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
                 "documents": included("documents")
                     .then(|| found.iter().map(|r| r.document.clone()).collect::<Vec<_>>()),
                 "embeddings": included("embeddings")
-                    .then(|| found.iter().map(|r| r.embedding.clone()).collect::<Vec<_>>()),
+                    .then(|| found.iter().map(|r| embedding(r)).collect::<Vec<_>>()),
                 "metadatas": included("metadatas")
-                    .then(|| found.iter().map(|r| r.metadata.clone()).collect::<Vec<_>>()),
-                "uris": null,
+                    .then(|| found.iter().map(|r| metadata(r)).collect::<Vec<_>>()),
+                "uris": included("uris")
+                    .then(|| found.iter().map(|r| uri(r)).collect::<Vec<_>>()),
                 "include": include,
             }))
             .into_response()
+        }
+
+        /// An embedding as HNSW with the cosine space gives it back: `normalize_vector` and `getDataByLabel` in
+        /// hnswlib/hnswalg.h, of the hnswlib of Chroma 1.5.9 and of VecturaDB. The last bit of a number can change.
+        pub fn as_the_index_gives_it(embedding: &[f32]) -> Vec<f32> {
+            let norm = embedding.iter().fold(0.0f32, |norm, x| norm + x * x);
+            let length = norm.sqrt();
+            let inverse = 1.0f32 / (length + 1e-30f32);
+            embedding.iter().map(|x| x * inverse * length).collect()
         }
 
         /// Chroma's answer, and the server block when the server has one.
@@ -2035,7 +2160,13 @@ mod tests {
             Path((_, _, id)): Path<(String, String, String)>,
             Json(body): Json<Value>,
         ) -> Response {
-            let failure = server.lock().unwrap().add_failures.pop_front();
+            let failure = {
+                let mut server = server.lock().unwrap();
+                match server.refuses_adds_after {
+                    Some(after) if server.adds.len() >= after => Some(Failure::Status(501)),
+                    _ => server.add_failures.pop_front(),
+                }
+            };
             if let Some(failure) = failure {
                 return answer(failure).await;
             }
@@ -2138,7 +2269,7 @@ mod tests {
         }
     }
 
-    use server::{start, Failure, Server, Shared, StoredCollection};
+    use server::{as_the_index_gives_it, start, Failure, Server, Shared, StoredCollection};
 
     /// A source with one collection of these records, and an empty target.
     async fn source_and_target(
@@ -3068,5 +3199,101 @@ mod tests {
             target_server.lock().unwrap().collections[0].schema,
             Some(Schema::new_default(chroma_types::KnnIndex::Spann))
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_record_with_a_uri_is_the_same_on_a_target_that_gives_the_uri_apart() {
+        // A search gives the URI of a record in its metadata, a get apart.
+        let mut books = records(0..250);
+        for book in books.iter_mut().step_by(5) {
+            let uri = MetadataValue::Str(format!("s3://bucket/{}", book.id));
+            book.metadata
+                .get_or_insert_with(Metadata::new)
+                .insert(CHROMA_URI_KEY.to_string(), uri);
+        }
+        let (source, _source_server, target, target_server) =
+            source_and_target(books.clone()).await;
+        let (result, _) = copy_books(&source, &target).await;
+        result.unwrap();
+        let (result, term) = copy_books(&source, &target).await;
+        result.unwrap();
+        assert!(said(&term, "is already copied"), "{:?}", term.output);
+        let (result, term) = again_with(&source, &target, OnExisting::Force).await;
+        result.unwrap();
+        assert!(said(&term, "is already copied"), "{:?}", term.output);
+        assert!(target_server.lock().unwrap().upserts.is_empty());
+        assert_eq!(records_on(&target_server, "books"), books);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_embedding_that_the_index_of_the_target_gives_back_rounded_is_the_same() {
+        // As Chroma 1.5.9 gave back [1.0, 0.2, 0.5], copied from Chroma Cloud to a collection with the cosine space.
+        assert_eq!(
+            as_the_index_gives_it(&[1.0, 0.2, 0.5]),
+            [1.0, f32::from_bits(0x3E4C_CCCC), 0.5]
+        );
+        let books: Vec<Record> = (0..250)
+            .map(|i| Record {
+                embedding: Some(vec![1.0, (i % 5) as f32 * 0.2, 0.5]),
+                ..record(i)
+            })
+            .collect();
+        let (source, _source_server, target, target_server) =
+            source_and_target(books.clone()).await;
+        target_server.lock().unwrap().rebuilds_embeddings = true;
+        let (result, _) = copy_books(&source, &target).await;
+        result.unwrap();
+        let (result, term) = copy_books(&source, &target).await;
+        result.unwrap();
+        assert!(said(&term, "is already copied"), "{:?}", term.output);
+        let (result, term) = again_with(&source, &target, OnExisting::Force).await;
+        result.unwrap();
+        assert!(said(&term, "is already copied"), "{:?}", term.output);
+        assert!(target_server.lock().unwrap().upserts.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_collection_with_no_record_written_is_deleted() {
+        let (source, _source_server, target, target_server) =
+            source_and_target(records(0..250)).await;
+        target_server.lock().unwrap().refuses_adds_after = Some(0);
+        let (result, _) = copy_books(&source, &target).await;
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("so the copy deleted the collection it had created. When that is solved, run the same command again"),
+            "{error}"
+        );
+        assert!(target_server.lock().unwrap().collections.is_empty());
+        target_server.lock().unwrap().refuses_adds_after = None;
+        let (result, term) = copy_books(&source, &target).await;
+        result.unwrap();
+        assert!(
+            !said(&term, "is already on the target"),
+            "{:?}",
+            term.output
+        );
+        assert_eq!(records_on(&target_server, "books"), records(0..250));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_collection_with_one_record_written_stays() {
+        let (source, _source_server, target, target_server) =
+            source_and_target(records(0..3)).await;
+        target_server.lock().unwrap().refuses_adds_after = Some(1);
+        let one_at_a_time = CopyOptions {
+            step: 1,
+            ..options(None, false)
+        };
+        let (result, _) = copy_books_with(
+            &source,
+            &target,
+            one_at_a_time,
+            TestTerminal::new().without_prompts(),
+        )
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("to go on from there"), "{error}");
+        assert!(!error.contains("deleted"), "{error}");
+        assert_eq!(records_on(&target_server, "books"), records(0..1));
     }
 }
