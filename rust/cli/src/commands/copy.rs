@@ -14,7 +14,7 @@ use chroma_types::operator::Key;
 use chroma_types::plan::SearchPayload;
 use chroma_types::{
     GetResponse, Include, IncludeList, Metadata, MetadataValue, Schema, SearchResponse,
-    UpdateMetadata, UpdateMetadataValue, ValueTypes,
+    UpdateMetadata, UpdateMetadataValue, ValueTypes, CHROMA_URI_KEY,
 };
 use clap::Parser;
 use crossterm::style::Stylize;
@@ -537,18 +537,29 @@ fn records_of(response: SearchResponse) -> Vec<Record> {
         .collect()
 }
 
+/// The records of a get, as a search gives them: a get gives the URI of a record apart, a search in its metadata, where the
+/// write path stores it (`to_records`).
 fn records_of_get(response: GetResponse) -> Vec<Record> {
     let mut documents = response.documents.unwrap_or_default().into_iter();
     let mut embeddings = response.embeddings.unwrap_or_default().into_iter();
+    let mut uris = response.uris.unwrap_or_default().into_iter();
     let mut metadatas = response.metadatas.unwrap_or_default().into_iter();
     response
         .ids
         .into_iter()
-        .map(|id| Record {
-            id,
-            document: documents.next().flatten(),
-            embedding: embeddings.next(),
-            metadata: metadatas.next().flatten(),
+        .map(|id| {
+            let mut metadata = metadatas.next().flatten();
+            if let Some(uri) = uris.next().flatten() {
+                metadata
+                    .get_or_insert_with(Metadata::new)
+                    .insert(CHROMA_URI_KEY.to_string(), MetadataValue::Str(uri));
+            }
+            Record {
+                id,
+                document: documents.next().flatten(),
+                embedding: embeddings.next(),
+                metadata,
+            }
         })
         .collect()
 }
@@ -590,6 +601,7 @@ async fn read_page(
             Include::Document,
             Include::Embedding,
             Include::Metadata,
+            Include::Uri,
         ]);
         let response = until_done("the target", progress, || {
             target.get(Some(ids.clone()), None, None, None, Some(include.clone()))
@@ -1656,7 +1668,7 @@ mod tests {
         use axum::response::{IntoResponse, Response};
         use axum::routing::{get, post};
         use axum::{Json, Router};
-        use chroma_types::{Collection, CollectionUuid, Schema};
+        use chroma_types::{Collection, CollectionUuid, Schema, CHROMA_KEY};
         use serde_json::{json, Value};
         use std::collections::VecDeque;
 
@@ -1991,6 +2003,20 @@ mod tests {
             };
             let include: Vec<String> = serde_json::from_value(body["include"].clone()).unwrap();
             let included = |what: &str| include.iter().any(|field| field == what);
+            // As a get of Chroma (`GetResponse` from a `GetResult`): the URI of a record comes apart from its metadata, which
+            // leave the keys of Chroma.
+            let uri = |record: &Record| match record.metadata.as_ref()?.get(CHROMA_URI_KEY)? {
+                MetadataValue::Str(uri) => Some(uri.clone()),
+                _ => None,
+            };
+            let metadata = |record: &Record| {
+                record.metadata.clone().map(|metadata| {
+                    metadata
+                        .into_iter()
+                        .filter(|(key, _)| !key.starts_with(CHROMA_KEY))
+                        .collect::<Metadata>()
+                })
+            };
             Json(json!({
                 "ids": found.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
                 "documents": included("documents")
@@ -1998,8 +2024,9 @@ mod tests {
                 "embeddings": included("embeddings")
                     .then(|| found.iter().map(|r| r.embedding.clone()).collect::<Vec<_>>()),
                 "metadatas": included("metadatas")
-                    .then(|| found.iter().map(|r| r.metadata.clone()).collect::<Vec<_>>()),
-                "uris": null,
+                    .then(|| found.iter().map(|r| metadata(r)).collect::<Vec<_>>()),
+                "uris": included("uris")
+                    .then(|| found.iter().map(|r| uri(r)).collect::<Vec<_>>()),
                 "include": include,
             }))
             .into_response()
@@ -3068,5 +3095,29 @@ mod tests {
             target_server.lock().unwrap().collections[0].schema,
             Some(Schema::new_default(chroma_types::KnnIndex::Spann))
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_record_with_a_uri_is_the_same_on_a_target_that_gives_the_uri_apart() {
+        // A search gives the URI of a record in its metadata, a get apart.
+        let mut books = records(0..250);
+        for book in books.iter_mut().step_by(5) {
+            let uri = MetadataValue::Str(format!("s3://bucket/{}", book.id));
+            book.metadata
+                .get_or_insert_with(Metadata::new)
+                .insert(CHROMA_URI_KEY.to_string(), uri);
+        }
+        let (source, _source_server, target, target_server) =
+            source_and_target(books.clone()).await;
+        let (result, _) = copy_books(&source, &target).await;
+        result.unwrap();
+        let (result, term) = copy_books(&source, &target).await;
+        result.unwrap();
+        assert!(said(&term, "is already copied"), "{:?}", term.output);
+        let (result, term) = again_with(&source, &target, OnExisting::Force).await;
+        result.unwrap();
+        assert!(said(&term, "is already copied"), "{:?}", term.output);
+        assert!(target_server.lock().unwrap().upserts.is_empty());
+        assert_eq!(records_on(&target_server, "books"), books);
     }
 }
