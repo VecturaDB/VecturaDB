@@ -99,6 +99,36 @@ jobs:
           path: vecturadb-windows-x64.exe
       # The tests of the local HNSW that only Windows runs: data paths at the limit of MAX_PATH.
       - run: cargo test --release -p chroma-segment --lib on_windows
+      # The tests that open a database file again, here on Windows too: every start of the server, or of a
+      # PersistentClient, on a folder with data opens its file again.
+      - run: cargo test --release -p chroma-sqlite --lib opened_again
+      # The exe that this job publishes, started on a folder with data: a write, a kill, a start on the same folder and a
+      # count. It runs after a failure of the tests above too, so that a defect at the open shows in both.
+      - name: The server opens its folder again
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $data = Join-Path $env:RUNNER_TEMP "reopen"
+          $collections = "http://127.0.0.1:8123/api/v2/tenants/default_tenant/databases/default_database/collections"
+          function Start-Server {
+            $server = Start-Process .\vecturadb-windows-x64.exe -ArgumentList "run", "--path", $data, "--host", "127.0.0.1", "--port", "8123" -NoNewWindow -PassThru
+            $null = $server.Handle
+            for ($i = 0; $i -lt 120; $i++) {
+              if ($server.HasExited) { throw "the server stopped with exit code $($server.ExitCode)" }
+              try { Invoke-RestMethod http://127.0.0.1:8123/api/v2/heartbeat | Out-Null; return $server } catch { Start-Sleep -Milliseconds 500 }
+            }
+            throw "the server did not answer in 60 s"
+          }
+          $server = Start-Server
+          $collection = Invoke-RestMethod -Method Post $collections -ContentType application/json -Body '{"name": "reopen"}'
+          Invoke-RestMethod -Method Post "$collections/$($collection.id)/add" -ContentType application/json -Body '{"ids": ["a", "b"], "embeddings": [[1, 2, 3], [4, 5, 6]]}' | Out-Null
+          Stop-Process -Id $server.Id -Force
+          $server.WaitForExit()
+          $server = Start-Server
+          $count = Invoke-RestMethod "$collections/$($collection.id)/count"
+          Stop-Process -Id $server.Id -Force
+          if ($count -ne 2) { throw "after the start on the same folder the count is $count, not 2" }
+          "after the start on the same folder the count is $count"
 
   cli-macos:
     name: CLI macOS ${{ matrix.name }}

@@ -447,4 +447,43 @@ mod tests {
             .unwrap();
         assert_eq!(written, 3);
     }
+
+    // A database file opened again while it is open, as by a second process or after a kill, when its log and the index
+    // of its log are there too: the open syncs the three files, and reads the records that the log holds.
+    #[tokio::test]
+    async fn a_database_file_opened_again_while_open_reads_its_log() {
+        let (dir, path, first) = database_file(JournalMode::default()).await;
+        let files = files_of(dir.path());
+        assert!(files.contains(&"chroma.sqlite3-wal".to_string()));
+        assert!(files.contains(&"chroma.sqlite3-shm".to_string()));
+        let config = SqliteDBConfig {
+            url: Some(path.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        let second = SqliteDb::try_from_config(&config, &Registry::new())
+            .await
+            .unwrap();
+        let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM written")
+            .fetch_one(second.get_conn())
+            .await
+            .unwrap();
+        assert_eq!(written, 3);
+        second.close().await;
+        first.close().await;
+    }
+
+    // The sync at the open of a database file that the process cannot write, as one restored read-only: Chroma 1.5.9,
+    // which did not sync, opened it, so the sync does not stop the open.
+    #[tokio::test]
+    async fn a_database_file_opened_again_that_cannot_be_written_is_not_refused_by_the_sync() {
+        let (_dir, path, db) = database_file(JournalMode::default()).await;
+        db.close().await;
+        let writable = std::fs::metadata(&path).unwrap().permissions();
+        let mut read_only = writable.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&path, read_only).unwrap();
+        let synced = sync_existing(&path).await;
+        std::fs::set_permissions(&path, writable).unwrap();
+        synced.unwrap();
+    }
 }
