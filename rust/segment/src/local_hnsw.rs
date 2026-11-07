@@ -1,6 +1,6 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
 mod persistence;
-pub(crate) use persistence::validate_checkpoint;
+pub(crate) use persistence::{save_in_flight, validate_checkpoint};
 use persistence::{validate_checkpoint_seq_id, CheckpointFingerprint, VerifiedCheckpoint};
 #[cfg(test)]
 mod regression;
@@ -8,7 +8,7 @@ mod regression;
 pub use persistence::TOUCH_AFTER_INSPECTION;
 pub use persistence::{
     inspect_persisted_hnsw_index, inspect_persisted_hnsw_index_for_config_repair,
-    is_checkpoint_changed, CheckpointChanged, PersistedHnswIndex,
+    is_checkpoint_changed, is_save_in_flight, CheckpointChanged, PersistedHnswIndex, SaveInFlight,
 };
 
 use std::{
@@ -64,9 +64,12 @@ async fn acquire_hnsw_files() -> tokio::sync::SemaphorePermit<'static> {
 }
 
 // Must be held under the index write lock. Close on every exit, including a
-// failed native save, before the file-operation permit is released.
+// failed native save, before the file-operation permit is released. For the tests that save through the streams of
+// the index; a save writes the files from its journal (Save::write_files).
+#[cfg(test)]
 struct HnswFiles<'a>(&'a HnswIndex);
 
+#[cfg(test)]
 impl Drop for HnswFiles<'_> {
     fn drop(&mut self) {
         self.0.close_fd();
@@ -269,9 +272,13 @@ impl LocalHnswSegmentReader {
 
         match persist_root {
             Some(path_str) => {
-                let _files = acquire_hnsw_files().await;
                 let path = Path::new(&path_str);
                 let index_folder = path.join(segment.id.to_string());
+                // A save in the background of an instance of this index, as one evicted from the cache, may write its
+                // files: the load waits for it, and no save of the instance loaded writes them before the load ends.
+                let files = files_lock(&index_folder);
+                let _saving = files.clone().lock_owned().await;
+                let _files = acquire_hnsw_files().await;
                 // A save cut by a stop leaves its journal: its bytes go back to the files before anything reads them, unless
                 // the files were saved after it (apply_journals_newer_than_data).
                 if index_folder.exists() {
@@ -370,6 +377,9 @@ impl LocalHnswSegmentReader {
                                 last_seen_seq_id: current_seq_id,
                                 sync_threshold: hnsw_configuration.sync_threshold,
                                 persist_path: Some(index_folder_str.to_string()),
+                                files: Some(files.clone()),
+                                #[cfg(any(test, feature = "test-hooks"))]
+                                save_hook: None,
                                 sqlite: sql_db,
                             })),
                         },
@@ -423,6 +433,9 @@ impl LocalHnswSegmentReader {
                             last_seen_seq_id: 0,
                             sync_threshold: hnsw_configuration.sync_threshold,
                             persist_path: None,
+                            files: None,
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            save_hook: None,
                             sqlite: sql_db,
                         })),
                     },
@@ -768,8 +781,18 @@ pub struct Inner {
     last_seen_seq_id: u64,
     sync_threshold: usize,
     persist_path: Option<String>,
+    // The lock of the files of the index in persist_path (files_lock), None without one.
+    files: Option<Arc<tokio::sync::Mutex<()>>>,
+    // Run by the save of this instance before it writes the files, which an error stops: for tests of what goes on
+    // during a save, and of a save that fails.
+    #[cfg(any(test, feature = "test-hooks"))]
+    save_hook: Option<SaveHook>,
     sqlite: SqliteDb,
 }
+
+/// What a test runs in a save of a local HNSW index before it writes the files (LocalHnswIndex::set_save_hook).
+#[cfg(any(test, feature = "test-hooks"))]
+pub type SaveHook = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 impl Inner {
     fn needs_checkpoint(&self) -> bool {
@@ -793,6 +816,12 @@ pub struct IndexShared {
     deleted: AtomicBool,
     failed: AtomicBool,
     replay_complete: AtomicBool,
+    // Inner::files, taken without the lock of the index: before it, as a save in the background takes the lock of the
+    // index while it holds this one.
+    files: Option<Arc<tokio::sync::Mutex<()>>>,
+    // A save waits for the lock of the files (Save::queued): an apply called for one while a save, a close, a load or an
+    // inspection held them.
+    save_queued: AtomicBool,
 }
 
 impl IndexShared {
@@ -803,9 +832,35 @@ impl IndexShared {
             deleted: AtomicBool::new(inner.deleted),
             failed: AtomicBool::new(inner.failed),
             replay_complete: AtomicBool::new(inner.replay_complete),
+            files: inner.files.clone(),
+            save_queued: AtomicBool::new(false),
             lock: tokio::sync::RwLock::new(inner),
         }
     }
+}
+
+// One save at a time writes the files of a local HNSW index, and nothing reads them meanwhile. A save takes its journal
+// under the write lock of the index and writes the files in the background (Save::write), so that reads and writes do not
+// wait for the disk: the lock of the index no longer covers the files, this one does. A load, a close, a deletion and the
+// inspection before a purge of the log take it before the lock of the index, as the save does. Keyed by the folder of the
+// index: an instance evicted from the cache and the one loaded after it are two instances of the same files.
+static FILES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The lock of the files of the local HNSW index in `index_folder`, which a save in the background holds while it writes
+/// them: whoever reads or removes the files takes it first.
+pub fn files_lock(index_folder: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = FILES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(lock) = locks.get(index_folder).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    locks.retain(|_, lock| lock.strong_count() != 0);
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(index_folder.to_path_buf(), Arc::downgrade(&lock));
+    lock
 }
 
 impl std::ops::Deref for IndexShared {
@@ -847,6 +902,17 @@ impl LocalHnswIndex {
         path: &Path,
         watermark: u64,
     ) -> std::io::Result<bool> {
+        // A save in the background writes the files: no inspection now (is_save_in_flight). Waiting for it would hold the
+        // compactor that asked, and with it every write.
+        let _files = match &self.inner.files {
+            Some(files) => Some(
+                files
+                    .clone()
+                    .try_lock_owned()
+                    .map_err(|_| persistence::save_in_flight())?,
+            ),
+            None => None,
+        };
         let mut guard = self.inner.write().await;
         let before = CheckpointFingerprint::read(path)?;
         if let Some(verified) = &guard.verified_checkpoint {
@@ -880,10 +946,35 @@ impl LocalHnswIndex {
         self.inner.replay_complete.store(complete, Ordering::Release);
     }
 
+    // The lock of the files of this index (files_lock), once the save in the background that writes them, if any, ended;
+    // None for an index without files. Taken before the lock of the index, as the save does.
+    async fn lock_files(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        match &self.inner.files {
+            Some(files) => Some(files.clone().lock_owned().await),
+            None => None,
+        }
+    }
+
+    /// Waits for the save in the background that writes the files of this index, if one does, and for the one that waits
+    /// to write them after it, if any.
+    pub async fn wait_for_save(&self) {
+        loop {
+            drop(self.lock_files().await);
+            if !self.inner.save_queued.load(Ordering::Acquire) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    // After the save in the background, if any: a closed index has no save that writes its files.
     pub async fn close(&self) {
+        let _files = self.lock_files().await;
         self.inner.write().await.index.close_fd();
     }
+    // After the save in the background, if any, and none after it: the files of a deleted index are removed next.
     pub(crate) async fn mark_deleted(&self) {
+        let _files = self.lock_files().await;
         let mut guard = self.inner.write().await;
         guard.deleted = true;
         self.inner.deleted.store(true, Ordering::Release);
@@ -912,6 +1003,12 @@ impl LocalHnswIndex {
     #[cfg(any(test, feature = "test-hooks"))]
     pub async fn set_save_interval(&self, save_interval: Duration) {
         self.inner.write().await.save_interval = save_interval;
+    }
+
+    /// What the saves of this instance run before they write the files, in the background; an error stops the save.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn set_save_hook(&self, hook: Option<SaveHook>) {
+        self.inner.write().await.save_hook = hook;
     }
 
     /// The last applied log offset and the number of vectors in the index.
@@ -1040,9 +1137,13 @@ impl LocalHnswSegmentWriter {
 
         match persist_root {
             Some(path_str) => {
-                let _files = acquire_hnsw_files().await;
                 let path = Path::new(&path_str);
                 let index_folder = path.join(segment.id.to_string());
+                // A save in the background of an instance of this index, as one evicted from the cache, may write its
+                // files: the load waits for it, and no save of the instance loaded writes them before the load ends.
+                let files = files_lock(&index_folder);
+                let _saving = files.clone().lock_owned().await;
+                let _files = acquire_hnsw_files().await;
                 // A save cut by a stop leaves its journal: its bytes go back to the files before anything reads them, unless
                 // the files were saved after it (apply_journals_newer_than_data).
                 if index_folder.exists() {
@@ -1140,6 +1241,9 @@ impl LocalHnswSegmentWriter {
                                 last_seen_seq_id: current_seq_id,
                                 sync_threshold: hnsw_configuration.sync_threshold,
                                 persist_path: Some(index_folder_str.to_string()),
+                                files: Some(files.clone()),
+                                #[cfg(any(test, feature = "test-hooks"))]
+                                save_hook: None,
                                 sqlite: sql_db,
                             })),
                         },
@@ -1192,6 +1296,9 @@ impl LocalHnswSegmentWriter {
                             last_seen_seq_id: 0,
                             sync_threshold: hnsw_configuration.sync_threshold,
                             persist_path: Some(index_folder_str.to_string()),
+                            files: Some(files.clone()),
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            save_hook: None,
                             sqlite: sql_db,
                         })),
                     },
@@ -1238,6 +1345,9 @@ impl LocalHnswSegmentWriter {
                             last_seen_seq_id: 0,
                             sync_threshold: hnsw_configuration.sync_threshold,
                             persist_path: None,
+                            files: None,
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            save_hook: None,
                             sqlite: sql_db,
                         })),
                     },
@@ -1452,23 +1562,24 @@ impl LocalHnswSegmentWriter {
         // The index holds the chunk in memory: a read that waits for these records may go on.
         self.index.inner.applied_seq_id.store(max_seq_id, Ordering::Release);
         guard.id_map.total_elements_added = next_label - 1;
+        // A save takes its journal here, under the write lock, and writes the files in the background with the lock of
+        // the files held: reads and writes do not wait for the disk. While another holds the files, as a save of this
+        // index, the save waits for them in the background and takes its journal then (Save::queued), so that the saves
+        // reach the files in the order of their journals.
         if guard.needs_checkpoint() {
-            guard = persist(guard).await?;
-            let id = guard.index.id.to_string().into();
-            let max_id = max_seq_id.into();
-            // Persist max_seq_id to sqlite.
-            let (query, values) = Query::insert()
-                .into_table(MaxSeqId::Table)
-                .replace()
-                .columns([MaxSeqId::SegmentId, MaxSeqId::SeqId])
-                .values([id, max_id])?
-                .build_sqlx(SqliteQueryBuilder);
-            let _ = sqlx::query_with(&query, values)
-                .execute(guard.sqlite.get_conn())
-                .await?;
-            guard.num_elements_since_last_persist = 0;
-            guard.recovery_checkpoint_pending = false;
-            guard.last_persist = Some(tokio::time::Instant::now());
+            if let Some(lock) = guard.files.clone() {
+                match lock.clone().try_lock_owned() {
+                    Ok(files) => {
+                        let save = take_save(&mut guard, files)?;
+                        tokio::spawn(save.write(self.index.clone()));
+                    }
+                    Err(_) => {
+                        if !self.index.inner.save_queued.swap(true, Ordering::AcqRel) {
+                            tokio::spawn(Save::queued(lock, self.index.clone()));
+                        }
+                    }
+                }
+            }
         }
 
         guard.last_seen_seq_id = max_seq_id;
@@ -1509,50 +1620,190 @@ fn reconcile_checkpoint(
     Ok(())
 }
 
-async fn persist(
-    mut guard: tokio::sync::RwLockWriteGuard<'_, Inner>,
-) -> Result<tokio::sync::RwLockWriteGuard<'_, Inner>, LocalHnswSegmentWriterError> {
+// A save of a local HNSW index: its journal, which holds the ID map, taken under the write lock of the index
+// (take_save), and the position in the log that it publishes in SQLite once the files are durable; written without that
+// lock (write_files), with the lock of the files held until it ends (finish).
+struct Save {
+    files: tokio::sync::OwnedMutexGuard<()>,
+    folder: std::path::PathBuf,
+    journal: Vec<u8>,
+    seq_id: u64,
+    segment_id: String,
+    sqlite: SqliteDb,
+    // The files were those that the last inspection verified: the files of this save are verified too.
+    verified: bool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    hook: Option<SaveHook>,
+}
+
+// The journal of a save, taken under the write lock of the index with the lock of its files held: the elements changed
+// from now on go to the next save, whose counts start here. A save that fails gives its elements back (finish).
+fn take_save(
+    guard: &mut Inner,
+    files: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<Save, LocalHnswSegmentWriterError> {
     if guard.failed {
         return Err(LocalHnswSegmentWriterError::HnswIndexLoadError);
     }
-    if let Some(path) = guard.persist_path.clone() {
-        guard.id_map.checkpoint_seq_id = Some(guard.last_seen_seq_id);
-        // Retain validation only across our own successful writes. Unexpected
-        // file changes and any failed save require another complete inspection.
-        let verified = guard.verified_checkpoint.take().is_some_and(|previous| {
-            CheckpointFingerprint::read(Path::new(&path))
-                .is_ok_and(|current| current == previous.fingerprint)
-        });
-        let path = path.as_str();
-        // The ID map goes in the journal of the save of the native files, as the compaction of distributed Chroma
-        // publishes its files whole or not at all: a kill between the files and the map left the files of one save
-        // with the map of the save before, ids on labels the files had deleted and labels no id had.
-        let mut id_map = Vec::new();
-        serde_pickle::to_writer(&mut id_map, &guard.id_map, SerOptions::new())?;
-        let _permit = acquire_hnsw_files().await;
-        {
-            // Queries and mutations use memory. Only checkpointing needs open
-            // streams, serialized with eviction by the index write lock.
-            let files = HnswFiles(&guard.index);
-            files
-                .0
-                .open_fd()
-                .map_err(|_| LocalHnswSegmentWriterError::HnswIndexPersistError)?;
-            files
-                .0
-                .save_with_journal_file(METADATA_FILE, &id_map)
-                .map_err(|_| LocalHnswSegmentWriterError::HnswIndexPersistError)?;
-        }
-        // The save syncs its journal, the folder of the index and the folder above it, then the four files and the ID map,
-        // and only then removes the journal (persistDirtyWithJournal of the fork of hnswlib): a power cut or a snapshot of
-        // the disk finds the index of this save or of the one before. Chroma 1.5.9 synced nothing.
-        if verified {
-            guard.verified_checkpoint = Some(VerifiedCheckpoint {
-                fingerprint: CheckpointFingerprint::read(Path::new(path))?,
-                seq_id: guard.id_map.checkpoint_seq_id,
-            });
+    let folder = guard
+        .persist_path
+        .clone()
+        .ok_or(LocalHnswSegmentWriterError::HnswIndexPersistError)?;
+    guard.id_map.checkpoint_seq_id = Some(guard.last_seen_seq_id);
+    // Retain validation only across our own successful writes. Unexpected
+    // file changes and any failed save require another complete inspection.
+    let verified = guard.verified_checkpoint.take().is_some_and(|previous| {
+        CheckpointFingerprint::read(Path::new(&folder))
+            .is_ok_and(|current| current == previous.fingerprint)
+    });
+    // The ID map goes in the journal of the save of the native files, as the compaction of distributed Chroma
+    // publishes its files whole or not at all: a kill between the files and the map left the files of one save
+    // with the map of the save before, ids on labels the files had deleted and labels no id had.
+    let mut id_map = Vec::new();
+    serde_pickle::to_writer(&mut id_map, &guard.id_map, SerOptions::new())?;
+    let journal = guard
+        .index
+        .take_persist_journal_file(METADATA_FILE, &id_map)
+        .map_err(|_| LocalHnswSegmentWriterError::HnswIndexPersistError)?;
+    guard.num_elements_since_last_persist = 0;
+    guard.recovery_checkpoint_pending = false;
+    guard.last_persist = Some(tokio::time::Instant::now());
+    Ok(Save {
+        files,
+        folder: folder.into(),
+        journal,
+        seq_id: guard.last_seen_seq_id,
+        segment_id: guard.index.id.to_string(),
+        sqlite: guard.sqlite.clone(),
+        verified,
+        #[cfg(any(test, feature = "test-hooks"))]
+        hook: guard.save_hook.clone(),
+    })
+}
+
+impl Save {
+    // The files written from the journal, which syncs the journal, the folder of the index and the folder above it, then
+    // the four files and the ID map, and only then removes the journal (persistJournalBytes of the fork of hnswlib): a
+    // power cut or a snapshot of the disk finds the index of this save or of the one before. Chroma 1.5.9 synced
+    // nothing.
+    async fn write_files(&mut self) -> Result<(), String> {
+        let permit = acquire_hnsw_files().await;
+        let folder = self.folder.clone();
+        let journal = std::mem::take(&mut self.journal);
+        #[cfg(any(test, feature = "test-hooks"))]
+        let hook = self.hook.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(any(test, feature = "test-hooks"))]
+            if let Some(hook) = hook {
+                hook()?;
+            }
+            HnswIndex::persist_journal_bytes(&folder, &journal).map_err(|err| err.to_string())
+        })
+        .await
+        .map_err(|err| err.to_string())??;
+        drop(permit);
+        Ok(())
+    }
+
+    // After write_files, the position in the log published in SQLite: the next load applies the records after it again.
+    async fn publish(&self) -> Result<(), String> {
+        let (query, values) = Query::insert()
+            .into_table(MaxSeqId::Table)
+            .replace()
+            .columns([MaxSeqId::SegmentId, MaxSeqId::SeqId])
+            .values([self.segment_id.clone().into(), self.seq_id.into()])
+            .map_err(|err| err.to_string())?
+            .build_sqlx(SqliteQueryBuilder);
+        sqlx::query_with(&query, values)
+            .execute(self.sqlite.get_conn())
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    // After write_files, under the write lock of the index, then the lock of the files released: the files verified
+    // again after a save that found them verified; after an error, the elements of the journal given back to the next
+    // save, which the next apply makes whatever its counts (recovery_checkpoint_pending).
+    fn finish(&self, guard: &mut Inner, written: Result<(), String>) -> Result<(), String> {
+        match written {
+            Ok(()) => {
+                if self.verified {
+                    if let Ok(fingerprint) = CheckpointFingerprint::read(&self.folder) {
+                        guard.verified_checkpoint = Some(VerifiedCheckpoint {
+                            fingerprint,
+                            seq_id: Some(self.seq_id),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            Err(err) => {
+                if guard.index.restore_taken_elements().is_err() {
+                    // The next save would miss them: the instance is not used again, and the next load replays the log.
+                    guard.failed = true;
+                }
+                guard.recovery_checkpoint_pending = true;
+                Err(err)
+            }
         }
     }
+
+    // The save in the background: an error goes to the log of the server, and the next apply saves again.
+    async fn write(mut self, index: LocalHnswIndex) {
+        let written = match self.write_files().await {
+            Ok(()) => self.publish().await,
+            Err(err) => Err(err),
+        };
+        let mut guard = index.inner.write().await;
+        if let Err(err) = self.finish(&mut guard, written) {
+            index.inner.failed.store(guard.failed, Ordering::Release);
+            tracing::error!(
+                error = %err,
+                "A save of a local HNSW index failed; the next write to its collection saves it again"
+            );
+        }
+    }
+
+    // The save that an apply called for while another held the files: once they are free, its journal under the write
+    // lock of the index, if the index still calls for a save, then written as any other. The records applied while a
+    // save wrote the files get the next save so, instead of at the next apply.
+    async fn queued(lock: Arc<tokio::sync::Mutex<()>>, index: LocalHnswIndex) {
+        let files = lock.lock_owned().await;
+        let mut guard = index.inner.write().await;
+        index.inner.save_queued.store(false, Ordering::Release);
+        if guard.deleted || guard.failed || !guard.needs_checkpoint() {
+            return;
+        }
+        match take_save(&mut guard, files) {
+            Ok(save) => {
+                drop(guard);
+                save.write(index).await;
+            }
+            Err(err) => tracing::error!(
+                error = %err,
+                "A save of a local HNSW index failed; the next write to its collection saves it again"
+            ),
+        }
+    }
+}
+
+// The files of a save of the index written now, before it returns, under the write lock, the position in SQLite left
+// where it was: for the tests that need the files of a save before they go on, as persist did before the saves in the
+// background. No save of the index may write its files meanwhile.
+#[cfg(test)]
+async fn persist(
+    mut guard: tokio::sync::RwLockWriteGuard<'_, Inner>,
+) -> Result<tokio::sync::RwLockWriteGuard<'_, Inner>, LocalHnswSegmentWriterError> {
+    let Some(files) = guard.files.clone() else {
+        return Ok(guard);
+    };
+    let files = files
+        .try_lock_owned()
+        .map_err(|_| LocalHnswSegmentWriterError::HnswIndexPersistError)?;
+    let mut save = take_save(&mut guard, files)?;
+    let written = save.write_files().await;
+    save.finish(&mut guard, written)
+        .map_err(|_| LocalHnswSegmentWriterError::HnswIndexPersistError)?;
     Ok(guard)
 }
 
@@ -1951,6 +2202,9 @@ mod tests {
                     last_seen_seq_id: 0,
                     sync_threshold: 1000,
                     persist_path: None,
+                    files: None,
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    save_hook: None,
                     sqlite,
                 })),
             },
@@ -2169,12 +2423,14 @@ mod tests {
         };
 
         writer.apply_log_chunk(chunk(1)).await.expect("apply log");
+        writer.index.wait_for_save().await;
         assert_eq!(saved().await, Some(2), "the first save, at the threshold");
         for first in [3, 5, 7] {
             writer
                 .apply_log_chunk(chunk(first))
                 .await
                 .expect("apply log");
+            writer.index.wait_for_save().await;
             assert_eq!(
                 saved().await,
                 Some(2),
@@ -2186,11 +2442,390 @@ mod tests {
 
         writer.index.set_save_interval(super::Duration::ZERO).await;
         writer.apply_log_chunk(chunk(9)).await.expect("apply log");
+        writer.index.wait_for_save().await;
         assert_eq!(
             saved().await,
             Some(10),
             "a save once the interval has passed"
         );
         writer.index.close().await;
+    }
+
+    // A persistent index with a writer whose saves, in the background, stop before they write the files until the test
+    // lets each one go on or fail: what goes on while a save writes the files, as a slow disk would make it last.
+    struct HeldSaves {
+        sqlite: chroma_sqlite::db::SqliteDb,
+        _dir: tempfile::TempDir,
+        persist_path: String,
+        collection: Collection,
+        segment: Segment,
+        writer: super::LocalHnswSegmentWriter,
+        // One message as each save stops.
+        started: tokio::sync::mpsc::UnboundedReceiver<()>,
+        // What the next save that stopped does: go on, or fail with the error.
+        release: std::sync::mpsc::Sender<Result<(), String>>,
+    }
+
+    const HELD: std::time::Duration = std::time::Duration::from_millis(300);
+    const PROMPT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    async fn held_saves() -> HeldSaves {
+        let sqlite = get_new_sqlite_db().await;
+        let dir = tempfile::tempdir().expect("persist dir");
+        let persist_path = dir.path().to_str().expect("utf-8 path").to_string();
+        let mut collection = Collection::test_collection(3);
+        collection.schema = Some(Schema::new_default(KnnIndex::Hnsw));
+        let segment = Segment {
+            id: SegmentUuid::new(),
+            r#type: SegmentType::HnswLocalPersisted,
+            scope: SegmentScope::VECTOR,
+            collection: collection.collection_id,
+            metadata: None,
+            file_path: Default::default(),
+        };
+        let writer = super::LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_path.clone()),
+            sqlite.clone(),
+        )
+        .await
+        .expect("writer");
+        writer.index.set_sync_threshold(2).await;
+        writer.index.set_save_interval(super::Duration::ZERO).await;
+        let (started_tx, started) = tokio::sync::mpsc::unbounded_channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let hook: super::SaveHook = std::sync::Arc::new(move || {
+            let _ = started_tx.send(());
+            release_rx.lock().expect("release").recv().unwrap_or(Ok(()))
+        });
+        writer.index.set_save_hook(Some(hook)).await;
+        HeldSaves {
+            sqlite,
+            _dir: dir,
+            persist_path,
+            collection,
+            segment,
+            writer,
+            started,
+            release,
+        }
+    }
+
+    impl HeldSaves {
+        // The records of the log offsets in records, of ids id-<offset>.
+        fn chunk(records: std::ops::RangeInclusive<i64>) -> Chunk<LogRecord> {
+            Chunk::new(
+                records
+                    .map(|log_offset| LogRecord {
+                        log_offset,
+                        record: OperationRecord {
+                            id: format!("id-{log_offset}"),
+                            embedding: Some(vec![log_offset as f32, 2.0, 3.0]),
+                            encoding: None,
+                            metadata: None,
+                            document: None,
+                            operation: Operation::Add,
+                        },
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        }
+
+        // An apply, which must not wait for a save.
+        async fn apply(&mut self, records: std::ops::RangeInclusive<i64>) {
+            tokio::time::timeout(PROMPT, self.writer.apply_log_chunk(Self::chunk(records)))
+                .await
+                .expect("an apply waits for no save")
+                .expect("apply log");
+        }
+
+        // Until a save stops before it writes the files.
+        async fn save_started(&mut self) {
+            tokio::time::timeout(PROMPT, self.started.recv())
+                .await
+                .expect("a save started")
+                .expect("hook");
+        }
+
+        // The position of the segment in SQLite, which a save publishes once its files are durable.
+        async fn saved(&self) -> Option<i64> {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT CAST(seq_id AS INTEGER) FROM max_seq_id WHERE segment_id = ?",
+            )
+            .bind(self.segment.id.to_string())
+            .fetch_optional(self.sqlite.get_conn())
+            .await
+            .expect("max_seq_id")
+        }
+
+        fn folder(&self) -> std::path::PathBuf {
+            std::path::Path::new(&self.persist_path).join(self.segment.id.to_string())
+        }
+
+        // A reader of the index, loaded from its files.
+        async fn load(&self) -> super::LocalHnswSegmentReader {
+            super::LocalHnswSegmentReader::from_segment(
+                &self.collection,
+                &self.segment,
+                3,
+                Some(self.persist_path.clone()),
+                self.sqlite.clone(),
+            )
+            .await
+            .expect("load")
+        }
+    }
+
+    // Each record of the offsets in records, in reader, with its embedding.
+    async fn assert_records(
+        reader: &super::LocalHnswSegmentReader,
+        records: std::ops::RangeInclusive<i64>,
+    ) {
+        for offset in records {
+            assert_eq!(
+                reader
+                    .get_embedding_by_user_id(&format!("id-{offset}"))
+                    .await
+                    .expect("record"),
+                vec![offset as f32, 2.0, 3.0]
+            );
+        }
+    }
+
+    // A save writes the files without the lock of the index: while it does, a query and an apply go on, and the records
+    // of that apply get the next save, right after, without another apply. Were the files written under the lock, the
+    // apply that saves would wait for them and the test would stop at its first apply.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queries_and_writes_go_on_while_a_save_writes_the_files() {
+        let mut held = held_saves().await;
+        held.apply(1..=2).await;
+        held.save_started().await;
+        let reader = super::LocalHnswSegmentReader::from_index(held.writer.index.clone());
+        let found =
+            tokio::time::timeout(PROMPT, reader.query_embedding(&[], vec![1.0, 2.0, 3.0], 1))
+                .await
+                .expect("a query waits for no save")
+                .expect("query");
+        assert_eq!(found.len(), 1);
+        held.apply(3..=4).await;
+        assert_eq!(held.writer.index.applied_state().await, (4, 4));
+        assert_eq!(
+            held.saved().await,
+            None,
+            "the save has not written the files yet"
+        );
+        held.release.send(Ok(())).expect("release");
+        held.save_started().await;
+        held.release.send(Ok(())).expect("release");
+        held.writer.index.wait_for_save().await;
+        assert_eq!(
+            held.saved().await,
+            Some(4),
+            "the records 3 and 4 in the save after"
+        );
+        held.writer.index.close().await;
+        assert_records(&held.load().await, 1..=4).await;
+    }
+
+    // The index grows in memory, past its capacity, while a save writes the files of its size before: the save after
+    // writes the index grown, and a load finds every record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_index_grows_while_a_save_writes_the_files() {
+        let mut held = held_saves().await;
+        held.apply(1..=2).await;
+        held.save_started().await;
+        let capacity = held.writer.index.inner.read().await.index.capacity();
+        held.apply(3..=(capacity as i64 * 2 + 3)).await;
+        assert!(held.writer.index.inner.read().await.index.capacity() > capacity);
+        held.release.send(Ok(())).expect("release");
+        held.save_started().await;
+        held.release.send(Ok(())).expect("release");
+        held.writer.index.wait_for_save().await;
+        held.writer.index.close().await;
+        assert_records(&held.load().await, 1..=(capacity as i64 * 2 + 3)).await;
+    }
+
+    // A close waits for the save that writes the files: once closed, no save of the index writes them. Were it not to
+    // wait, it would end while the save is held.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_close_waits_for_the_save_that_writes_the_files() {
+        let mut held = held_saves().await;
+        held.apply(1..=2).await;
+        held.save_started().await;
+        let index = held.writer.index.clone();
+        let closing = tokio::spawn(async move { index.close().await });
+        tokio::time::sleep(HELD).await;
+        assert!(!closing.is_finished(), "the close waits for the save");
+        held.release.send(Ok(())).expect("release");
+        tokio::time::timeout(PROMPT, closing)
+            .await
+            .expect("the close ends after the save")
+            .expect("close");
+        assert_eq!(held.saved().await, Some(2));
+        assert!(!held.folder().join("journal.bin").exists());
+    }
+
+    // A load of the index, as after an eviction from the cache, waits for the save of the instance before, which writes
+    // the files: it reads them whole, with the records of that save. Were it not to wait, it would end while the save is
+    // held, without them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_load_waits_for_the_save_that_writes_the_files() {
+        let mut held = held_saves().await;
+        held.apply(1..=2).await;
+        held.save_started().await;
+        let (collection, segment, persist_path, sqlite) = (
+            held.collection.clone(),
+            held.segment.clone(),
+            held.persist_path.clone(),
+            held.sqlite.clone(),
+        );
+        let loading = tokio::spawn(async move {
+            super::LocalHnswSegmentReader::from_segment(
+                &collection,
+                &segment,
+                3,
+                Some(persist_path),
+                sqlite,
+            )
+            .await
+        });
+        tokio::time::sleep(HELD).await;
+        assert!(!loading.is_finished(), "the load waits for the save");
+        held.release.send(Ok(())).expect("release");
+        let reader = tokio::time::timeout(PROMPT, loading)
+            .await
+            .expect("the load ends after the save")
+            .expect("load")
+            .expect("reader");
+        assert_records(&reader, 1..=2).await;
+    }
+
+    // A deletion waits for the save that writes the files, and no save starts after it: the files removed next stay
+    // removed. Were it not to wait, it would end while the save is held.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deletion_waits_for_the_save_that_writes_the_files() {
+        let mut held = held_saves().await;
+        held.apply(1..=2).await;
+        held.save_started().await;
+        let index = held.writer.index.clone();
+        let deleting = tokio::spawn(async move { index.mark_deleted().await });
+        tokio::time::sleep(HELD).await;
+        assert!(!deleting.is_finished(), "the deletion waits for the save");
+        held.release.send(Ok(())).expect("release");
+        tokio::time::timeout(PROMPT, deleting)
+            .await
+            .expect("the deletion ends after the save")
+            .expect("deletion");
+        assert!(matches!(
+            held.writer.apply_log_chunk(HeldSaves::chunk(3..=4)).await,
+            Err(super::LocalHnswSegmentWriterError::Deleted)
+        ));
+        assert!(held
+            .writer
+            .index
+            .inner
+            .files
+            .as_ref()
+            .expect("files")
+            .try_lock()
+            .is_ok());
+    }
+
+    // The inspection of the files before a purge of the log does not read them while a save writes them, nor wait for
+    // it, which would hold the compactor that asked, and with it the writes: it answers that a save is in flight, and the
+    // purge waits for a later write. After the save, it finds the files of that save. Were it to read them while the save
+    // is held, it would find no ID map and fail otherwise.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_inspection_before_a_purge_does_not_read_files_a_save_writes() {
+        let mut held = held_saves().await;
+        held.apply(1..=2).await;
+        held.save_started().await;
+        let inspected = tokio::time::timeout(
+            PROMPT,
+            held.writer
+                .index
+                .validate_persisted_checkpoint(&held.folder(), 2),
+        )
+        .await
+        .expect("the inspection waits for no save");
+        assert!(
+            inspected.as_ref().is_err_and(super::is_save_in_flight),
+            "{inspected:?}"
+        );
+        held.release.send(Ok(())).expect("release");
+        held.writer.index.wait_for_save().await;
+        held.writer
+            .index
+            .validate_persisted_checkpoint(&held.folder(), 2)
+            .await
+            .expect("the files of the save cover the position 2");
+    }
+
+    // A save that fails in the background: the error goes to the log of the server, the position in SQLite stays, and
+    // the next apply saves again, even with no record, with the elements of the save that failed. Were they not given
+    // back to it, its journal would hold none of them, and the load after would miss them: a record of the next apply
+    // would not do, as it changes the links of every element of so small an index.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_save_is_made_again_by_the_next_apply() {
+        let mut held = held_saves().await;
+        held.apply(1..=2).await;
+        held.save_started().await;
+        held.release
+            .send(Err("disk full".to_string()))
+            .expect("release");
+        held.writer.index.wait_for_save().await;
+        assert_eq!(held.saved().await, None);
+        assert!(
+            held.writer
+                .index
+                .inner
+                .read()
+                .await
+                .recovery_checkpoint_pending
+        );
+        tokio::time::timeout(
+            PROMPT,
+            held.writer.apply_log_chunk(Chunk::new(vec![].into())),
+        )
+        .await
+        .expect("an apply waits for no save")
+        .expect("apply log");
+        held.save_started().await;
+        held.release.send(Ok(())).expect("release");
+        held.writer.index.wait_for_save().await;
+        assert_eq!(held.saved().await, Some(2));
+        held.writer.index.close().await;
+        assert_records(&held.load().await, 1..=2).await;
+    }
+
+    // A save called for while another holds the files, as a close or an inspection does for a moment, waits for them in
+    // the background and is made then, with no other apply. Were it dropped, the records of that apply would reach the
+    // files only at a later one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_save_called_for_while_the_files_are_held_is_made_after() {
+        let mut held = held_saves().await;
+        held.writer.index.set_save_hook(None).await;
+        let files = held
+            .writer
+            .index
+            .inner
+            .files
+            .clone()
+            .expect("files")
+            .lock_owned()
+            .await;
+        held.apply(1..=2).await;
+        assert_eq!(held.saved().await, None);
+        drop(files);
+        tokio::time::timeout(PROMPT, held.writer.index.wait_for_save())
+            .await
+            .expect("the save called for while the files were held");
+        assert_eq!(held.saved().await, Some(2));
+        held.writer.index.close().await;
+        assert_records(&held.load().await, 1..=2).await;
     }
 }

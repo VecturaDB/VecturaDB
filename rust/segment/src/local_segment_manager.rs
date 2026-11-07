@@ -436,9 +436,31 @@ impl LocalSegmentManager {
                 .await?;
             return Ok(());
         }
+        // The save in the background of an instance no longer live may still write the files.
+        let _files = crate::local_hnsw::files_lock(&path)
+            .try_lock_owned()
+            .map_err(|_| crate::local_hnsw::save_in_flight())?;
         tokio::task::spawn_blocking(move || validate_checkpoint(&path, watermark).map(|_| ()))
             .await
             .map_err(io::Error::other)?
+    }
+
+    /// Whether a save in the background writes the files of the local HNSW index of the segment now.
+    pub fn hnsw_save_in_flight(&self, segment: SegmentUuid) -> bool {
+        match &self.persist_root {
+            Some(root) => crate::local_hnsw::files_lock(&Path::new(root).join(segment.to_string()))
+                .try_lock()
+                .is_err(),
+            None => false,
+        }
+    }
+
+    /// Waits for the save in the background that writes the files of the local HNSW index of the segment, if one does.
+    pub async fn wait_for_hnsw_save(&self, segment: SegmentUuid) {
+        if let Some(root) = &self.persist_root {
+            let folder = Path::new(root).join(segment.to_string());
+            drop(crate::local_hnsw::files_lock(&folder).lock().await);
+        }
     }
 
     pub async fn get_hnsw_reader(
@@ -648,7 +670,10 @@ impl LocalSegmentManager {
         self.live_indexes.lock(&id).await.remove(&id);
         self.hnsw_index_pool.remove(&id).await;
         if let Some(root) = &self.persist_root {
-            match tokio::fs::remove_dir_all(Path::new(root).join(segment_id.to_string())).await {
+            let folder = Path::new(root).join(segment_id.to_string());
+            // After the save in the background that writes the files, if any: removed under its lock, they stay removed.
+            let _files = crate::local_hnsw::files_lock(&folder).lock_owned().await;
+            match tokio::fs::remove_dir_all(&folder).await {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err.into()),
@@ -1771,6 +1796,7 @@ mod tests {
             .set_save_interval(std::time::Duration::ZERO)
             .await;
         writer.apply_log_chunk(add(1, "a")).await.unwrap();
+        writer.index.wait_for_save().await;
         manager
             .validate_persisted_checkpoint(&segment.id, 0)
             .await
@@ -1792,6 +1818,7 @@ mod tests {
             ))
             .await
             .unwrap();
+        writer.index.wait_for_save().await;
         // Tombstoned native slots with no live vectors are still a usable checkpoint.
         manager
             .validate_persisted_checkpoint(&segment.id, 0)
@@ -1888,6 +1915,8 @@ mod tests {
                 .unwrap();
             writer.index.set_sync_threshold(1).await;
             writer.apply_log_chunk(add(2, "b")).await.unwrap();
+            // The save runs in the background; the check below loads the files.
+            writer.index.wait_for_save().await;
             assert_eq!(writer.index.applied_state().await, (2, 2));
         }
         // Reopen the checkpoints to verify that closing streams after saves

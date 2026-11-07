@@ -335,6 +335,34 @@ impl HnswIndex {
             .map_err(|e| WrappedHnswError(e).boxed())
     }
 
+    /// The first step of a save whose files are written without the lock of the index: the journal of what
+    /// `save_with_journal_file` would write now, in memory, the dirty elements taken from the index. Under the lock that
+    /// writes the index; `persist_journal_bytes` writes it, and `restore_taken_elements` gives the elements back to the
+    /// next save after that failed.
+    pub fn take_persist_journal_file(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, Box<dyn ChromaError>> {
+        self.index
+            .take_persist_journal_file(name, bytes)
+            .map_err(|e| WrappedHnswError(e).boxed())
+    }
+
+    /// The dirty elements of the last journal taken given back to the next save, after its write failed.
+    pub fn restore_taken_elements(&self) -> Result<(), Box<dyn ChromaError>> {
+        self.index
+            .restore_taken_elements()
+            .map_err(|e| WrappedHnswError(e).boxed())
+    }
+
+    /// The journal taken from an index written to its files in `path`, synced, and removed (hnswlib::persist_journal_bytes):
+    /// a cut anywhere leaves the index of the save before or of this one. One save at a time, and no load meanwhile.
+    pub fn persist_journal_bytes(path: &Path, journal: &[u8]) -> Result<(), Box<dyn ChromaError>> {
+        hnswlib::persist_journal_bytes(path, journal)
+            .map_err(|e| WrappedHnswInitError::Other(e).boxed())
+    }
+
     /// The journal of a save alone, the files untouched: for tests of a save cut after its journal.
     pub fn write_persist_journal(&self) -> Result<(), Box<dyn ChromaError>> {
         self.index

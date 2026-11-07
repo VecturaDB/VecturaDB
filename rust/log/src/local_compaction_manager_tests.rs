@@ -106,6 +106,7 @@ impl Fixture {
             function_runs: Default::default(),
             sync_retries: Default::default(),
             function_storage: None,
+            purge_after_save: None,
         });
         Self {
             db,
@@ -181,6 +182,13 @@ impl Fixture {
     fn break_collection_configuration(&mut self) {
         self.collection.dimension = Some(4);
         self.sysdb.add_collection(self.collection.clone());
+    }
+
+    // Waits for the save in the background of the vector index, if any: the tests check its files and its position
+    // in SQLite after it.
+    async fn saved(&self) {
+        let folder = self.path.path().join(self.vector.to_string());
+        drop(chroma_segment::local_hnsw::files_lock(&folder).lock().await);
     }
 
     async fn records(&mut self) -> Vec<LogRecord> {
@@ -261,6 +269,7 @@ impl Fixture {
             function_runs: Default::default(),
             sync_retries: Default::default(),
             function_storage: None,
+            purge_after_save: None,
         });
         background
     }
@@ -595,6 +604,7 @@ async fn a_purge_of_the_timer_holds_until_a_backfill() {
         .await
         .unwrap()
         .unwrap();
+    f.saved().await;
     let after_backfill: Vec<_> = original.into_iter().filter(|r| r.log_offset >= 5).collect();
     for _ in 0..100 {
         f.purge().await.unwrap();
@@ -663,6 +673,7 @@ async fn backfill_makes_the_next_purge_check_again() {
         .await
         .unwrap()
         .unwrap();
+    f.saved().await;
     f.purge().await.unwrap();
     assert_records(
         f.records().await,
@@ -828,6 +839,7 @@ async fn cached_index_does_not_hide_corruption_from_purge() {
         .await
         .unwrap()
         .unwrap();
+    f.saved().await;
     let header = f.path.path().join(f.vector.to_string()).join("header.bin");
     let saved = std::fs::read(&header).unwrap();
     std::fs::write(&header, b"bad").unwrap();
@@ -842,6 +854,7 @@ async fn cached_index_does_not_hide_corruption_from_purge() {
         .await
         .unwrap()
         .unwrap();
+    f.saved().await;
     assert!(matches!(
         f.purge().await,
         Err(CompactionManagerError::UnsafeHnswCheckpoint(_))
@@ -916,6 +929,7 @@ async fn retained_logs_allow_full_vector_rebuild_after_checkpoint_loss() {
         .await
         .unwrap()
         .unwrap();
+    f.saved().await;
     let folder = f.path.path().join(f.vector.to_string());
     std::fs::write(folder.join("header.bin"), b"bad").unwrap();
     assert!(matches!(
@@ -945,6 +959,7 @@ async fn retained_logs_allow_full_vector_rebuild_after_checkpoint_loss() {
         .await
         .unwrap()
         .unwrap();
+    f.saved().await;
     let watermarks = SqliteMetadataReader::new(f.db.clone());
     assert_eq!(
         (
@@ -1316,6 +1331,7 @@ async fn uncheckpointed_vectors_keep_all_logs_for_replay() {
         .await
         .unwrap()
         .unwrap();
+    f.saved().await;
     // The batch is below HNSW's persistence threshold: metadata has advanced,
     // but the vector checkpoint must still be absent.
     let reader = SqliteMetadataReader::new(f.db.clone());
@@ -1387,10 +1403,10 @@ async fn vector_checkpoint_sqlite_failure_preserves_replay_logs() {
         )
         .await
         .unwrap();
-    assert!(
-        matches!(result, Err(CompactionManagerError::HnswApplyLogsError)),
-        "{result:?}"
-    );
+    // The save in the background fails to publish its position: the backfill does not wait for it, and its error
+    // goes to the log of the server.
+    result.unwrap();
+    f.saved().await;
     let reader = SqliteMetadataReader::new(f.db.clone());
     assert_eq!(
         (
@@ -1416,9 +1432,74 @@ async fn vector_checkpoint_sqlite_failure_preserves_replay_logs() {
         .await
         .unwrap()
         .unwrap();
+    f.saved().await;
     assert_eq!(reader.current_max_seq_id(&f.vector).await.unwrap(), 5);
     f.purge().await.unwrap();
     assert_eq!(f.records().await.len(), 1);
+    f.stop().await;
+}
+
+// A purge asked while a save in the background writes the files of the index: it does not wait for the save, which would
+// hold the compactor and every write with it, and it removes nothing, as the files cannot be inspected then; once the
+// save ends, the purge comes again on its own and removes the records the save covers. Were the inspection to wait, the
+// purge would end only after the save; were the purge not to come again, the records would stay until the next write.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_purge_during_a_save_removes_nothing_and_comes_again_after_it() {
+    let mut f = Fixture::new().await;
+    if let chroma_types::VectorIndexConfiguration::Hnsw(config) =
+        &mut f.collection.config.vector_index
+    {
+        config.sync_threshold = 2;
+    } else {
+        panic!("expected HNSW configuration");
+    }
+    f.collection.schema = Some(Schema::try_from(&f.collection.config).unwrap());
+    f.sysdb.add_collection(f.collection.clone());
+    let original = f.seed().await;
+    // The index of the compactor, with its saves held before they write the files until the test lets them go on.
+    let segments = SysDb::Test(f.sysdb.clone())
+        .get_collection_with_segments(None, f.collection.collection_id)
+        .await
+        .unwrap();
+    let writer = f
+        .manager
+        .get_hnsw_writer(&f.collection, &segments.vector_segment, 3)
+        .await
+        .unwrap();
+    let (started_tx, mut started) = tokio::sync::mpsc::unbounded_channel();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    writer
+        .index
+        .set_save_hook(Some(std::sync::Arc::new(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+            Ok::<(), String>(())
+        })))
+        .await;
+    f.handle
+        .request(
+            BackfillMessage {
+                collection_id: f.collection.collection_id,
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), started.recv())
+        .await
+        .expect("a save started")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), f.purge())
+        .await
+        .expect("the purge waits for no save")
+        .unwrap();
+    assert_records(f.records().await, original.clone());
+    release.send(()).unwrap();
+    f.wait_for_records(original.into_iter().filter(|r| r.log_offset >= 5).collect())
+        .await;
+    drop(writer);
     f.stop().await;
 }
 
@@ -1448,6 +1529,7 @@ async fn valid_checkpoint_recovers_retained_tail_after_configuration_is_repaired
         .await
         .unwrap()
         .unwrap();
+    f.saved().await;
     let reader = SqliteMetadataReader::new(f.db.clone());
     assert_eq!(
         (
@@ -1501,6 +1583,7 @@ async fn valid_checkpoint_recovers_retained_tail_after_configuration_is_repaired
         .await
         .unwrap()
         .unwrap();
+    f.saved().await;
     assert_eq!(
         (
             reader.current_max_seq_id(&f.metadata).await.unwrap(),
@@ -1666,11 +1749,11 @@ async fn recovered_short_tail_checkpoints_before_purge_and_retries_publication()
             )
             .await
             .unwrap();
+        // The save in the background, which fails to publish its position when fail_publication: the backfill does not
+        // wait for it, and its error goes to the log of the server.
+        replay.unwrap();
+        f.saved().await;
         if fail_publication {
-            assert!(matches!(
-                replay,
-                Err(CompactionManagerError::HnswApplyLogsError)
-            ));
             assert_eq!(
                 SqliteMetadataReader::new(f.db.clone())
                     .current_max_seq_id(&f.vector)
@@ -1694,8 +1777,7 @@ async fn recovered_short_tail_checkpoints_before_purge_and_retries_publication()
                 .await
                 .unwrap()
                 .unwrap();
-        } else {
-            replay.unwrap();
+            f.saved().await;
         }
         assert_eq!(
             SqliteMetadataReader::new(f.db.clone())
@@ -1816,6 +1898,7 @@ async fn replaced_spann_versions_are_forgotten_after_the_grace() {
         function_runs: Default::default(),
         sync_retries: Default::default(),
         function_storage: None,
+        purge_after_save: None,
     };
     let collection = Collection::test_collection(3);
     for _ in 0..100 {

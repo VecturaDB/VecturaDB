@@ -33,6 +33,29 @@ pub fn is_checkpoint_changed(err: &io::Error) -> bool {
         .is_some_and(|inner| inner.is::<CheckpointChanged>())
 }
 
+/// A save in the background writes the files of the checkpoint: they cannot be inspected now. The purge that asked waits
+/// for a later one, instead of holding the compactor, and with it the writes, until the save ends.
+#[derive(Debug)]
+pub struct SaveInFlight;
+
+impl std::fmt::Display for SaveInFlight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a save writes the checkpoint")
+    }
+}
+
+impl std::error::Error for SaveInFlight {}
+
+pub(crate) fn save_in_flight() -> io::Error {
+    io::Error::other(SaveInFlight)
+}
+
+/// Whether a validation was not made because a save in the background writes the files of the checkpoint.
+pub fn is_save_in_flight(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|inner| inner.is::<SaveInFlight>())
+}
+
 /// Test hook: the checkpoint folder whose id map gets a new modification time between the inspection and the second
 /// read of the fingerprint, as a file system that reports attributes late.
 #[cfg(feature = "test-hooks")]
