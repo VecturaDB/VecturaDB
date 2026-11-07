@@ -9981,6 +9981,138 @@ mod tests {
         assert_eq!(count_records(&mut frontend, &new).await, 2);
     }
 
+    // The records of a collection, added a thousand at a time, with embeddings of two dimensions.
+    async fn add_records(
+        frontend: &mut ServiceBasedFrontend,
+        collection: CollectionUuid,
+        n: usize,
+    ) {
+        for start in (0..n).step_by(1000) {
+            let ids: Vec<usize> = (start..n.min(start + 1000)).collect();
+            frontend
+                .add(
+                    AddCollectionRecordsRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection,
+                        ids.iter().map(|i| format!("r{i}")).collect(),
+                        ids.iter()
+                            .map(|i| vec![*i as f32, (*i as f32).sin()])
+                            .collect(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    // The collection of that name as a user reads it, by its name.
+    async fn collection_named(
+        frontend: &mut ServiceBasedFrontend,
+        name: &str,
+    ) -> Option<Collection> {
+        frontend
+            .sysdb_client
+            .get_collections(GetCollectionsOptions {
+                name: Some(name.to_string()),
+                tenant: Some(TENANT.to_string()),
+                database_or_topology: Some(DatabaseOrTopology::Database(
+                    DatabaseName::new(DATABASE).unwrap(),
+                )),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .pop()
+    }
+
+    fn fork_request(source: CollectionUuid, name: &str) -> ForkCollectionRequest {
+        ForkCollectionRequest::try_new(
+            TENANT.to_string(),
+            DATABASE.to_string(),
+            source,
+            name.to_string(),
+        )
+        .unwrap()
+    }
+
+    // A fork stopped halfway, as by a kill of the server: the database closes under the copy once the catalog has the
+    // target. After the restart the fork is not there, and the same fork can be done again, whole.
+    #[tokio::test]
+    async fn a_fork_stopped_halfway_is_not_there_after_the_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        let mut frontend = ServiceBasedFrontend::try_from_config(
+            &(persistent_config(root.path(), false), System::new()),
+            &registry,
+        )
+        .await
+        .unwrap();
+        let source = create_collection_for(&mut frontend, TENANT, DATABASE, "fork_source").await;
+        add_records(&mut frontend, source.collection_id, 5000).await;
+        let mut forking = frontend.clone();
+        let source_id = source.collection_id;
+        let fork = tokio::spawn(async move {
+            forking
+                .fork_collection(fork_request(source_id, "halfway"))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !catalog_has(&root.path().join("chroma.sqlite3"), "halfway") {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the fork wrote no target in the catalog");
+        close_the_database(&registry).await;
+        assert!(
+            !fork.is_finished() || fork.await.unwrap().is_err(),
+            "the fork ended before the stop: the test needs a longer copy"
+        );
+        drop(frontend);
+
+        let mut frontend = persistent_frontend(root.path()).await;
+        assert!(collection_named(&mut frontend, "halfway").await.is_none());
+        let fork = frontend
+            .fork_collection(fork_request(source.collection_id, "halfway"))
+            .await
+            .unwrap();
+        assert_eq!(count_records(&mut frontend, &fork).await, 5000);
+    }
+
+    // A fork whose client goes away during the copy, as one that times out: the copy goes on, and the fork, once a user
+    // sees it, has every record of the source.
+    #[tokio::test]
+    async fn a_fork_whose_client_goes_away_has_every_record_afterwards() {
+        let mut frontend = sqlite_frontend().await;
+        let source = create_collection_for(&mut frontend, TENANT, DATABASE, "fork_source").await;
+        add_records(&mut frontend, source.collection_id, 5000).await;
+        let given_up = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            frontend.fork_collection(fork_request(source.collection_id, "given_up")),
+        )
+        .await;
+        assert!(
+            given_up.is_err(),
+            "the fork answered before the client went away: the test needs a longer copy"
+        );
+        let forked = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                if let Some(forked) = collection_named(&mut frontend, "given_up").await {
+                    return forked;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the fork never showed");
+        assert_eq!(count_records(&mut frontend, &forked).await, 5000);
+    }
+
     async fn create_collection_for(
         frontend: &mut ServiceBasedFrontend,
         tenant: &str,
