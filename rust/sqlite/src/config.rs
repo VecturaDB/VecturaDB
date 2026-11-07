@@ -119,9 +119,13 @@ async fn sync_existing(path: &Path) -> std::io::Result<()> {
         files.push(name.into());
     }
     for file in files {
-        match tokio::fs::File::open(&file).await {
+        match open_to_sync(&file).await {
             Ok(f) => f.sync_all().await?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            // A file that the process cannot write, as one restored read-only: Windows cannot sync it, and SQLite only
+            // reads it. Chroma 1.5.9, which synced nothing, opened it.
+            #[cfg(windows)]
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {}
             Err(err) => return Err(err),
         }
     }
@@ -130,6 +134,18 @@ async fn sync_existing(path: &Path) -> std::io::Result<()> {
         tokio::fs::File::open(parent).await?.sync_all().await?;
     }
     Ok(())
+}
+
+// A file opened to be synced. On Windows the sync is FlushFileBuffers, which needs a handle that can write: with one
+// opened to read it fails with "Access is denied" (os error 5). Elsewhere fsync syncs a file opened to read.
+#[cfg(windows)]
+async fn open_to_sync(file: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new().write(true).open(file).await
+}
+
+#[cfg(not(windows))]
+async fn open_to_sync(file: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::File::open(file).await
 }
 
 #[async_trait]
