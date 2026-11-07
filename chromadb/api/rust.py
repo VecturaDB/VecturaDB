@@ -868,6 +868,11 @@ class RustBindingsAPI(ServerAPI):
             record_count=result.record_count,
         )
 
+    def _wait_for_hnsw_save(self, collection_id: UUID) -> None:
+        """For tests that read the files of an index or the log right after a write: the save of the index that the
+        write started in the background, then the purge of the log that comes after it."""
+        self.bindings._wait_for_hnsw_save(str(collection_id))
+
     @override
     def reset(self) -> bool:
         return self.bindings.reset()

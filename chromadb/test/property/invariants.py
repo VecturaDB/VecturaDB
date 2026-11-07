@@ -20,7 +20,7 @@ from typing import Callable, Optional, Tuple, Union, List, TypeVar, cast, Any, D
 from typing_extensions import Literal
 import numpy as np
 import numpy.typing as npt
-from chromadb.api import types, ClientAPI
+from chromadb.api import types, ClientAPI, ServerAPI
 from chromadb.api.models.Collection import Collection
 from hypothesis import note
 from hypothesis.errors import InvalidArgument
@@ -477,6 +477,12 @@ def log_size_below_max(
         return
 
     if has_collection_mutated:
+        # A write returns before the save of the index that it started in the background, and before the purge of the
+        # log that comes after that save (VecturaDB): the log is read once both are done.
+        wait = getattr(system.instance(ServerAPI), "_wait_for_hnsw_save", None)
+        if wait is not None:
+            for collection in collections:
+                wait(collection.id)
         # Must always keep one entry to avoid reusing seq_ids
         assert _total_embedding_queue_log_size(sqlite) >= 1
 

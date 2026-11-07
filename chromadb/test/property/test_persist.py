@@ -80,6 +80,21 @@ def clear_shared_system_cache() -> Generator[None, None, None]:
     SharedSystemClient.clear_system_cache()
 
 
+def saving_at_every_threshold(settings: Settings) -> Settings:
+    """The settings with a save of the index at every hnsw:sync_threshold, as Chroma 1.5.9 makes them, for the tests
+    that count those saves or the log they leave: after its first save, VecturaDB saves an index at most every
+    chroma_hnsw_min_save_interval_seconds, 30 by default."""
+    return settings.model_copy(update={"chroma_hnsw_min_save_interval_seconds": 0})
+
+
+def wait_for_hnsw_save(system: System, collection_id: UUID) -> None:
+    """A write returns before the save of the index that it started in the background, and before the purge of the
+    log that comes after that save: wait for both before reading the files or the log (Rust bindings only)."""
+    wait = getattr(system.instance(ServerAPI), "_wait_for_hnsw_save", None)
+    if wait is not None:
+        wait(collection_id)
+
+
 collection_st = st.shared(
     strategies.collections(
         with_hnsw_params=True,
@@ -182,7 +197,7 @@ def test_persist(
 
 
 def test_sync_threshold(settings: Settings) -> None:
-    system = System(settings)
+    system = System(saving_at_every_threshold(settings))
     system.start()
     client = ClientCreator.from_system(system)
 
@@ -194,6 +209,7 @@ def test_sync_threshold(settings: Settings) -> None:
     segment = manager.get_segment(collection.id, VectorReader)
 
     def get_index_last_modified_at() -> float:
+        wait_for_hnsw_save(system, collection.id)
         # Time resolution on Windows can be up to 10ms
         time.sleep(0.1)
         try:
@@ -352,6 +368,7 @@ def test_persist_embeddings_state(
     caplog: pytest.LogCaptureFixture, settings: Settings
 ) -> None:
     caplog.set_level(logging.ERROR)
+    settings = saving_at_every_threshold(settings)
     client = chromadb.Client(settings)
     run_state_machine_as_test(
         lambda: PersistEmbeddingsStateMachine(settings=settings, client=client),
@@ -465,6 +482,7 @@ def test_batch_size_less_than_sync_with_duplicate_adds_results_in_skipped_seq_id
     # NOTE(hammadb) this test was autogenerate by hypothesis and added here to ensure that the test is run
     # in the future. It tests a case where the max seq id was incorrect in response to the same
     # id being added multiple times in a bathc.
+    settings = saving_at_every_threshold(settings)
     client = chromadb.Client(settings)
     state = PersistEmbeddingsStateMachine(settings=settings, client=client)
     state.initialize(
