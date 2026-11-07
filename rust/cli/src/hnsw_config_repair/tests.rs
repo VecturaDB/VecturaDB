@@ -3,6 +3,7 @@ use super::*;
 use chroma_config::{registry::Registry, Configurable};
 use chroma_frontend::{impls::service_based_frontend::ServiceBasedFrontend, FrontendConfig};
 use chroma_log::LocalCompactionManager;
+use chroma_segment::local_segment_manager::LocalSegmentManager;
 use chroma_sqlite::db::SqliteDb;
 use chroma_system::{ComponentHandle, System};
 use chroma_types::*;
@@ -115,6 +116,13 @@ async fn stale_checkpoint_cannot_be_published_by_configuration_repair() {
             .fetch_one(db.get_conn())
             .await
             .unwrap();
+    // The save at the threshold writes the files and publishes its position in the background: the position moved
+    // below is the one of that save.
+    registry
+        .get::<LocalSegmentManager>()
+        .unwrap()
+        .wait_for_hnsw_save(segment.parse().unwrap())
+        .await;
     sqlx::query("UPDATE max_seq_id SET seq_id = seq_id + 10 WHERE segment_id = ?")
         .bind(&segment)
         .execute(db.get_conn())
@@ -197,6 +205,26 @@ async fn repairs_legacy_construction_settings_and_preserves_records_and_logs() {
                 .fetch_one(db.get_conn())
                 .await
                 .unwrap();
+        // The save at the threshold writes the files and publishes its position in the background, and the purge of the
+        // log asked during it comes after it: the records and the positions read below, which the repair must keep, are
+        // those after both, as a write left them when it saved and purged before it returned.
+        registry
+            .get::<LocalSegmentManager>()
+            .unwrap()
+            .wait_for_hnsw_save(segment.parse().unwrap())
+            .await;
+        registry
+            .get::<ComponentHandle<LocalCompactionManager>>()
+            .unwrap()
+            .request(
+                chroma_log::PurgeLogsMessage {
+                    collection_id: collection.collection_id,
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
         let before_logs: Vec<i64> =
             sqlx::query_scalar("SELECT seq_id FROM embeddings_queue ORDER BY seq_id")
                 .fetch_all(db.get_conn())
