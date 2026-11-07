@@ -516,6 +516,37 @@ impl SysDb {
         }
     }
 
+    /// The target of a fork of the single node, whose copy has ended, shown to the users. Distributed Chroma forks in one
+    /// go, with nothing to show at the end.
+    pub async fn finish_fork(
+        &mut self,
+        target_collection_id: CollectionUuid,
+    ) -> Result<(), Box<dyn ChromaError>> {
+        match self {
+            SysDb::Sqlite(sqlite) => sqlite.finish_fork(target_collection_id).await,
+            SysDb::Grpc(_) | SysDb::Test(_) => Ok(()),
+        }
+    }
+
+    /// The targets of the forks of the single node still copying, which a stop left halfway when read at the start.
+    pub async fn unfinished_forks(&mut self) -> Result<Vec<CollectionUuid>, Box<dyn ChromaError>> {
+        match self {
+            SysDb::Sqlite(sqlite) => sqlite.unfinished_forks().await,
+            SysDb::Grpc(_) | SysDb::Test(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// The row of the lineage of a fork of the single node that never happened.
+    pub async fn forget_fork(
+        &mut self,
+        target_collection_id: CollectionUuid,
+    ) -> Result<(), Box<dyn ChromaError>> {
+        match self {
+            SysDb::Sqlite(sqlite) => sqlite.forget_fork(target_collection_id).await,
+            SysDb::Grpc(_) | SysDb::Test(_) => Ok(()),
+        }
+    }
+
     pub async fn count_forks(
         &mut self,
         source_collection_id: CollectionUuid,

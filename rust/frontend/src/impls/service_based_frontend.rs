@@ -1862,7 +1862,9 @@ impl ServiceBasedFrontend {
     /// collection, and its log holds only the writes not yet applied. So the sysdb copies the collection and its
     /// segments without their files, then the records of the source are written again into the copy through the local
     /// write path, in storage order. If the copy fails, the new collection is
-    /// removed and the fork fails as a whole.
+    /// removed and the fork fails as a whole. The copy runs in a task of its own, so that a client that goes away, which
+    /// drops this request, does not stop it; until it ends, the reads of the users do not show the new collection, which
+    /// they see whole or not at all, as a fork of distributed Chroma (sysdb migration 00019).
     async fn fork_local(
         &mut self,
         tenant_id: &str,
@@ -1890,43 +1892,114 @@ impl ServiceBasedFrontend {
                 target_collection_name,
             )
             .await?;
-        if let Err(err) = self
-            .copy_records_for_fork(
-                tenant_id,
-                database_name.clone(),
-                source,
-                target_collection_id,
-                cmek,
-            )
-            .await
-        {
-            let segments = [
-                target.metadata_segment.clone(),
-                target.record_segment.clone(),
-                target.vector_segment.clone(),
-            ];
-            if let Err(cleanup) = self
-                .sysdb_client
-                .delete_collection(
-                    tenant_id.to_string(),
-                    database_name,
+        let mut copier = self.clone();
+        let tenant_id = tenant_id.to_string();
+        let copied = target.clone();
+        let copy = tokio::spawn(async move {
+            match copier
+                .copy_records_for_fork(
+                    &tenant_id,
+                    database_name.clone(),
+                    source,
                     target_collection_id,
-                    segments.iter().map(|segment| segment.id).collect(),
+                    cmek,
                 )
                 .await
             {
+                Ok(()) => copier
+                    .sysdb_client
+                    .finish_fork(target_collection_id)
+                    .await
+                    .map_err(ForkCollectionError::Internal),
+                Err(err) => {
+                    copier
+                        .remove_incomplete_fork(&tenant_id, database_name, &copied)
+                        .await;
+                    Err(err)
+                }
+            }
+        });
+        match copy.await {
+            Ok(copied) => copied.map(|()| target),
+            Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+            Err(err) => Err(ForkCollectionError::Internal(Box::new(
+                std::io::Error::other(err),
+            ))),
+        }
+    }
+
+    // The target of a fork that never happened, as one whose copy failed or that a stop left halfway: removed with the
+    // normal deletion, then its row of the lineage, so that the fork does not count among the forks of its lineage. A
+    // target whose deletion fails stays hidden from the users, for the next start.
+    async fn remove_incomplete_fork(
+        &mut self,
+        tenant_id: &str,
+        database_name: DatabaseName,
+        target: &CollectionAndSegments,
+    ) {
+        let target_collection_id = target.collection.collection_id;
+        let segments = [
+            target.metadata_segment.clone(),
+            target.record_segment.clone(),
+            target.vector_segment.clone(),
+        ];
+        match self
+            .sysdb_client
+            .delete_collection(
+                tenant_id.to_string(),
+                database_name,
+                target_collection_id,
+                segments.iter().map(|segment| segment.id).collect(),
+            )
+            .await
+        {
+            Ok(()) => {
+                if let Err(cleanup) = self.sysdb_client.forget_fork(target_collection_id).await {
+                    tracing::warn!(error = %cleanup, "the lineage row of an incomplete fork stays");
+                }
+            }
+            Err(cleanup) => {
                 tracing::error!(error = %cleanup, "Failed to remove an incomplete fork");
             }
-            self.collections_with_segments_provider
-                .collections_with_segments_cache
-                .remove(&target_collection_id)
-                .await;
-            if let Err(cleanup) = self.executor.delete_segments(&segments).await {
-                tracing::warn!(error = %cleanup, "incomplete fork removed; index cleanup will retry");
-            }
-            return Err(err);
         }
-        Ok(target)
+        self.collections_with_segments_provider
+            .collections_with_segments_cache
+            .remove(&target_collection_id)
+            .await;
+        if let Err(cleanup) = self.executor.delete_segments(&segments).await {
+            tracing::warn!(error = %cleanup, "incomplete fork removed; index cleanup will retry");
+        }
+    }
+
+    /// The targets of the forks that a stop left halfway, which no user saw: removed at the start, as a fork that failed
+    /// (sysdb migration 00019).
+    pub(crate) async fn remove_unfinished_forks(&mut self) -> Result<(), Box<dyn ChromaError>> {
+        for target_collection_id in self.sysdb_client.unfinished_forks().await? {
+            match self
+                .sysdb_client
+                .get_collection_with_segments(None, target_collection_id)
+                .await
+            {
+                Ok(target) => {
+                    let tenant_id = target.collection.tenant.clone();
+                    let database_name = DatabaseName::new(target.collection.database.clone())
+                        .ok_or_else(|| -> Box<dyn ChromaError> {
+                            Box::new(GetCollectionWithSegmentsError::NotFound(
+                                target_collection_id.to_string(),
+                            ))
+                        })?;
+                    self.remove_incomplete_fork(&tenant_id, database_name, &target)
+                        .await;
+                }
+                // A stop between the deletion of the target and the one of its row of the lineage.
+                Err(GetCollectionWithSegmentsError::NotFound(_)) => {
+                    self.sysdb_client.forget_fork(target_collection_id).await?
+                }
+                Err(err) => return Err(err.boxed()),
+            }
+            tracing::warn!(collection_id = %target_collection_id, "A fork that a stop left halfway is removed");
+        }
+        Ok(())
     }
 
     async fn copy_records_for_fork(
@@ -4041,7 +4114,7 @@ impl Configurable<(FrontendConfig, System)> for ServiceBasedFrontend {
         let executor =
             Executor::try_from_config(&(config.executor.clone(), system.clone()), registry).await?;
 
-        Ok(ServiceBasedFrontend::new(
+        let mut frontend = ServiceBasedFrontend::new(
             config.allow_reset,
             sysdb,
             collections_with_segments_provider,
@@ -4057,7 +4130,11 @@ impl Configurable<(FrontendConfig, System)> for ServiceBasedFrontend {
             config.tenants_with_transactions_enabled.clone(),
             config.enable_log_scouting,
             config.enable_transactions,
-        ))
+        );
+        if let Err(err) = frontend.remove_unfinished_forks().await {
+            tracing::warn!(error = %err, "the forks that a stop left halfway could not be removed; they stay hidden");
+        }
+        Ok(frontend)
     }
 }
 
