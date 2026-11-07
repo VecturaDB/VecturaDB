@@ -1543,7 +1543,9 @@ async fn persist(
                 .save_with_journal_file(METADATA_FILE, &id_map)
                 .map_err(|_| LocalHnswSegmentWriterError::HnswIndexPersistError)?;
         }
-        // No sync of the folder: a save syncs nothing, as in Chroma 1.5.9 (the fork of hnswlib, persistDirtyWithJournal).
+        // The save syncs its journal, the folder of the index and the folder above it, then the four files and the ID map,
+        // and only then removes the journal (persistDirtyWithJournal of the fork of hnswlib): a power cut or a snapshot of
+        // the disk finds the index of this save or of the one before. Chroma 1.5.9 synced nothing.
         if verified {
             guard.verified_checkpoint = Some(VerifiedCheckpoint {
                 fingerprint: CheckpointFingerprint::read(Path::new(path))?,
