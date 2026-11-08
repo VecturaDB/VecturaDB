@@ -5,6 +5,7 @@ use std::{path::Path, sync::Arc};
 pub mod config;
 #[allow(dead_code)]
 pub mod executor;
+pub mod folder_lock;
 pub mod get_collection_with_segments_provider;
 pub mod impls;
 pub mod quota;
@@ -60,6 +61,25 @@ pub async fn frontend_service_entrypoint(
     frontend_service_entrypoint_with_config(auth, quota_enforcer, &config, init_otel_tracing).await;
 }
 
+// The lock of the data folder of a server of the single node, or the end of the process with its message: a server on
+// a folder that another program holds, a server or an embedded client, waits folder_lock::FOLDER_WAIT, then stops
+// here, before it opens the database.
+async fn hold_folder_for_server(folder: std::path::PathBuf) -> folder_lock::FolderLock {
+    let held = tokio::task::spawn_blocking(move || {
+        folder_lock::lock_folder(&folder, folder_lock::FOLDER_WAIT)
+    })
+    .await
+    .expect("the wait for the lock of the data folder");
+    match held {
+        Ok(lock) => lock,
+        Err(err) => {
+            tracing::error!(error = %err, "The data folder is in use");
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    }
+}
+
 pub async fn frontend_service_entrypoint_with_config_system_registry(
     auth: Arc<dyn auth::AuthenticateAndAuthorize>,
     quota_enforcer: Arc<dyn QuotaEnforcer>,
@@ -68,6 +88,8 @@ pub async fn frontend_service_entrypoint_with_config_system_registry(
     config: &FrontendServerConfig,
 ) {
     let mut fe_cfg = config.frontend.clone();
+    // The lock of the data folder, held until the server has stopped and closed its database (folder_lock).
+    let mut _held_folder = None;
     if let (Some(sql_cfg), Some(local_segman_cfg)) =
         (fe_cfg.sqlitedb.as_mut(), fe_cfg.segment_manager.as_mut())
     {
@@ -79,6 +101,9 @@ pub async fn frontend_service_entrypoint_with_config_system_registry(
                 .expect("Persist path should be valid")
                 .to_string(),
         );
+        if let Some(folder) = &local_segman_cfg.persist_path {
+            _held_folder = Some(hold_folder_for_server(folder.into()).await);
+        }
         sql_cfg.url.get_or_insert(
             sqlite_url
                 .to_str()

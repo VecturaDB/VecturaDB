@@ -1,7 +1,10 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 import logging
 import multiprocessing
 from multiprocessing.connection import Connection
 import multiprocessing.context
+import shutil
+import sqlite3
 import time
 from typing import Generator, Callable, List, Tuple, cast
 from uuid import UUID
@@ -239,6 +242,29 @@ def test_sync_threshold(settings: Settings) -> None:
     assert get_index_last_modified_at() > last_modified_at
     last_modified_at = get_index_last_modified_at()
 
+    # The next test opens the same folder: one program at a time uses it.
+    system.stop()
+
+
+def copy_of_the_folder(folder: str) -> str:
+    """A copy of a data folder that another process holds, as its disk has it now: on VecturaDB one program at a time
+    uses a data folder. The database through the backup of SQLite, a snapshot under its locks; the folders of the
+    segments as they are, which a write changes before it returns; not the lock of the folder."""
+    copy = tempfile.mkdtemp()
+    for entry in os.listdir(folder):
+        source = os.path.join(folder, entry)
+        if os.path.isdir(source):
+            shutil.copytree(source, os.path.join(copy, entry))
+        elif entry == "chroma.sqlite3":
+            database = sqlite3.connect(source, timeout=30)
+            backup = sqlite3.connect(os.path.join(copy, entry))
+            database.backup(backup)
+            backup.close()
+            database.close()
+        elif not entry.startswith("chroma.sqlite3-") and entry != "vecturadb.lock":
+            shutil.copy2(source, os.path.join(copy, entry))
+    return copy
+
 
 def load_and_check(
     settings: Settings,
@@ -247,7 +273,9 @@ def load_and_check(
     conn: Connection,
 ) -> None:
     try:
-        system = System(settings)
+        # The process that wrote the records still holds the folder: this one reads a copy of it.
+        folder = copy_of_the_folder(settings.persist_directory)
+        system = System(settings.model_copy(update={"persist_directory": folder}))
         system.start()
         client = ClientCreator.from_system(system)
 
@@ -262,6 +290,7 @@ def load_and_check(
         invariants.ann_accuracy(coll, record_set)
 
         system.stop()
+        shutil.rmtree(folder, ignore_errors=True)
     except Exception as e:
         conn.send(e)
         raise e
@@ -356,6 +385,7 @@ def test_persist_embeddings_state(
     run_state_machine_as_test(
         lambda: PersistEmbeddingsStateMachine(settings=settings, client=client),
     )  # type: ignore
+    client.close()
 
 
 def test_delete_less_than_k(
@@ -405,6 +435,7 @@ def test_delete_less_than_k(
     state.delete_by_ids(ids=[embedding_ids_2])
     state.ann_accuracy()
     state.teardown()
+    client.close()
 
 
 # Ideally this scenario would be exercised by Hypothesis, but most runs don't seem to trigger this particular state.
@@ -457,6 +488,7 @@ def test_delete_add_after_persist(settings: Settings) -> None:
 
     # At this point, the changes above are not fully persisted
     state.fields_match()
+    client.close()
 
 
 def test_batch_size_less_than_sync_with_duplicate_adds_results_in_skipped_seq_ids(
@@ -733,3 +765,4 @@ def test_batch_size_less_than_sync_with_duplicate_adds_results_in_skipped_seq_id
     state.fields_match()
     state.log_size_below_max()
     state.teardown()
+    client.close()

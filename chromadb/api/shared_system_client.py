@@ -34,10 +34,16 @@ class SharedSystemClient:
             new_system = System(settings)
             cls._identifier_to_system[identifier] = new_system
 
-            new_system.instance(ProductTelemetryClient)
-            new_system.instance(ServerAPI)
+            try:
+                new_system.instance(ProductTelemetryClient)
+                new_system.instance(ServerAPI)
 
-            new_system.start()
+                new_system.start()
+            except BaseException:
+                # A system that did not start is not kept: the next client with these settings starts a new one,
+                # for example once another program has let go of the data folder.
+                cls._identifier_to_system.pop(identifier, None)
+                raise
         else:
             previous_system = cls._identifier_to_system[identifier]
 
