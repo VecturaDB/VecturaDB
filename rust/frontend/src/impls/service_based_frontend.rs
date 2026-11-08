@@ -6392,6 +6392,149 @@ mod tests {
         assert_eq!(failures().await, 5);
     }
 
+    // The records of the log of a collection.
+    async fn log_rows_of(db: &sqlx::SqlitePool, collection: &Collection) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM embeddings_queue WHERE topic LIKE '%' || $1")
+            .bind(collection.collection_id.to_string())
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
+    // An attach that did not finish leaves its row with no output collection, at the completion offset 0, as in
+    // the_windows_queued_before_a_dead_letter_do_not_run_the_function, and that offset keeps the log of its input whole.
+    // After an hour it goes, as CleanupExpiredPartialAttachedFunctions of distributed Chroma removes it: here at the start
+    // of the server. The log of its input is purged and its name is free; one left for a minute stays, and so does a
+    // function that is ready.
+    #[tokio::test]
+    async fn an_attach_left_half_way_for_an_hour_goes_and_the_log_of_its_input_is_purged() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = persistent_frontend_with(root.path(), true).await;
+        let old = create_collection_for(&mut frontend, TENANT, DATABASE, "held_for_hours").await;
+        let young =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "held_for_a_minute").await;
+        let free =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "free_of_functions").await;
+        let ready = create_collection_for(&mut frontend, TENANT, DATABASE, "ready_and_old").await;
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        for (collection, output, is_ready, age) in [
+            (&old, None, false, "-2 hours"),
+            (&young, None, false, "-1 minutes"),
+            (
+                &ready,
+                Some("11111111-1111-1111-1111-111111111111"),
+                true,
+                "-2 hours",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO attached_functions (id, name, tenant_id, database_id, input_collection_id, \
+                 output_collection_name, output_collection_id, function_id, function_params, is_ready, updated_at) \
+                 SELECT $1, 'unfinished_counter', databases.tenant_id, collections.database_id, collections.id, \
+                 'unfinished_counts', $2, functions.id, '{}', $3, datetime('now', $4) FROM collections \
+                 JOIN databases ON databases.id = collections.database_id \
+                 JOIN functions ON functions.name = 'record_counter' WHERE collections.id = $5",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(output)
+            .bind(is_ready)
+            .bind(age)
+            .bind(collection.collection_id.to_string())
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        // 1500 records in one write each: past the threshold of 1000, so that the index saves and the log may go.
+        for collection in [&old, &young, &free] {
+            frontend
+                .add(
+                    AddCollectionRecordsRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection.collection_id,
+                        (0..1500).map(|id| format!("r{id}")).collect(),
+                        vec![vec![1.0, 2.0]; 1500],
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        // The purges may come after the write: a limit of 30 s each.
+        let mut free_rows = log_rows_of(&db, &free).await;
+        for _ in 0..300 {
+            if free_rows < 1500 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            free_rows = log_rows_of(&db, &free).await;
+        }
+        assert!(
+            free_rows < 1500,
+            "the log of a collection with no function is purged: {free_rows} rows"
+        );
+
+        // The start of the server cleans up. The manager of the first start may have done it already: that round has
+        // no order with the writes above.
+        let mut reopened = persistent_frontend_with(root.path(), true).await;
+        let mut old_rows = log_rows_of(&db, &old).await;
+        for _ in 0..300 {
+            if old_rows <= free_rows {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            old_rows = log_rows_of(&db, &old).await;
+        }
+        assert!(
+            old_rows <= free_rows,
+            "the log of its input is purged: {old_rows} rows against {free_rows}"
+        );
+        let row_of = |collection: &Collection| {
+            sqlx::query_as::<_, (String, bool)>(
+                "SELECT name, is_deleted FROM attached_functions WHERE input_collection_id = $1",
+            )
+            .bind(collection.collection_id.to_string())
+            .fetch_one(&db)
+        };
+        let (name, deleted) = row_of(&old).await.unwrap();
+        assert!(
+            deleted && name.starts_with("_deleted_unfinished_counter_"),
+            "{name} {deleted}"
+        );
+        for collection in [&young, &ready] {
+            assert_eq!(
+                row_of(collection).await.unwrap(),
+                ("unfinished_counter".to_string(), false)
+            );
+        }
+        assert!(
+            log_rows_of(&db, &young).await >= 1500,
+            "the one left for a minute still holds the log"
+        );
+
+        // The name is free: the same function can be attached again.
+        reopened
+            .attach_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                old.collection_id.to_string(),
+                AttachFunctionRequest::try_new(
+                    "unfinished_counter".to_string(),
+                    "record_counter".to_string(),
+                    "unfinished_counts".to_string(),
+                    serde_json::json!({}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
     // An asynchronous function runs after each apply of its input, not only at the round of the timer: here a timer of
     // an hour. The state kept before the applies starts at the first of them, and stays there while the function has
     // not run past it.

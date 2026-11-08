@@ -63,6 +63,38 @@ pub struct FunctionWindow {
     pub counts_version: bool,
 }
 
+/// The attached functions left half-way for longer than the age given, soft deleted as CleanupExpiredPartial of the
+/// coordinator of distributed Chroma deletes them: the attach of the single node gives a function its output collection
+/// when it finishes, in one transaction. The name goes free for a new attach. The answer has their input collections.
+pub async fn cleanup_expired_partial(
+    sqlite_db: &SqliteDb,
+    max_age: Duration,
+) -> Result<Vec<CollectionUuid>, Box<dyn ChromaError>> {
+    let inputs: Vec<String> = sqlx::query_scalar(
+        "UPDATE attached_functions SET name = '_deleted_' || name || '_' || id, is_deleted = TRUE, \
+         updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+         WHERE output_collection_id IS NULL AND is_deleted = FALSE \
+         AND updated_at < strftime('%Y-%m-%d %H:%M:%f', 'now', $1) \
+         RETURNING input_collection_id",
+    )
+    .bind(format!("-{} seconds", max_age.as_secs()))
+    .fetch_all(sqlite_db.get_conn())
+    .await
+    .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)?;
+    let mut collections = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let collection = CollectionUuid::from_str(&input).map_err(|e| {
+            Box::new(chroma_error::TonicError(tonic::Status::internal(
+                e.to_string(),
+            ))) as Box<dyn ChromaError>
+        })?;
+        if !collections.contains(&collection) {
+            collections.push(collection);
+        }
+    }
+    Ok(collections)
+}
+
 /// The input collections of the ready synchronous functions behind the records applied to them, with the log offset of
 /// the last record applied, as the metadata segment of the collection records it.
 pub async fn behind(

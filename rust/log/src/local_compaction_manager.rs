@@ -162,6 +162,8 @@ pub struct LocalCompactionManager {
     spann_version_grace: Duration,
     // When SPANN collections flush: see LocalCompactionManagerConfig.
     compaction_interval: Duration,
+    // How often the attached functions left half-way are looked for (cleanup_expired_partial).
+    partial_attach_cleanup_interval: Duration,
     min_compaction_size: usize,
     max_compaction_size: usize,
     max_partition_size: usize,
@@ -220,6 +222,11 @@ impl PurgeSchedule {
 // writes records BackfillFn to the log of its input collection, and the apply that sees them reads the catalog again.
 // How long the queue of a collection waits for a window before it goes.
 const QUEUE_IDLE: Duration = Duration::from_secs(600);
+
+// How old an attached function left half-way must be to go. In distributed Chroma, the caller of
+// CleanupExpiredPartialAttachedFunctions gives it.
+const PARTIAL_ATTACH_MAX_AGE: Duration = Duration::from_secs(3600);
+const PARTIAL_ATTACH_CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
 
 #[derive(Clone, Default)]
 struct FunctionRuns {
@@ -441,6 +448,7 @@ impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
             spann_versions: HashMap::new(),
             spann_version_grace: registry.get::<SpannVersionGrace>().unwrap_or_default().0,
             compaction_interval: Duration::from_secs(config.compaction_interval_sec),
+            partial_attach_cleanup_interval: PARTIAL_ATTACH_CLEANUP_INTERVAL,
             min_compaction_size: config.min_compaction_size,
             max_compaction_size: config.max_compaction_size,
             max_partition_size: config.max_partition_size,
@@ -486,6 +494,20 @@ impl Component for LocalCompactionManager {
                 ))
             },
         );
+        self.schedule_partial_attach_cleanup(Duration::ZERO, ctx);
+    }
+}
+
+impl LocalCompactionManager {
+    fn schedule_partial_attach_cleanup(&self, after: Duration, ctx: &ComponentContext<Self>) {
+        ctx.scheduler
+            .schedule(CleanupPartialAttachesMessage {}, after, ctx, || {
+                Some(tracing::span!(
+                    parent: None,
+                    tracing::Level::INFO,
+                    "Cleanup of the partial attaches"
+                ))
+            });
     }
 }
 
@@ -555,6 +577,11 @@ impl ChromaError for CompactionManagerError {
 pub struct PurgeLogsMessage {
     pub collection_id: CollectionUuid,
 }
+
+/// The cleanup of the attached functions left half-way by a stop during their attach, when the manager starts and then
+/// at every PARTIAL_ATTACH_CLEANUP_INTERVAL: without it, their completion offset of 0 keeps the log of their input.
+#[derive(Clone, Debug)]
+pub struct CleanupPartialAttachesMessage {}
 
 #[derive(Clone, Debug)]
 pub struct BackfillMessage {
@@ -955,6 +982,42 @@ impl Handler<PurgeLogsMessage> for LocalCompactionManager {
         }
         self.purges.request(message.collection_id);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<CleanupPartialAttachesMessage> for LocalCompactionManager {
+    type Result = ();
+
+    async fn handle(
+        &mut self,
+        _message: CleanupPartialAttachesMessage,
+        ctx: &ComponentContext<LocalCompactionManager>,
+    ) -> Self::Result {
+        self.schedule_partial_attach_cleanup(self.partial_attach_cleanup_interval, ctx);
+        let inputs = match attached_functions::run::cleanup_expired_partial(
+            &self.sqlite_db,
+            PARTIAL_ATTACH_MAX_AGE,
+        )
+        .await
+        {
+            Ok(inputs) => inputs,
+            Err(err) => {
+                tracing::error!(error = %err, "Cleanup of the partial attaches failed");
+                return;
+            }
+        };
+        // The log that these functions held back goes now, not at the next write of their input collections.
+        for collection_id in inputs {
+            self.purged.remove(&collection_id);
+            if let Err(err) = self.purge_requested(collection_id).await {
+                tracing::warn!(
+                    collection_id = %collection_id,
+                    error = %err,
+                    "Purge of the log after the cleanup of a partial attach failed"
+                );
+            }
+        }
     }
 }
 
