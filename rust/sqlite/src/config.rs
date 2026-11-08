@@ -8,7 +8,10 @@ use chroma_config::{
     Configurable,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteTransactionManager,
+};
+use sqlx::{Connection, TransactionManager};
 use tokio::fs::create_dir_all;
 
 #[cfg(feature = "pyo3")]
@@ -184,6 +187,27 @@ impl Configurable<SqliteDBConfig, SqliteCreationError> for SqliteDb {
                 JournalMode::Delete => SqliteJournalMode::Delete,
             };
             SqlitePoolOptions::new()
+                // SQLite ends by itself a transaction that fills the disk, so the rollback of sqlx fails and the connection
+                // comes back still counted in a transaction. On it the next BEGIN IMMEDIATE is refused, and the savepoint of
+                // a plain begin leaves a real transaction open, with the write lock, until the server stops. Such a
+                // connection is closed, and SQLite frees what it holds. Not for the database in memory below: it lives in
+                // its only connection, and it has no disk to fill.
+                .after_release(|connection, _| {
+                    Box::pin(async move {
+                        if SqliteTransactionManager::get_transaction_depth(connection) > 0 {
+                            // The rollback of a dropped transaction may still be queued.
+                            connection.ping().await?;
+                        }
+                        let usable =
+                            SqliteTransactionManager::get_transaction_depth(connection) == 0;
+                        if !usable {
+                            tracing::warn!(
+                                "Closing a SQLite connection whose transaction could not be rolled back"
+                            );
+                        }
+                        Ok(usable)
+                    })
+                })
                 .connect_with(
                     conn_options
                         .filename(path)
@@ -221,7 +245,6 @@ mod tests {
 
     use super::*;
     use chroma_config::registry::Registry;
-    use sqlx::Connection;
 
     #[tokio::test]
     async fn test_sqlite_db_config_registry() {
