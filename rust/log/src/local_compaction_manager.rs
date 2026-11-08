@@ -1523,27 +1523,16 @@ impl LocalCompactionManager {
         }
         // Read durable watermarks without loading HNSW, but do not trust a
         // watermark when its checkpoint has since become unusable.
-        let max_seq_id = max_purge_seq_id(
+        let PurgeLimit {
+            max_seq_id,
+            purge_seq_id,
+        } = purge_limit(
             &self.sqlite_db,
+            collection_id,
             &collection_segments.metadata_segment.id,
             &collection_segments.vector_segment.id,
         )
         .await?;
-        // As the garbage collector of distributed Chroma keeps the log that its attached functions have not run on
-        // (fetch_min_attached_function_completion_offset.rs): no record after the lowest completion offset of the
-        // functions of the collection goes, as GetMinCompletionOffsetForCollection of the coordinator reads it. A
-        // function that keeps failing holds back the purge of its input collection, as in distributed Chroma.
-        let min_completion_offset: Option<i64> = sqlx::query_scalar(
-            "SELECT MIN(completion_offset) FROM attached_functions WHERE input_collection_id = $1 AND is_deleted = FALSE",
-        )
-        .bind(collection_id.to_string())
-        .fetch_one(self.sqlite_db.get_conn())
-        .await
-        .map_err(|_| CompactionManagerError::PurgeLogsFailure)?;
-        let purge_seq_id = match min_completion_offset {
-            Some(offset) => max_seq_id.min(offset.max(0) as u64 + 1),
-            None => max_seq_id,
-        };
         if let Log::Sqlite(log) = &mut self.log {
             if !log
                 .has_purge_work(collection_id, purge_seq_id)
@@ -2057,6 +2046,43 @@ async fn max_purge_seq_id(
         .current_max_seq_id(metadata)
         .await?
         .min(reader.current_max_seq_id(vector).await?))
+}
+
+/// How far the log of a collection can be purged: the same limit for the server and for vacuum.
+pub struct PurgeLimit {
+    /// The lowest position of the segments of the collection.
+    pub max_seq_id: u64,
+    /// The records below this one can go.
+    pub purge_seq_id: u64,
+}
+
+/// The limit of the purge of the log of a collection, from the positions of its segments and its attached functions.
+pub async fn purge_limit(
+    sqlite: &SqliteDb,
+    collection_id: CollectionUuid,
+    metadata: &SegmentUuid,
+    vector: &SegmentUuid,
+) -> Result<PurgeLimit, CompactionManagerError> {
+    let max_seq_id = max_purge_seq_id(sqlite, metadata, vector).await?;
+    // As the garbage collector of distributed Chroma keeps the log that its attached functions have not run on
+    // (fetch_min_attached_function_completion_offset.rs): no record after the lowest completion offset of the
+    // functions of the collection goes, as GetMinCompletionOffsetForCollection of the coordinator reads it. A
+    // function that keeps failing holds back the purge of its input collection, as in distributed Chroma.
+    let min_completion_offset: Option<i64> = sqlx::query_scalar(
+        "SELECT MIN(completion_offset) FROM attached_functions WHERE input_collection_id = $1 AND is_deleted = FALSE",
+    )
+    .bind(collection_id.to_string())
+    .fetch_one(sqlite.get_conn())
+    .await
+    .map_err(|_| CompactionManagerError::PurgeLogsFailure)?;
+    let purge_seq_id = match min_completion_offset {
+        Some(offset) => max_seq_id.min(offset.max(0) as u64 + 1),
+        None => max_seq_id,
+    };
+    Ok(PurgeLimit {
+        max_seq_id,
+        purge_seq_id,
+    })
 }
 
 #[cfg(test)]
