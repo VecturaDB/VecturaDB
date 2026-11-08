@@ -89,6 +89,9 @@ pub enum SqlitePushLogsError {
     // A commit that the log can no longer check, stale as a read at its token, so that a client starts it again.
     #[error("{0}")]
     StaleRead(#[from] StaleReadError),
+    // The task of the commit and the backfill of a write that did not end, as a panic in it.
+    #[error("The write to the log was interrupted: {0}")]
+    Interrupted(String),
 }
 
 impl ChromaError for SqlitePushLogsError {
@@ -108,6 +111,7 @@ impl ChromaError for SqlitePushLogsError {
             SqlitePushLogsError::ConditionalWriteConflict => ErrorCodes::Aborted,
             SqlitePushLogsError::ConditionalWriteRefused(code, _) => *code,
             SqlitePushLogsError::StaleRead(err) => err.code(),
+            SqlitePushLogsError::Interrupted(_) => ErrorCodes::Internal,
         }
     }
 }
@@ -887,31 +891,39 @@ impl SqliteLog {
                 query.execute(&mut *tx).await.map_err(WrappedSqlxError)?;
             }
         }
-        tx.commit().await.map_err(WrappedSqlxError)?;
-        #[cfg(feature = "test-hooks")]
-        hooks::after_commit(collection_id).await;
-
-        if let Some(handle) = self.compactor_handle.get() {
-            let backfill_message = BackfillMessage { collection_id };
-            let backfill_result = handle.request(backfill_message, None).await;
-            let purge_log_msg = PurgeLogsMessage { collection_id };
-            let purge_result = handle
-                .clone()
-                .request(purge_log_msg, None)
-                .await
-                .map_err(SqlitePushLogsError::from)
-                .and_then(|result| result.map_err(SqlitePushLogsError::from));
-            // Preserve purge failures even when the backfill error takes precedence.
-            if let Err(err) = &purge_result {
-                tracing::error!(
-                    collection_id = %collection_id,
-                    error = %err,
-                    "Failed to purge logs after backfill attempt"
-                );
+        // The commit and the backfill of the write run in a task of their own. A client that goes away drops the future of
+        // its request: a write committed to the log stayed there unapplied, seen by no read until another write of the
+        // collection or a restart. As in distributed Chroma, a write that reaches the log is seen by the reads.
+        let handle = self.compactor_handle.get().cloned();
+        tokio::spawn(async move {
+            tx.commit().await.map_err(WrappedSqlxError)?;
+            #[cfg(feature = "test-hooks")]
+            hooks::after_commit(collection_id).await;
+            if let Some(handle) = handle {
+                let backfill_message = BackfillMessage { collection_id };
+                let backfill_result = handle.request(backfill_message, None).await;
+                let purge_log_msg = PurgeLogsMessage { collection_id };
+                let purge_result = handle
+                    .clone()
+                    .request(purge_log_msg, None)
+                    .await
+                    .map_err(SqlitePushLogsError::from)
+                    .and_then(|result| result.map_err(SqlitePushLogsError::from));
+                // Preserve purge failures even when the backfill error takes precedence.
+                if let Err(err) = &purge_result {
+                    tracing::error!(
+                        collection_id = %collection_id,
+                        error = %err,
+                        "Failed to purge logs after backfill attempt"
+                    );
+                }
+                backfill_result??;
+                purge_result?;
             }
-            backfill_result??;
-            purge_result?;
-        }
+            Ok::<_, SqlitePushLogsError>(())
+        })
+        .await
+        .map_err(|err| SqlitePushLogsError::Interrupted(err.to_string()))??;
 
         Ok(first_inserted_record_offset)
     }
