@@ -96,7 +96,7 @@ impl LocalStorage {
     // new one, never a part of one, and the bytes are on disk before the caller records the key.
     // The file gets the permissions that std::fs::write gave it, 0666 less the umask, not the 0600 of a temporary file.
     fn write_durably(parent: &Path, file_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-        std::fs::create_dir_all(parent)?;
+        Self::create_folders_durably(parent)?;
         let mut builder = tempfile::Builder::new();
         #[cfg(unix)]
         {
@@ -110,8 +110,47 @@ impl LocalStorage {
         std::fs::rename(&temp_path, file_path)?;
         let _ = temp_path.keep();
         #[cfg(unix)]
-        Self::folder_synced(std::fs::File::open(parent)?.sync_all())?;
+        Self::sync_folder(parent)?;
         Ok(())
+    }
+
+    // The folders of a key that do not exist yet, created, each one synced in the folder above it: the sync of a file
+    // and of its folder do not make the name of the folder durable, and a power cut could lose the folder with the
+    // files in it, after the caller has recorded them. A folder that exists costs nothing more.
+    #[cfg(unix)]
+    fn create_folders_durably(folder: &Path) -> std::io::Result<()> {
+        let mut missing = Vec::new();
+        let mut current = folder;
+        while !current.exists() {
+            missing.push(current);
+            match current.parent() {
+                Some(above) if !above.as_os_str().is_empty() => current = above,
+                _ => break,
+            }
+        }
+        std::fs::create_dir_all(folder)?;
+        for created in missing {
+            if let Some(above) = created
+                .parent()
+                .filter(|above| !above.as_os_str().is_empty())
+            {
+                Self::sync_folder(above)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn create_folders_durably(folder: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(folder)
+    }
+
+    // The sync of a folder, which the tests record.
+    #[cfg(unix)]
+    fn sync_folder(folder: &Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        tests::SYNCED_FOLDERS.with(|synced| synced.borrow_mut().push(folder.to_path_buf()));
+        Self::folder_synced(std::fs::File::open(folder)?.sync_all())
     }
 
     // The sync of the folder makes the rename survive a crash. Some file systems refuse to sync a folder, with EINVAL or
@@ -294,6 +333,43 @@ impl Configurable<StorageConfig> for LocalStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        // The folders that the writes of this thread synced, in their order: see sync_folder.
+        pub(super) static SYNCED_FOLDERS: std::cell::RefCell<Vec<PathBuf>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    // A key in folders that do not exist yet: each folder that the write creates is synced in the folder above it, as
+    // the file is in its own folder, so that a power cut after the write leaves the folders as well as the file. A
+    // second key in the same folders syncs only its own folder.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_folders_a_write_creates_are_synced_in_the_folders_above_them() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = LocalStorage::new(root.path().to_str().unwrap());
+        SYNCED_FOLDERS.with(|synced| synced.borrow_mut().clear());
+        storage
+            .put_bytes("segment/one/block/key", b"bytes", PutOptions::default())
+            .await
+            .unwrap();
+        let synced = SYNCED_FOLDERS.with(|synced| synced.borrow().clone());
+        for folder in ["", "segment", "segment/one", "segment/one/block"] {
+            assert!(
+                synced.contains(&root.path().join(folder)),
+                "{folder:?} not synced: {synced:?}"
+            );
+        }
+        SYNCED_FOLDERS.with(|synced| synced.borrow_mut().clear());
+        storage
+            .put_bytes("segment/one/block/other", b"bytes", PutOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            SYNCED_FOLDERS.with(|synced| synced.borrow().clone()),
+            vec![root.path().join("segment/one/block")]
+        );
+    }
 
     // A folder that cannot be synced does not fail a write whose file is in place; any other error does.
     #[test]
