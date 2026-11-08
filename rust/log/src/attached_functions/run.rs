@@ -70,6 +70,20 @@ pub async fn cleanup_expired_partial(
     sqlite_db: &SqliteDb,
     max_age: Duration,
 ) -> Result<Vec<CollectionUuid>, Box<dyn ChromaError>> {
+    // This runs at every start, next to the first commands of the program, and a write here can refuse at once a
+    // transaction of theirs that has read and is about to write: it writes only when it has something to delete.
+    let age = format!("-{} seconds", max_age.as_secs());
+    let any: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM attached_functions WHERE output_collection_id IS NULL AND is_deleted = FALSE \
+         AND updated_at < strftime('%Y-%m-%d %H:%M:%f', 'now', $1) LIMIT 1",
+    )
+    .bind(&age)
+    .fetch_optional(sqlite_db.get_conn())
+    .await
+    .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)?;
+    if any.is_none() {
+        return Ok(Vec::new());
+    }
     let inputs: Vec<String> = sqlx::query_scalar(
         "UPDATE attached_functions SET name = '_deleted_' || name || '_' || id, is_deleted = TRUE, \
          updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
@@ -77,7 +91,7 @@ pub async fn cleanup_expired_partial(
          AND updated_at < strftime('%Y-%m-%d %H:%M:%f', 'now', $1) \
          RETURNING input_collection_id",
     )
-    .bind(format!("-{} seconds", max_age.as_secs()))
+    .bind(&age)
     .fetch_all(sqlite_db.get_conn())
     .await
     .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)?;

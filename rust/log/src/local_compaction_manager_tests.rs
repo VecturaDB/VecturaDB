@@ -465,7 +465,34 @@ async fn the_cleanup_of_the_partial_attaches_comes_again_after_the_start() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(deleted, "no round of the cleanup after the one at the start");
+    assert!(
+        deleted,
+        "no round of the cleanup after the one at the start"
+    );
+    f.stop().await;
+}
+
+// The cleanup runs at every start, next to the first commands of the program: with nothing to clean it does not write,
+// so here it ends while another connection holds the lock of the writes.
+#[tokio::test]
+async fn the_cleanup_of_the_partial_attaches_does_not_write_with_nothing_to_clean() {
+    let f = Fixture::new().await;
+    let mut writer = f.db.get_conn().acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let cleaned = tokio::time::timeout(
+        Duration::from_secs(5),
+        attached_functions::run::cleanup_expired_partial(&f.db, PARTIAL_ATTACH_MAX_AGE),
+    )
+    .await;
+    sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+    drop(writer);
+    assert!(cleaned
+        .expect("the cleanup waited for the lock of the writes")
+        .unwrap()
+        .is_empty());
     f.stop().await;
 }
 
