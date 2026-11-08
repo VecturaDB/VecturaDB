@@ -258,10 +258,8 @@ async fn backfill_and_purge_error_matrix_logs_failures_and_retries() {
                     .contains("Error constructing hnsw segment reader"),
                 "{error}"
             );
-        } else if purge_fails {
-            let error = result.err().unwrap();
-            assert!(error.to_string().contains("Error purging logs"), "{error}");
         } else {
+            // A purge that fails leaves the log as it is: the read answers, and the error is in the log of the server.
             result.unwrap();
         }
         assert_eq!(
