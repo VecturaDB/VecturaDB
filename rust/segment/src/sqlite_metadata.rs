@@ -4,7 +4,7 @@ use std::{
     num::TryFromIntError,
 };
 
-use crate::local_hnsw::{LocalHnswSegmentReader, LocalHnswSegmentReaderError};
+use crate::local_hnsw::{LocalHnswSegmentReaderError, LocalHnswView};
 use chroma_error::{ChromaError, ErrorCodes};
 use chroma_sqlite::{
     db::SqliteDb,
@@ -108,9 +108,10 @@ pub struct SpannSearchSqlite {
     pub unranked: Option<Vec<String>>,
 }
 
-/// A dense KNN leaf on the local HNSW index (rust/worker/src/execution/operators/knn_hnsw.rs).
+/// A dense KNN leaf on the local HNSW index and the tail of the log after it, at the moment of the snapshot of the search
+/// (rust/worker/src/execution/operators/knn_hnsw.rs, knn_log.rs and knn_merge.rs).
 #[async_trait::async_trait]
-impl DenseVectorReader for LocalHnswSegmentReader {
+impl DenseVectorReader for LocalHnswView<'_> {
     async fn nearest(
         &self,
         collection: &chroma_types::CollectionAndSegments,
@@ -118,15 +119,6 @@ impl DenseVectorReader for LocalHnswSegmentReader {
         allowed_user_ids: Option<&[String]>,
         limit: u32,
     ) -> Result<Vec<(u32, String, f32)>, SqliteMetadataError> {
-        // The HNSW index knows the records by label.
-        let mut allowed_labels = Vec::new();
-        for user_id in allowed_user_ids.unwrap_or_default() {
-            allowed_labels.push(
-                self.get_offset_id_by_user_id(user_id)
-                    .await
-                    .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))?,
-            );
-        }
         let space = collection
             .collection
             .schema
@@ -150,33 +142,26 @@ impl DenseVectorReader for LocalHnswSegmentReader {
         } else {
             query
         };
-        let neighbors = self
-            .query_embedding(&allowed_labels, query, limit)
-            .await
-            .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))?;
-        let mut nearest = Vec::with_capacity(neighbors.len());
-        for neighbor in neighbors {
-            let user_id = self
-                .get_user_id_by_offset_id(neighbor.offset_id)
-                .await
-                .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))?;
-            nearest.push((neighbor.offset_id, user_id, neighbor.measure));
-        }
-        Ok(nearest)
+        Ok(self
+            .query(allowed_user_ids, query, limit, false)
+            .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))?
+            .into_iter()
+            .map(|record| (record.offset_id, record.user_id, record.measure))
+            .collect())
     }
 
     async fn embedding(&self, user_id: &str) -> Result<Vec<f32>, SqliteMetadataError> {
-        self.get_embedding_by_user_id(&user_id.to_string())
-            .await
+        LocalHnswView::embedding(self, user_id)
             .map_err(|err| SqliteMetadataError::LocalHnsw(Box::new(err)))
     }
 }
 
-/// A read of the metadata at one moment: see SqliteMetadataReader::snapshot. The single node keeps the rollback journal
-/// of SQLite, which sqlx does not change, so the read transaction holds its shared lock until it ends, and the commit of
-/// a writer waits for it. A writer that waits keeps new readers out: a second connection that reads while a snapshot is
-/// open waits for the writer that waits for the snapshot, up to the busy timeout of 1000 s (rust/sqlite/src/config.rs).
-/// Every read inside a snapshot goes through it.
+/// A read of the metadata at one moment: see SqliteMetadataReader::snapshot. Every read inside a snapshot goes through it.
+/// In WAL, the journal mode of a database file by default (rust/sqlite/src/config.rs), the read sees the database as its
+/// first read found it, and writers commit meanwhile. With the rollback journal (journal_mode delete) the read
+/// transaction holds its shared lock until it ends, and the commit of a writer waits for it: a writer that waits keeps new
+/// readers out, so a second connection that reads while a snapshot is open waits for the writer that waits for the
+/// snapshot, up to the busy timeout of 1000 s. A database in memory has one connection, which an open snapshot holds.
 pub struct MetadataSnapshot {
     tx: Transaction<'static, Sqlite>,
 }

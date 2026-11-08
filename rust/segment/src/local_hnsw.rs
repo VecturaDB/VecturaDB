@@ -1,4 +1,6 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
+#[cfg(feature = "test-hooks")]
+pub mod hooks;
 mod persistence;
 pub(crate) use persistence::validate_checkpoint;
 use persistence::{validate_checkpoint_seq_id, CheckpointFingerprint, VerifiedCheckpoint};
@@ -524,6 +526,32 @@ impl LocalHnswSegmentReader {
         k: u32,
     ) -> Result<Vec<RecordMeasure>, LocalHnswSegmentReaderError> {
         let guard = self.index.inner.read().await;
+        Self::search(&guard, allowed_offset_ids, &[], embedding, k)
+    }
+
+    /// The read lock of the index, which a read of the single node takes before its snapshot of SQLite: see
+    /// LocalHnswRead.
+    pub async fn begin_read(&self) -> Result<LocalHnswRead<'_>, LocalHnswSegmentReaderError> {
+        let guard = self.index.inner.read().await;
+        if guard.failed {
+            return Err(LocalHnswSegmentReaderError::HnswIndexLoadError);
+        }
+        if guard.deleted {
+            return Err(LocalHnswSegmentReaderError::Deleted);
+        }
+        Ok(LocalHnswRead { guard })
+    }
+
+    // The search of the index, under the lock that the caller holds: among the allowed labels, or all of them without
+    // the disallowed ones, as the KNN of a segment of distributed Chroma (rust/worker/src/execution/operators/
+    // knn_hnsw.rs).
+    fn search(
+        guard: &Inner,
+        allowed_offset_ids: &[u32],
+        disallowed_offset_ids: &[u32],
+        embedding: Vec<f32>,
+        k: u32,
+    ) -> Result<Vec<RecordMeasure>, LocalHnswSegmentReaderError> {
         if guard.failed {
             return Err(LocalHnswSegmentReaderError::HnswIndexLoadError);
         }
@@ -562,9 +590,13 @@ impl LocalHnswSegmentReader {
                     let allowed_ids_as_set = allowed_offset_ids
                         .iter()
                         .collect::<std::collections::HashSet<_>>();
+                    let disallowed_ids_as_set = disallowed_offset_ids
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>();
                     for curr_id in valid_ids.iter() {
-                        if !allowed_ids_as_set.is_empty()
-                            && !allowed_ids_as_set.contains(&(*curr_id as u32))
+                        if (!allowed_ids_as_set.is_empty()
+                            && !allowed_ids_as_set.contains(&(*curr_id as u32)))
+                            || disallowed_ids_as_set.contains(&(*curr_id as u32))
                         {
                             continue;
                         }
@@ -613,9 +645,18 @@ impl LocalHnswSegmentReader {
                 .iter()
                 .map(|oid| *oid as usize)
                 .collect::<Vec<_>>();
+            let disallowed_ids = disallowed_offset_ids
+                .iter()
+                .map(|oid| *oid as usize)
+                .collect::<Vec<_>>();
             let (offset_ids, distances) = guard
                 .index
-                .query(&embedding, k as usize, allowed_ids.as_slice(), &[])
+                .query(
+                    &embedding,
+                    k as usize,
+                    allowed_ids.as_slice(),
+                    disallowed_ids.as_slice(),
+                )
                 .map_err(|_| LocalHnswSegmentReaderError::QueryError)?;
 
             Ok(offset_ids
@@ -628,6 +669,274 @@ impl LocalHnswSegmentReader {
                 .collect())
         }
     }
+}
+
+/// The read lock of a local HNSW index for a read at one moment of the single node, in the order of distributed Chroma,
+/// whose reads take a version of every segment and the log after it. A read takes this lock first and then its
+/// snapshot of SQLite: a backfill commits its records to SQLite before it applies them to the index, so the snapshot
+/// holds every record of the index, and the records of the log between the position of the index and the snapshot,
+/// its tail (with_tail), are the only difference between them. No apply changes the index while the lock is held, and no
+/// read waits for a backfill.
+pub struct LocalHnswRead<'a> {
+    guard: tokio::sync::RwLockReadGuard<'a, Inner>,
+}
+
+impl<'a> LocalHnswRead<'a> {
+    /// The position in the log of the last record the index holds.
+    pub fn position(&self) -> u64 {
+        self.guard.last_seen_seq_id
+    }
+
+    /// The index with the tail of the log after its position, in the order of the log, as apply_log_chunk would apply
+    /// it: a record that the tail adds, or whose vector it sets, has its last vector here, and a record that it deletes
+    /// has none; either way the label that the record has in the index is left out of its searches. A record whose
+    /// metadata alone the tail changes keeps its vector in the index.
+    pub fn with_tail(
+        self,
+        tail: &[LogRecord],
+    ) -> Result<LocalHnswView<'a>, LocalHnswSegmentReaderError> {
+        let position = self.guard.last_seen_seq_id;
+        let dimensionality = self.guard.index.dimensionality() as usize;
+        // For each record of the tail: whether it exists, and the vector the tail set, if any.
+        let mut records: HashMap<&str, (bool, Option<&[f32]>, bool)> = HashMap::new();
+        for log in tail {
+            if log.log_offset <= position as i64 {
+                continue;
+            }
+            let id = log.record.id.as_str();
+            let (exists, vector, changed) = records
+                .entry(id)
+                .or_insert_with(|| (self.guard.id_map.id_to_label.contains_key(id), None, false));
+            let embedding = log.record.embedding.as_deref();
+            match log.record.operation {
+                Operation::Add if !*exists => {
+                    *vector =
+                        Some(embedding.ok_or(LocalHnswSegmentReaderError::GetEmbeddingError)?);
+                    *exists = true;
+                    *changed = true;
+                }
+                Operation::Upsert => {
+                    *vector =
+                        Some(embedding.ok_or(LocalHnswSegmentReaderError::GetEmbeddingError)?);
+                    *exists = true;
+                    *changed = true;
+                }
+                Operation::Update if *exists && embedding.is_some() => {
+                    *vector = embedding;
+                    *changed = true;
+                }
+                Operation::Delete if *exists => {
+                    *vector = None;
+                    *exists = false;
+                    *changed = true;
+                }
+                _ => {}
+            }
+        }
+        let mut changed = HashMap::new();
+        let mut disallowed = Vec::new();
+        for (id, (exists, vector, was_changed)) in records {
+            if !was_changed {
+                continue;
+            }
+            if let Some(label) = self.guard.id_map.id_to_label.get(id) {
+                disallowed.push(*label);
+            }
+            // A record that exists after a change of the tail has the vector of its last add, upsert or update with one.
+            let vector = if exists {
+                let vector = vector.ok_or(LocalHnswSegmentReaderError::GetEmbeddingError)?;
+                if vector.len() != dimensionality {
+                    return Err(LocalHnswSegmentReaderError::DimensionalityMismatch {
+                        expected: dimensionality,
+                        actual: vector.len(),
+                    });
+                }
+                Some(vector.to_vec())
+            } else {
+                None
+            };
+            changed.insert(id.to_string(), vector);
+        }
+        Ok(LocalHnswView {
+            guard: self.guard,
+            changed,
+            disallowed,
+        })
+    }
+}
+
+/// A local HNSW index and the tail of the log after its position, at the moment of a snapshot of SQLite: the records of
+/// that moment (LocalHnswRead).
+pub struct LocalHnswView<'a> {
+    guard: tokio::sync::RwLockReadGuard<'a, Inner>,
+    // The records that the tail adds, deletes or whose vector it sets, by user id: the last vector, or none when deleted.
+    changed: HashMap<String, Option<Vec<f32>>>,
+    // The labels of the index of those records, left out of its searches.
+    disallowed: Vec<u32>,
+}
+
+impl LocalHnswView<'_> {
+    /// The `k` nearest records of a query, among the records of the user ids given or all of them, with their ids,
+    /// distances, and embeddings when asked: those of the index without the records that the tail changes, and those
+    /// of the tail by brute force, merged by distance, as the KNN of distributed Chroma merges a segment and its log
+    /// (rust/worker/src/execution/operators/knn_log.rs and knn_merge.rs). A user id that the moment does not hold fails
+    /// the query with IdNotFound, as on Chroma 1.5.9. The query is normalized for the cosine space by the caller.
+    pub fn query(
+        &self,
+        allowed_user_ids: Option<&[String]>,
+        embedding: Vec<f32>,
+        k: u32,
+        with_embeddings: bool,
+    ) -> Result<Vec<QueriedRecord>, LocalHnswSegmentReaderError> {
+        let guard = &self.guard;
+        let mut from_tail: Vec<(&str, &[f32])> = Vec::new();
+        let (allowed_labels, disallowed) = match allowed_user_ids {
+            None => {
+                from_tail.extend(self.changed.iter().filter_map(|(id, vector)| {
+                    vector.as_deref().map(|vector| (id.as_str(), vector))
+                }));
+                (Vec::new(), self.disallowed.as_slice())
+            }
+            Some(user_ids) => {
+                let mut labels = Vec::with_capacity(user_ids.len());
+                let mut seen = HashSet::new();
+                for user_id in user_ids {
+                    if !seen.insert(user_id.as_str()) {
+                        continue;
+                    }
+                    match self.changed.get(user_id) {
+                        Some(Some(vector)) => from_tail.push((user_id.as_str(), vector.as_slice())),
+                        Some(None) => return Err(LocalHnswSegmentReaderError::IdNotFound),
+                        None => labels.push(
+                            guard
+                                .id_map
+                                .id_to_label
+                                .get(user_id)
+                                .copied()
+                                .ok_or(LocalHnswSegmentReaderError::IdNotFound)?,
+                        ),
+                    }
+                }
+                (labels, &[][..])
+            }
+        };
+        let distance_function = &guard.index.distance_function;
+        let mut found: Vec<Found<'_>> = Vec::new();
+        // With allowed records all in the tail, an empty list of labels would search the whole index.
+        if allowed_user_ids.is_none() || !allowed_labels.is_empty() {
+            for RecordMeasure { offset_id, measure } in LocalHnswSegmentReader::search(
+                guard,
+                &allowed_labels,
+                disallowed,
+                embedding.clone(),
+                k,
+            )? {
+                let user_id = guard
+                    .id_map
+                    .label_to_id
+                    .get(&offset_id)
+                    .ok_or(LocalHnswSegmentReaderError::IdNotFound)?;
+                found.push(Found {
+                    measure,
+                    offset_id: Some(offset_id),
+                    user_id: user_id.as_str(),
+                    vector: None,
+                });
+            }
+        }
+        for (user_id, vector) in from_tail {
+            let measure = match distance_function {
+                chroma_distance::DistanceFunction::Cosine => {
+                    distance_function.distance(&chroma_distance::normalize(vector), &embedding)
+                }
+                _ => distance_function.distance(vector, &embedding),
+            };
+            found.push(Found {
+                measure,
+                offset_id: None,
+                user_id,
+                vector: Some(vector),
+            });
+        }
+        found.sort_by(|a, b| {
+            a.measure
+                .total_cmp(&b.measure)
+                .then_with(|| a.user_id.cmp(b.user_id))
+        });
+        found.truncate(k as usize);
+        found
+            .into_iter()
+            .map(|found| {
+                let Found {
+                    measure,
+                    offset_id,
+                    user_id,
+                    vector,
+                } = found;
+                let embedding = match (with_embeddings, offset_id, vector) {
+                    (false, _, _) => None,
+                    (true, _, Some(vector)) => Some(vector.to_vec()),
+                    (true, Some(offset_id), None) => Some(
+                        guard
+                            .index
+                            .get(offset_id as usize)
+                            .map_err(|_| LocalHnswSegmentReaderError::GetEmbeddingError)?
+                            .ok_or(LocalHnswSegmentReaderError::GetEmbeddingError)?,
+                    ),
+                    (true, None, None) => {
+                        return Err(LocalHnswSegmentReaderError::GetEmbeddingError)
+                    }
+                };
+                Ok(QueriedRecord {
+                    offset_id: offset_id.unwrap_or(u32::MAX),
+                    user_id: user_id.to_string(),
+                    measure,
+                    embedding,
+                })
+            })
+            .collect()
+    }
+
+    /// The embedding of a record of the moment: from the tail when the tail sets it, else from the index.
+    pub fn embedding(&self, user_id: &str) -> Result<Vec<f32>, LocalHnswSegmentReaderError> {
+        match self.changed.get(user_id) {
+            Some(Some(vector)) => Ok(vector.clone()),
+            Some(None) => Err(LocalHnswSegmentReaderError::IdNotFound),
+            None => {
+                let label = self
+                    .guard
+                    .id_map
+                    .id_to_label
+                    .get(user_id)
+                    .copied()
+                    .ok_or(LocalHnswSegmentReaderError::IdNotFound)?;
+                self.guard
+                    .index
+                    .get(label as usize)
+                    .map_err(|_| LocalHnswSegmentReaderError::GetEmbeddingError)?
+                    .ok_or(LocalHnswSegmentReaderError::GetEmbeddingError)
+            }
+        }
+    }
+}
+
+// A result of a query of the view before its embedding: its distance, its label in the index (none for a record of the
+// tail), its user id, and its vector when it comes from the tail.
+struct Found<'v> {
+    measure: f32,
+    offset_id: Option<u32>,
+    user_id: &'v str,
+    vector: Option<&'v [f32]>,
+}
+
+/// A record that a query found, with its label in the index (u32::MAX for a record of the tail of the log), its id,
+/// its distance, and its embedding when the query asked for it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueriedRecord {
+    pub offset_id: u32,
+    pub user_id: String,
+    pub measure: f32,
+    pub embedding: Option<Vec<f32>>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]
@@ -1220,6 +1529,10 @@ impl LocalHnswSegmentWriter {
         &mut self,
         log_chunk: Chunk<LogRecord>,
     ) -> Result<u32, LocalHnswSegmentWriterError> {
+        // Dropped after the guard, once the lock is released.
+        #[cfg(feature = "test-hooks")]
+        let _done =
+            hooks::hold_apply(log_chunk.iter().map(|(log, _)| log.record.id.as_str())).await;
         let mut guard = self.index.inner.write().await;
         if guard.deleted {
             return Err(LocalHnswSegmentWriterError::Deleted);
