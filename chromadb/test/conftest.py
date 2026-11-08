@@ -35,6 +35,7 @@ from chromadb.config import DEFAULT_DATABASE, Settings, System
 from chromadb.ingest import Producer
 from chromadb.types import SeqId, OperationRecord
 from chromadb.api.client import Client as ClientCreator, AdminClient
+from chromadb.api.shared_system_client import SharedSystemClient
 from chromadb.api.async_client import (
     AsyncAdminClient,
     AsyncClient as AsyncClientCreator,
@@ -1002,7 +1003,17 @@ class ClientFactories:
             self._created_clients.append(client)  # type: ignore
             return client
 
-        client = AdminClient.from_system(self._system)
+        # On VecturaDB one program at a time uses a data folder, and a second system of the process on it would be a
+        # second program: when a client of the test has already opened the folder, the admin client takes that opening,
+        # as an AdminClient with the same settings does.
+        identifier = SharedSystemClient._get_identifier_from_settings(self._system.settings)
+        if (
+            self._system.settings.is_persistent
+            and identifier in SharedSystemClient._identifier_to_system
+        ):
+            client = AdminClient(settings=self._system.settings)
+        else:
+            client = AdminClient.from_system(self._system)
         self._created_clients.append(client)  # type: ignore
         return client
 

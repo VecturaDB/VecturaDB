@@ -250,7 +250,8 @@ impl Collection {
     /// the configuration from the existing schema to keep both representations consistent.
     pub fn reconcile_schema_for_read(&mut self) -> Result<(), SchemaError> {
         if let Some(schema) = self.schema.as_ref() {
-            self.config = InternalCollectionConfiguration::try_from(schema)
+            // A collection on the disk, with its HNSW settings checked as Chroma 1.5.9 checked them.
+            self.config = InternalCollectionConfiguration::from_persisted_schema(schema)
                 .map_err(|reason| SchemaError::InvalidSchema { reason })?;
         } else {
             self.schema = Some(Schema::try_from(&self.config)?);

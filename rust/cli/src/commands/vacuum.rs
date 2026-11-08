@@ -1,10 +1,11 @@
-// Changed by VecturaDB contributors for the VecturaDB branding.
+// Changed by VecturaDB contributors for the VecturaDB branding and the lock of the data folder.
 // Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
 use crate::terminal::{SystemTerminal, Terminal};
 use crate::utils::CliError;
 use chroma_config::registry::Registry;
 use chroma_config::Configurable;
 use chroma_frontend::config::FrontendServerConfig;
+use chroma_frontend::folder_lock::{lock_folder, FolderLock, FolderLockError, FOLDER_WAIT};
 use chroma_frontend::{Frontend, FrontendConfig};
 use chroma_log::sqlite_log::{
     legacy_embeddings_queue_config_default_kind, LegacyEmbeddingsQueueConfig, SqliteLog,
@@ -39,6 +40,13 @@ pub enum VacuumError {
     SqliteConfigNotFound,
     #[error("Failed to vacuum VecturaDB")]
     VacuumFailed,
+    #[error(
+        "The data folder {folder} is in use by another VecturaDB program, a server or an embedded client, after \
+         {waited} s of wait: stop it, then run vacuum again"
+    )]
+    FolderInUse { folder: String, waited: u64 },
+    #[error(transparent)]
+    FolderLock(FolderLockError),
 }
 
 #[derive(Parser, Debug)]
@@ -223,6 +231,28 @@ pub async fn vacuum_chroma(config: FrontendConfig) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+// The lock of the data folder (chroma_frontend::folder_lock), held until vacuum ends: one program at a time, so vacuum
+// does not run beside a server or an embedded client on the same folder. A folder in use is said at once; after the
+// wait the refusal is printed, as the error of the command shows only that vacuum failed.
+fn hold_folder(folder: &str, term: &mut SystemTerminal) -> Result<FolderLock, VacuumError> {
+    let refused = |err| match err {
+        FolderLockError::InUse { folder, waited } => VacuumError::FolderInUse { folder, waited },
+        err => VacuumError::FolderLock(err),
+    };
+    let held = match lock_folder(Path::new(folder), Duration::ZERO) {
+        Err(FolderLockError::InUse { .. }) => {
+            term.println(&format!(
+                "The data folder {folder} is in use by another VecturaDB program: waiting up to {} s for it",
+                FOLDER_WAIT.as_secs()
+            ));
+            lock_folder(Path::new(folder), FOLDER_WAIT)
+        }
+        held => held,
+    };
+    held.map_err(refused)
+        .inspect_err(|err| term.println(&format!("{}", err.to_string().red())))
+}
+
 pub fn vacuum(args: VacuumArgs) -> Result<(), CliError> {
     let mut term = SystemTerminal;
 
@@ -243,6 +273,8 @@ pub fn vacuum(args: VacuumArgs) -> Result<(), CliError> {
     if !Path::new(sqlite_url.as_str()).exists() {
         return Err(VacuumError::NotAChromaPath(sqlite_url).into());
     }
+
+    let _held_folder = hold_folder(&persistent_path, &mut term)?;
 
     let proceed = match args.force {
         true => true,
@@ -304,4 +336,37 @@ pub fn vacuum(args: VacuumArgs) -> Result<(), CliError> {
     ));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // One program at a time on a data folder: vacuum on a folder that a server or an embedded client holds waits for it,
+    // then refuses, with the folder in its message, and leaves the database as it was.
+    #[test]
+    fn vacuum_waits_for_a_folder_in_use_then_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().to_str().unwrap().to_string();
+        let database = root.path().join("chroma.sqlite3");
+        fs::write(&database, b"").unwrap();
+        let _server = lock_folder(root.path(), Duration::ZERO).unwrap();
+
+        let started = std::time::Instant::now();
+        let refused = vacuum(VacuumArgs {
+            path: Some(folder.clone()),
+            force: true,
+            timeout: None,
+        })
+        .unwrap_err();
+
+        assert!(started.elapsed() >= FOLDER_WAIT, "{:?}", started.elapsed());
+        match refused {
+            CliError::Vacuum(VacuumError::FolderInUse { folder: named, .. }) => {
+                assert_eq!(named, folder)
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(fs::read(&database).unwrap(), b"");
+    }
 }

@@ -1862,7 +1862,9 @@ impl ServiceBasedFrontend {
     /// collection, and its log holds only the writes not yet applied. So the sysdb copies the collection and its
     /// segments without their files, then the records of the source are written again into the copy through the local
     /// write path, in storage order. If the copy fails, the new collection is
-    /// removed and the fork fails as a whole.
+    /// removed and the fork fails as a whole. The copy runs in a task of its own, so that a client that goes away, which
+    /// drops this request, does not stop it; until it ends, the reads of the users do not show the new collection, which
+    /// they see whole or not at all, as a fork of distributed Chroma (sysdb migration 00019).
     async fn fork_local(
         &mut self,
         tenant_id: &str,
@@ -1890,43 +1892,114 @@ impl ServiceBasedFrontend {
                 target_collection_name,
             )
             .await?;
-        if let Err(err) = self
-            .copy_records_for_fork(
-                tenant_id,
-                database_name.clone(),
-                source,
-                target_collection_id,
-                cmek,
-            )
-            .await
-        {
-            let segments = [
-                target.metadata_segment.clone(),
-                target.record_segment.clone(),
-                target.vector_segment.clone(),
-            ];
-            if let Err(cleanup) = self
-                .sysdb_client
-                .delete_collection(
-                    tenant_id.to_string(),
-                    database_name,
+        let mut copier = self.clone();
+        let tenant_id = tenant_id.to_string();
+        let copied = target.clone();
+        let copy = tokio::spawn(async move {
+            match copier
+                .copy_records_for_fork(
+                    &tenant_id,
+                    database_name.clone(),
+                    source,
                     target_collection_id,
-                    segments.iter().map(|segment| segment.id).collect(),
+                    cmek,
                 )
                 .await
             {
+                Ok(()) => copier
+                    .sysdb_client
+                    .finish_fork(target_collection_id)
+                    .await
+                    .map_err(ForkCollectionError::Internal),
+                Err(err) => {
+                    copier
+                        .remove_incomplete_fork(&tenant_id, database_name, &copied)
+                        .await;
+                    Err(err)
+                }
+            }
+        });
+        match copy.await {
+            Ok(copied) => copied.map(|()| target),
+            Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+            Err(err) => Err(ForkCollectionError::Internal(Box::new(
+                std::io::Error::other(err),
+            ))),
+        }
+    }
+
+    // The target of a fork that never happened, as one whose copy failed or that a stop left halfway: removed with the
+    // normal deletion, then its row of the lineage, so that the fork does not count among the forks of its lineage. A
+    // target whose deletion fails stays hidden from the users, for the next start.
+    async fn remove_incomplete_fork(
+        &mut self,
+        tenant_id: &str,
+        database_name: DatabaseName,
+        target: &CollectionAndSegments,
+    ) {
+        let target_collection_id = target.collection.collection_id;
+        let segments = [
+            target.metadata_segment.clone(),
+            target.record_segment.clone(),
+            target.vector_segment.clone(),
+        ];
+        match self
+            .sysdb_client
+            .delete_collection(
+                tenant_id.to_string(),
+                database_name,
+                target_collection_id,
+                segments.iter().map(|segment| segment.id).collect(),
+            )
+            .await
+        {
+            Ok(()) => {
+                if let Err(cleanup) = self.sysdb_client.forget_fork(target_collection_id).await {
+                    tracing::warn!(error = %cleanup, "the lineage row of an incomplete fork stays");
+                }
+            }
+            Err(cleanup) => {
                 tracing::error!(error = %cleanup, "Failed to remove an incomplete fork");
             }
-            self.collections_with_segments_provider
-                .collections_with_segments_cache
-                .remove(&target_collection_id)
-                .await;
-            if let Err(cleanup) = self.executor.delete_segments(&segments).await {
-                tracing::warn!(error = %cleanup, "incomplete fork removed; index cleanup will retry");
-            }
-            return Err(err);
         }
-        Ok(target)
+        self.collections_with_segments_provider
+            .collections_with_segments_cache
+            .remove(&target_collection_id)
+            .await;
+        if let Err(cleanup) = self.executor.delete_segments(&segments).await {
+            tracing::warn!(error = %cleanup, "incomplete fork removed; index cleanup will retry");
+        }
+    }
+
+    /// The targets of the forks that a stop left halfway, which no user saw: removed at the start, as a fork that failed
+    /// (sysdb migration 00019).
+    pub(crate) async fn remove_unfinished_forks(&mut self) -> Result<(), Box<dyn ChromaError>> {
+        for target_collection_id in self.sysdb_client.unfinished_forks().await? {
+            match self
+                .sysdb_client
+                .get_collection_with_segments(None, target_collection_id)
+                .await
+            {
+                Ok(target) => {
+                    let tenant_id = target.collection.tenant.clone();
+                    let database_name = DatabaseName::new(target.collection.database.clone())
+                        .ok_or_else(|| -> Box<dyn ChromaError> {
+                            Box::new(GetCollectionWithSegmentsError::NotFound(
+                                target_collection_id.to_string(),
+                            ))
+                        })?;
+                    self.remove_incomplete_fork(&tenant_id, database_name, &target)
+                        .await;
+                }
+                // A stop between the deletion of the target and the one of its row of the lineage.
+                Err(GetCollectionWithSegmentsError::NotFound(_)) => {
+                    self.sysdb_client.forget_fork(target_collection_id).await?
+                }
+                Err(err) => return Err(err.boxed()),
+            }
+            tracing::warn!(collection_id = %target_collection_id, "A fork that a stop left halfway is removed");
+        }
+        Ok(())
     }
 
     async fn copy_records_for_fork(
@@ -4041,7 +4114,7 @@ impl Configurable<(FrontendConfig, System)> for ServiceBasedFrontend {
         let executor =
             Executor::try_from_config(&(config.executor.clone(), system.clone()), registry).await?;
 
-        Ok(ServiceBasedFrontend::new(
+        let mut frontend = ServiceBasedFrontend::new(
             config.allow_reset,
             sysdb,
             collections_with_segments_provider,
@@ -4057,7 +4130,11 @@ impl Configurable<(FrontendConfig, System)> for ServiceBasedFrontend {
             config.tenants_with_transactions_enabled.clone(),
             config.enable_log_scouting,
             config.enable_transactions,
-        ))
+        );
+        if let Err(err) = frontend.remove_unfinished_forks().await {
+            tracing::warn!(error = %err, "the forks that a stop left halfway could not be removed; they stay hidden");
+        }
+        Ok(frontend)
     }
 }
 
@@ -4216,7 +4293,8 @@ mod tests {
             )
             .await
             .unwrap();
-        // Bypass API validation to model a configuration persisted by an older release.
+        // Bypass API validation to model a configuration persisted that Chroma 1.5.9 refused too: a configuration outside
+        // the bounds of a request, which Chroma 1.5.9 accepted, is read as stored.
         frontend
             .sysdb_client
             .update_collection(
@@ -4228,7 +4306,7 @@ mod tests {
                 Some(chroma_types::InternalUpdateCollectionConfiguration {
                     vector_index: Some(chroma_types::UpdateVectorIndexConfiguration::Hnsw(Some(
                         chroma_types::UpdateHnswConfiguration {
-                            ef_search: Some(4097),
+                            sync_threshold: Some(1),
                             ..Default::default()
                         },
                     ))),
@@ -9981,6 +10059,138 @@ mod tests {
         assert_eq!(count_records(&mut frontend, &new).await, 2);
     }
 
+    // The records of a collection, added a thousand at a time, with embeddings of two dimensions.
+    async fn add_records(
+        frontend: &mut ServiceBasedFrontend,
+        collection: CollectionUuid,
+        n: usize,
+    ) {
+        for start in (0..n).step_by(1000) {
+            let ids: Vec<usize> = (start..n.min(start + 1000)).collect();
+            frontend
+                .add(
+                    AddCollectionRecordsRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection,
+                        ids.iter().map(|i| format!("r{i}")).collect(),
+                        ids.iter()
+                            .map(|i| vec![*i as f32, (*i as f32).sin()])
+                            .collect(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    // The collection of that name as a user reads it, by its name.
+    async fn collection_named(
+        frontend: &mut ServiceBasedFrontend,
+        name: &str,
+    ) -> Option<Collection> {
+        frontend
+            .sysdb_client
+            .get_collections(GetCollectionsOptions {
+                name: Some(name.to_string()),
+                tenant: Some(TENANT.to_string()),
+                database_or_topology: Some(DatabaseOrTopology::Database(
+                    DatabaseName::new(DATABASE).unwrap(),
+                )),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .pop()
+    }
+
+    fn fork_request(source: CollectionUuid, name: &str) -> ForkCollectionRequest {
+        ForkCollectionRequest::try_new(
+            TENANT.to_string(),
+            DATABASE.to_string(),
+            source,
+            name.to_string(),
+        )
+        .unwrap()
+    }
+
+    // A fork stopped halfway, as by a kill of the server: the database closes under the copy once the catalog has the
+    // target. After the restart the fork is not there, and the same fork can be done again, whole.
+    #[tokio::test]
+    async fn a_fork_stopped_halfway_is_not_there_after_the_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        let mut frontend = ServiceBasedFrontend::try_from_config(
+            &(persistent_config(root.path(), false), System::new()),
+            &registry,
+        )
+        .await
+        .unwrap();
+        let source = create_collection_for(&mut frontend, TENANT, DATABASE, "fork_source").await;
+        add_records(&mut frontend, source.collection_id, 5000).await;
+        let mut forking = frontend.clone();
+        let source_id = source.collection_id;
+        let fork = tokio::spawn(async move {
+            forking
+                .fork_collection(fork_request(source_id, "halfway"))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !catalog_has(&root.path().join("chroma.sqlite3"), "halfway") {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the fork wrote no target in the catalog");
+        close_the_database(&registry).await;
+        assert!(
+            !fork.is_finished() || fork.await.unwrap().is_err(),
+            "the fork ended before the stop: the test needs a longer copy"
+        );
+        drop(frontend);
+
+        let mut frontend = persistent_frontend(root.path()).await;
+        assert!(collection_named(&mut frontend, "halfway").await.is_none());
+        let fork = frontend
+            .fork_collection(fork_request(source.collection_id, "halfway"))
+            .await
+            .unwrap();
+        assert_eq!(count_records(&mut frontend, &fork).await, 5000);
+    }
+
+    // A fork whose client goes away during the copy, as one that times out: the copy goes on, and the fork, once a user
+    // sees it, has every record of the source.
+    #[tokio::test]
+    async fn a_fork_whose_client_goes_away_has_every_record_afterwards() {
+        let mut frontend = sqlite_frontend().await;
+        let source = create_collection_for(&mut frontend, TENANT, DATABASE, "fork_source").await;
+        add_records(&mut frontend, source.collection_id, 5000).await;
+        let given_up = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            frontend.fork_collection(fork_request(source.collection_id, "given_up")),
+        )
+        .await;
+        assert!(
+            given_up.is_err(),
+            "the fork answered before the client went away: the test needs a longer copy"
+        );
+        let forked = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                if let Some(forked) = collection_named(&mut frontend, "given_up").await {
+                    return forked;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the fork never showed");
+        assert_eq!(count_records(&mut frontend, &forked).await, 5000);
+    }
+
     async fn create_collection_for(
         frontend: &mut ServiceBasedFrontend,
         tenant: &str,
@@ -11952,5 +12162,446 @@ mod tests {
 
             assert!(records.is_empty());
         }
+    }
+
+    // Ten records r0 to r9 of a new collection, with their documents: "kind" a for r0 to r4 and b for r5 to r9.
+    async fn ten_records(
+        frontend: &mut ServiceBasedFrontend,
+        name: &str,
+    ) -> (Collection, Vec<String>) {
+        let collection = create_collection_for(frontend, TENANT, DATABASE, name).await;
+        let ids: Vec<String> = (0..10).map(|i| format!("r{i}")).collect();
+        frontend
+            .add(
+                AddCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    ids.clone(),
+                    (0..10).map(|i| vec![i as f32, (i as f32).sin()]).collect(),
+                    Some(
+                        ids.iter()
+                            .map(|id| Some(format!("document of {id}")))
+                            .collect(),
+                    ),
+                    None,
+                    Some(
+                        (0..10)
+                            .map(|i| {
+                                Some(std::collections::HashMap::from([(
+                                    "kind".to_string(),
+                                    MetadataValue::Str(if i < 5 { "a" } else { "b" }.to_string()),
+                                )]))
+                            })
+                            .collect(),
+                    ),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        (collection, ids)
+    }
+
+    fn kind_is(kind: &str) -> Where {
+        Where::Metadata(MetadataExpression {
+            key: "kind".to_string(),
+            comparison: MetadataComparison::Primitive(
+                PrimitiveOperator::Equal,
+                MetadataValue::Str(kind.to_string()),
+            ),
+        })
+    }
+
+    async fn delete_records(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        ids: &[&str],
+    ) {
+        frontend
+            .delete(
+                DeleteCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    Some(ids.iter().map(|id| id.to_string()).collect()),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                "test-region".to_string(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn query_of(collection_id: CollectionUuid, filter: Option<Where>) -> QueryRequest {
+        QueryRequest::try_new(
+            TENANT.to_string(),
+            DATABASE.to_string(),
+            collection_id,
+            None,
+            filter,
+            vec![vec![0.0, 1.0]],
+            10,
+            chroma_types::IncludeList(vec![Include::Document]),
+        )
+        .unwrap()
+    }
+
+    // A search of the ten nearest records, with their scores, among those of a filter.
+    fn dense_search_of(collection_id: CollectionUuid, filter: Option<Where>) -> SearchRequest {
+        SearchRequest::try_new(
+            TENANT.to_string(),
+            DATABASE.to_string(),
+            collection_id,
+            vec![SearchPayload {
+                filter: Filter {
+                    query_ids: None,
+                    where_clause: filter,
+                },
+                rank: chroma_types::operator::Rank {
+                    expr: Some(chroma_types::operator::RankExpr::Knn {
+                        query: chroma_types::operator::QueryVector::Dense(vec![0.0, 1.0]),
+                        key: chroma_types::operator::Key::Embedding,
+                        limit: 10,
+                        default: None,
+                        return_rank: false,
+                    }),
+                },
+                limit: Limit {
+                    offset: 0,
+                    limit: Some(10),
+                },
+                select: chroma_types::operator::Select {
+                    keys: [chroma_types::operator::Key::Score].into_iter().collect(),
+                },
+                ..Default::default()
+            }],
+            chroma_types::plan::ReadLevel::default(),
+        )
+        .unwrap()
+    }
+
+    // The code reached the hold, within 30 s.
+    async fn reached(hold: &chroma_segment::local_hnsw::hooks::Hold, what: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), hold.reached.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{what}"));
+    }
+
+    // A single node on a data folder, with the journal mode of SQLite given, and a collection whose index saves every 2
+    // records, so that the apply of a write of 2 records writes the save to SQLite: r0 to r9, "kind" a for r0 to r4 and b
+    // for r5 to r9.
+    async fn saving_every_two(
+        root: &std::path::Path,
+        journal_mode: chroma_sqlite::config::JournalMode,
+    ) -> (ServiceBasedFrontend, CollectionUuid) {
+        let mut config = FrontendConfig::sqlite_in_memory();
+        let sqlitedb = config.sqlitedb.as_mut().unwrap();
+        sqlitedb.url = Some(root.join("chroma.sqlite3").to_str().unwrap().into());
+        sqlitedb.journal_mode = journal_mode;
+        config.segment_manager.as_mut().unwrap().persist_path = Some(root.to_str().unwrap().into());
+        let mut frontend =
+            ServiceBasedFrontend::try_from_config(&(config, System::new()), &Registry::new())
+                .await
+                .unwrap();
+        let mut configuration = InternalCollectionConfiguration::default_hnsw();
+        if let chroma_types::VectorIndexConfiguration::Hnsw(hnsw) = &mut configuration.vector_index
+        {
+            hnsw.sync_threshold = 2;
+            hnsw.batch_size = 2;
+        }
+        let collection = frontend
+            .create_collection(
+                CreateCollectionRequest::try_new(
+                    TENANT.to_string(),
+                    DatabaseName::new(DATABASE).unwrap(),
+                    "saving_every_two".to_string(),
+                    None,
+                    Some(configuration),
+                    None,
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        frontend
+            .add(records_of(
+                collection.collection_id,
+                (0..10).map(|i| format!("r{i}")).collect(),
+                (0..10).map(|i| if i < 5 { "a" } else { "b" }).collect(),
+            ))
+            .await
+            .unwrap();
+        (frontend, collection.collection_id)
+    }
+
+    // An add of records with their "kind", their documents, and embeddings near the query of query_of.
+    fn records_of(
+        collection_id: CollectionUuid,
+        ids: Vec<String>,
+        kinds: Vec<&str>,
+    ) -> AddCollectionRecordsRequest {
+        AddCollectionRecordsRequest::try_new(
+            TENANT.to_string(),
+            DATABASE.to_string(),
+            collection_id,
+            ids.clone(),
+            (0..ids.len())
+                .map(|i| vec![i as f32, (i as f32).sin()])
+                .collect(),
+            Some(
+                ids.iter()
+                    .map(|id| Some(format!("document of {id}")))
+                    .collect(),
+            ),
+            None,
+            Some(
+                kinds
+                    .into_iter()
+                    .map(|kind| {
+                        Some(std::collections::HashMap::from([(
+                            "kind".to_string(),
+                            MetadataValue::Str(kind.to_string()),
+                        )]))
+                    })
+                    .collect(),
+            ),
+        )
+        .unwrap()
+    }
+
+    // A write of the records given, committed to SQLite and held before the index: the task of the write, and the way
+    // to let it go on.
+    async fn held_before_the_index(
+        held: &str,
+        write: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<chroma_segment::local_hnsw::hooks::Hold>,
+    ) {
+        let apply = chroma_segment::local_hnsw::hooks::hold_apply_of(held);
+        let write = tokio::spawn(write);
+        reached(&apply, "the write never reached the index").await;
+        (write, apply)
+    }
+
+    // A read that answers within 10 s, while a write is held before the index: a read that waited for the index would not.
+    async fn within_ten_seconds<T>(read: impl std::future::Future<Output = T>, what: &str) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(10), read)
+            .await
+            .unwrap_or_else(|_| panic!("{what} waited for the index"))
+    }
+
+    // A search without a filter while a delete has been committed to SQLite and not yet applied to the index: the index
+    // still holds the deleted records. The search answers as its snapshot of SQLite does, without them, and with the
+    // other records, as distributed Chroma excludes from a segment the records that its log deletes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_search_answers_without_the_records_of_a_delete_not_yet_in_the_index() {
+        let mut frontend = sqlite_frontend().await;
+        let (collection, _) = ten_records(&mut frontend, "search_delete_pending").await;
+        let collection_id = collection.collection_id;
+        let mut deleting = frontend.clone();
+        let (delete, apply) = held_before_the_index("r0", async move {
+            delete_records(
+                &mut deleting,
+                collection_id,
+                &["r0", "r1", "r2", "r3", "r4"],
+            )
+            .await
+        })
+        .await;
+        let answered = within_ten_seconds(
+            frontend.search(dense_search_of(collection_id, None)),
+            "the search",
+        )
+        .await;
+        apply.go.notify_one();
+        delete.await.unwrap();
+        let answered = answered.expect("the search failed while a delete was not yet in the index");
+        let mut found = answered.ids[0].clone();
+        found.sort();
+        assert_eq!(found, ["r5", "r6", "r7", "r8", "r9"]);
+    }
+
+    // A search with a filter while an add has been committed to SQLite and not yet applied to the index: the search finds
+    // the new record among the writes that the index does not have yet, as distributed Chroma searches its log, and does
+    // not wait for the index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_search_with_a_filter_finds_a_record_not_yet_in_the_index_without_waiting() {
+        let mut frontend = sqlite_frontend().await;
+        let (collection, _) = ten_records(&mut frontend, "search_add_pending").await;
+        let collection_id = collection.collection_id;
+        let mut adding = frontend.clone();
+        let (add, apply) = held_before_the_index("late", async move {
+            adding
+                .add(records_of(
+                    collection_id,
+                    vec!["late".to_string()],
+                    vec!["a"],
+                ))
+                .await
+                .unwrap();
+        })
+        .await;
+        let answered = within_ten_seconds(
+            frontend.search(dense_search_of(collection_id, Some(kind_is("a")))),
+            "the search",
+        )
+        .await;
+        apply.go.notify_one();
+        add.await.unwrap();
+        let answered = answered.expect("the search failed while an add was not yet in the index");
+        let mut found = answered.ids[0].clone();
+        found.sort();
+        assert_eq!(found, ["late", "r0", "r1", "r2", "r3", "r4"]);
+    }
+
+    // A query with a filter while an add has been committed to SQLite and not yet applied to the index, on a data folder
+    // in each journal mode, with an index that saves every 2 records: the query finds the new record without waiting for
+    // the index. In journal_mode delete a read that waited with its snapshot open held the save of the index, which
+    // writes to SQLite, up to the busy timeout of 1000 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_query_with_a_filter_finds_a_record_not_yet_in_the_index_without_waiting() {
+        for journal_mode in [
+            chroma_sqlite::config::JournalMode::Delete,
+            chroma_sqlite::config::JournalMode::Wal,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut frontend, collection_id) = saving_every_two(root.path(), journal_mode).await;
+            let mut adding = frontend.clone();
+            let (add, apply) = held_before_the_index("late1", async move {
+                adding
+                    .add(records_of(
+                        collection_id,
+                        vec!["late1".to_string(), "late2".to_string()],
+                        vec!["a", "a"],
+                    ))
+                    .await
+                    .unwrap();
+            })
+            .await;
+            let answered = within_ten_seconds(
+                frontend.query(query_of(collection_id, Some(kind_is("a")))),
+                &format!("in journal mode {journal_mode:?}, the query"),
+            )
+            .await;
+            apply.go.notify_one();
+            add.await.unwrap();
+            let answered = answered.unwrap_or_else(|err| {
+                panic!("in journal mode {journal_mode:?}, the query failed: {err}")
+            });
+            let mut found = answered.ids[0].clone();
+            found.sort();
+            assert_eq!(
+                found,
+                ["late1", "late2", "r0", "r1", "r2", "r3", "r4"],
+                "in journal mode {journal_mode:?}"
+            );
+        }
+    }
+
+    // A get with embeddings of a record whose add has been committed to SQLite and not yet applied to the index, on a data
+    // folder in each journal mode: the get answers with its embedding, from the writes that the index does not have yet,
+    // without waiting for the index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_get_with_embeddings_reads_a_record_not_yet_in_the_index_without_waiting() {
+        for journal_mode in [
+            chroma_sqlite::config::JournalMode::Delete,
+            chroma_sqlite::config::JournalMode::Wal,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut frontend, collection_id) = saving_every_two(root.path(), journal_mode).await;
+            let mut adding = frontend.clone();
+            let (add, apply) = held_before_the_index("late1", async move {
+                adding
+                    .add(records_of(
+                        collection_id,
+                        vec!["late1".to_string(), "late2".to_string()],
+                        vec!["a", "a"],
+                    ))
+                    .await
+                    .unwrap();
+            })
+            .await;
+            let got = within_ten_seconds(
+                frontend.get(
+                    GetRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection_id,
+                        Some(vec!["late2".to_string(), "r3".to_string()]),
+                        None,
+                        None,
+                        0,
+                        chroma_types::IncludeList(vec![Include::Embedding]),
+                    )
+                    .unwrap(),
+                ),
+                &format!("in journal mode {journal_mode:?}, the get"),
+            )
+            .await;
+            apply.go.notify_one();
+            add.await.unwrap();
+            let got = got.unwrap_or_else(|err| {
+                panic!("in journal mode {journal_mode:?}, the get failed: {err}")
+            });
+            let mut pairs = got
+                .ids
+                .into_iter()
+                .zip(got.embeddings.expect("embeddings"))
+                .collect::<Vec<_>>();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                pairs,
+                vec![
+                    ("late2".to_string(), vec![1.0, 1f32.sin()]),
+                    ("r3".to_string(), vec![3.0, 3f32.sin()]),
+                ],
+                "in journal mode {journal_mode:?}"
+            );
+        }
+    }
+
+    // A query without a filter while a delete has been committed to SQLite and not yet applied to the index: the index
+    // still holds the deleted records. The query answers as its snapshot of SQLite does, without them, and every record
+    // it gives has its document. Chroma 1.5.9 gives a record that it finds in the index and no longer in SQLite without
+    // its document; distributed Chroma, which excludes from a segment the records that its log deletes, does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_query_gives_no_record_without_its_document_while_a_delete_is_not_yet_in_the_index() {
+        let mut frontend = sqlite_frontend().await;
+        let (collection, _) = ten_records(&mut frontend, "query_delete_pending").await;
+        let collection_id = collection.collection_id;
+        let mut deleting = frontend.clone();
+        let (delete, apply) = held_before_the_index("r0", async move {
+            delete_records(
+                &mut deleting,
+                collection_id,
+                &["r0", "r1", "r2", "r3", "r4"],
+            )
+            .await
+        })
+        .await;
+        let answered =
+            within_ten_seconds(frontend.query(query_of(collection_id, None)), "the query").await;
+        apply.go.notify_one();
+        delete.await.unwrap();
+        let answered = answered.expect("the query failed while a delete was not yet in the index");
+        let documents = answered.documents.expect("documents")[0].clone();
+        let without = answered.ids[0]
+            .iter()
+            .zip(&documents)
+            .filter(|(_, document)| document.is_none())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            without.is_empty(),
+            "records without their document: {without:?}"
+        );
+        let mut found = answered.ids[0].clone();
+        found.sort();
+        assert_eq!(found, ["r5", "r6", "r7", "r8", "r9"]);
     }
 }

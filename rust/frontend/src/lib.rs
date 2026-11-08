@@ -5,6 +5,7 @@ use std::{path::Path, sync::Arc};
 pub mod config;
 #[allow(dead_code)]
 pub mod executor;
+pub mod folder_lock;
 pub mod get_collection_with_segments_provider;
 pub mod impls;
 pub mod quota;
@@ -60,6 +61,25 @@ pub async fn frontend_service_entrypoint(
     frontend_service_entrypoint_with_config(auth, quota_enforcer, &config, init_otel_tracing).await;
 }
 
+// The lock of the data folder of a server of the single node, or the end of the process with its message: a server on
+// a folder that another program holds, a server or an embedded client, waits folder_lock::FOLDER_WAIT, then stops
+// here, before it opens the database.
+async fn hold_folder_for_server(folder: std::path::PathBuf) -> folder_lock::FolderLock {
+    let held = tokio::task::spawn_blocking(move || {
+        folder_lock::lock_folder(&folder, folder_lock::FOLDER_WAIT)
+    })
+    .await
+    .expect("the wait for the lock of the data folder");
+    match held {
+        Ok(lock) => lock,
+        Err(err) => {
+            tracing::error!(error = %err, "The data folder is in use");
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// The configuration of the frontend from the one of the server: on a single node, the folder of the data, the SQLite
 /// file in it and the shortest time between two saves of a local HNSW index, where the frontend block gives none.
 pub fn local_frontend_config(config: &FrontendServerConfig) -> FrontendConfig {
@@ -98,6 +118,17 @@ pub async fn frontend_service_entrypoint_with_config_system_registry(
     config: &FrontendServerConfig,
 ) {
     let fe_cfg = local_frontend_config(config);
+    // The lock of the data folder, held until the server has stopped and closed its database (folder_lock).
+    let mut _held_folder = None;
+    if fe_cfg.sqlitedb.is_some() {
+        if let Some(folder) = fe_cfg
+            .segment_manager
+            .as_ref()
+            .and_then(|manager| manager.persist_path.as_ref())
+        {
+            _held_folder = Some(hold_folder_for_server(folder.into()).await);
+        }
+    }
 
     let frontend = Frontend::try_from_config(&(fe_cfg, system.clone()), &registry)
         .await
