@@ -12604,4 +12604,179 @@ mod tests {
         found.sort();
         assert_eq!(found, ["r5", "r6", "r7", "r8", "r9"]);
     }
+
+    // A write whose client goes away after its commit to the log, before its backfill, as a client that disconnects drops
+    // the future of its request there: the write is in the log, and a get of its record sees it, with no other write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_whose_client_goes_away_after_the_log_is_seen_by_a_get() {
+        let mut frontend = sqlite_frontend().await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "client_goes_away").await;
+        let collection_id = collection.collection_id;
+        let add = |id: &str, embedding: Vec<f32>| {
+            AddCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                vec![id.to_string()],
+                vec![embedding],
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        // A first write gives the collection its dimension and its index.
+        frontend.add(add("r0", vec![0.0, 1.0])).await.unwrap();
+        let hold = chroma_log::sqlite_log::hooks::hold_after_commit(collection_id);
+        let mut adding = frontend.clone();
+        let request = add("gone", vec![1.0, 0.0]);
+        let writing = tokio::spawn(async move { adding.add(request).await });
+        tokio::time::timeout(std::time::Duration::from_secs(30), hold.reached.notified())
+            .await
+            .expect("the write never reached the log");
+        writing.abort();
+        let _ = writing.await;
+        hold.go.notify_one();
+        let mut seen = Vec::new();
+        for _ in 0..50 {
+            seen = frontend
+                .get(
+                    GetRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection_id,
+                        Some(vec!["gone".to_string()]),
+                        None,
+                        None,
+                        0,
+                        chroma_types::IncludeList(vec![]),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .ids;
+            if !seen.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            seen,
+            vec!["gone".to_string()],
+            "a write committed to the log stayed unseen for 5 s, with no other write"
+        );
+    }
+
+    // A get, a count and a query that answer with the records given, and no others.
+    async fn the_reads_see(
+        frontend: &mut ServiceBasedFrontend,
+        collection_id: CollectionUuid,
+        expected: &[&str],
+    ) {
+        let mut got = frontend
+            .get(
+                GetRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    None,
+                    None,
+                    None,
+                    0,
+                    chroma_types::IncludeList(vec![]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .ids;
+        got.sort();
+        assert_eq!(got, expected);
+        let counted = frontend
+            .count(
+                CountRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection_id,
+                    chroma_types::plan::ReadLevel::default(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(counted as usize, expected.len());
+        let mut queried = frontend
+            .query(query_of(collection_id, None))
+            .await
+            .unwrap()
+            .ids
+            .remove(0);
+        queried.sort();
+        assert_eq!(queried, expected);
+    }
+
+    // A write that reaches the log and cannot be applied yet, as on a full disk, is answered as written, as in distributed
+    // Chroma, where the compaction applies the log after the answer: a conditional commit too. Meanwhile the reads answer
+    // with what is applied, and once the records can be applied the next read applies them and sees them.
+    #[tokio::test]
+    async fn a_write_in_the_log_that_cannot_be_applied_yet_is_answered_and_seen_when_it_can() {
+        for spann in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut frontend = frontend_with_spann(root.path(), spann).await;
+            let collection_id = if spann {
+                spann_tail_tests::empty_spann_collection(&mut frontend, "applied_later").await
+            } else {
+                create_collection_for(&mut frontend, TENANT, DATABASE, "applied_later")
+                    .await
+                    .collection_id
+            };
+            add_c(&mut frontend, collection_id).await;
+            let db =
+                sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+                    .await
+                    .unwrap();
+            sqlx::query(
+                "CREATE TRIGGER no_space BEFORE INSERT ON embeddings \
+                 BEGIN SELECT RAISE(ABORT, 'no space'); END",
+            )
+            .execute(&db)
+            .await
+            .unwrap();
+
+            frontend
+                .add(
+                    AddCollectionRecordsRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection_id,
+                        vec!["later".to_string()],
+                        vec![vec![3.0, 4.0]],
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            the_reads_see(&mut frontend, collection_id, &["c"]).await;
+            let token = conditional_get_of_c(&mut frontend, collection_id)
+                .await
+                .occ_read_token
+                .unwrap()
+                .log_upper_bound_offset();
+            commit_after_reading_c(&mut frontend, collection_id, token)
+                .await
+                .unwrap();
+            the_reads_see(&mut frontend, collection_id, &["c"]).await;
+
+            sqlx::query("DROP TRIGGER no_space")
+                .execute(&db)
+                .await
+                .unwrap();
+            the_reads_see(&mut frontend, collection_id, &["c", "d", "later"]).await;
+        }
+    }
 }

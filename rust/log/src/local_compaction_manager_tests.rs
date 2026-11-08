@@ -1,6 +1,6 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
 use super::*;
-use crate::sqlite_log::{LegacyEmbeddingsQueueConfig, SqliteLog, SqlitePushLogsError};
+use crate::sqlite_log::{LegacyEmbeddingsQueueConfig, SqliteLog};
 use chroma_segment::local_segment_manager::LocalSegmentManagerConfig;
 use chroma_sysdb::test_sysdb::TestSysDb;
 use chroma_system::{ComponentHandle, System};
@@ -804,15 +804,7 @@ async fn missing_checkpoint_directory_preserves_logs_and_new_writes() {
         .log
         .push_logs(f.collection.collection_id, vec![operation(5)])
         .await;
-    assert!(
-        matches!(
-            result,
-            Err(SqlitePushLogsError::CompactionError(
-                CompactionManagerError::HnswReaderConstructionError(_)
-            ))
-        ),
-        "{result:?}"
-    );
+    assert!(result.is_ok(), "{result:?}");
     expected.push(LogRecord {
         log_offset: 6,
         record: operation(5),
@@ -1061,15 +1053,7 @@ async fn push_attempts_purge_after_backfill_failure_and_retains_new_records() {
         .log
         .push_logs(f.collection.collection_id, vec![operation(5)])
         .await;
-    assert!(
-        matches!(
-            result,
-            Err(SqlitePushLogsError::CompactionError(
-                CompactionManagerError::HnswReaderConstructionError(_)
-            ))
-        ),
-        "{result:?}"
-    );
+    assert!(result.is_ok(), "{result:?}");
     let mut expected: Vec<_> = original.into_iter().filter(|r| r.log_offset >= 3).collect();
     expected.push(LogRecord {
         log_offset: 6,
@@ -1115,7 +1099,7 @@ async fn a_checkpoint_that_changes_during_inspection_postpones_the_purge() {
 }
 
 #[tokio::test]
-async fn push_returns_purge_failure_when_backfill_succeeds() {
+async fn a_push_is_answered_when_its_purge_fails() {
     let mut f = Fixture::new().await;
     let original = f.seed().await;
     f.checkpoint().await;
@@ -1131,15 +1115,7 @@ async fn push_returns_purge_failure_when_backfill_succeeds() {
         .log
         .push_logs(f.collection.collection_id, vec![operation(5)])
         .await;
-    assert!(
-        matches!(
-            result,
-            Err(SqlitePushLogsError::CompactionError(
-                CompactionManagerError::PurgeLogsFailure
-            ))
-        ),
-        "{result:?}"
-    );
+    assert!(result.is_ok(), "{result:?}");
     let mut expected = original;
     expected.push(LogRecord {
         log_offset: 6,
@@ -1191,7 +1167,7 @@ impl std::io::Write for Capture {
 }
 
 #[tokio::test]
-async fn push_logs_both_failures_but_returns_backfill_error() {
+async fn a_push_is_answered_and_logs_both_failures() {
     // Keep a process-wide subscriber alive: scoped subscriber registration can
     // race with the same callsite firing in parallel tests without a subscriber.
     // Filter captured lines by this test's unique collection to avoid accepting
@@ -1225,15 +1201,7 @@ async fn push_logs_both_failures_but_returns_backfill_error() {
         .log
         .push_logs(f.collection.collection_id, vec![operation(5)])
         .await;
-    assert!(
-        matches!(
-            result,
-            Err(SqlitePushLogsError::CompactionError(
-                CompactionManagerError::HnswReaderConstructionError(_)
-            ))
-        ),
-        "{result:?}"
-    );
+    assert!(result.is_ok(), "{result:?}");
     expected.push(LogRecord {
         log_offset: 6,
         record: operation(5),
@@ -1250,6 +1218,7 @@ async fn push_logs_both_failures_but_returns_backfill_error() {
         output.contains("Failed to purge logs after backfill attempt"),
         "{output}"
     );
+    assert!(output.contains("could not be applied yet"), "{output}");
     assert!(output.contains("Error purging logs"), "{output}");
     assert!(
         output.contains(&f.collection.collection_id.to_string()),
@@ -1268,10 +1237,7 @@ async fn push_to_stopped_compactor_preserves_committed_records() {
         .log
         .push_logs(f.collection.collection_id, vec![operation(5)])
         .await;
-    assert!(
-        matches!(result, Err(SqlitePushLogsError::MessageSendingError(_))),
-        "{result:?}"
-    );
+    assert!(result.is_ok(), "{result:?}");
     expected.push(LogRecord {
         log_offset: 6,
         record: operation(5),
@@ -1359,15 +1325,7 @@ async fn incompatible_index_configuration_never_purges_from_metadata_alone() {
         .log
         .push_logs(f.collection.collection_id, vec![operation(5)])
         .await;
-    assert!(
-        matches!(
-            result,
-            Err(SqlitePushLogsError::CompactionError(
-                CompactionManagerError::HnswReaderConstructionError(_)
-            ))
-        ),
-        "{result:?}"
-    );
+    assert!(result.is_ok(), "{result:?}");
     expected.push(LogRecord {
         log_offset: 6,
         record: operation(5),

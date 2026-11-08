@@ -8,7 +8,10 @@ use chroma_config::{
     Configurable,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteTransactionManager,
+};
+use sqlx::{Connection, TransactionManager};
 use tokio::fs::create_dir_all;
 
 #[cfg(feature = "pyo3")]
@@ -184,6 +187,27 @@ impl Configurable<SqliteDBConfig, SqliteCreationError> for SqliteDb {
                 JournalMode::Delete => SqliteJournalMode::Delete,
             };
             SqlitePoolOptions::new()
+                // SQLite ends by itself a transaction that fills the disk, so the rollback of sqlx fails and the connection
+                // comes back still counted in a transaction. On it the next BEGIN IMMEDIATE is refused, and the savepoint of
+                // a plain begin leaves a real transaction open, with the write lock, until the server stops. Such a
+                // connection is closed, and SQLite frees what it holds. Not for the database in memory below: it lives in
+                // its only connection, and it has no disk to fill.
+                .after_release(|connection, _| {
+                    Box::pin(async move {
+                        if SqliteTransactionManager::get_transaction_depth(connection) > 0 {
+                            // The rollback of a dropped transaction may still be queued.
+                            connection.ping().await?;
+                        }
+                        let usable =
+                            SqliteTransactionManager::get_transaction_depth(connection) == 0;
+                        if !usable {
+                            tracing::warn!(
+                                "Closing a SQLite connection whose transaction could not be rolled back"
+                            );
+                        }
+                        Ok(usable)
+                    })
+                })
                 .connect_with(
                     conn_options
                         .filename(path)
@@ -351,6 +375,78 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         db.close_within(Duration::from_secs(5)).await;
         assert_eq!(files_of(dir.path()), vec!["chroma.sqlite3"]);
+    }
+
+    // Writes more than this connection may hold in the database file: SQLite ends the transaction by itself, as on a full
+    // disk. The connection is back in the pool at the end, past the checks of the pool.
+    async fn a_transaction_ended_by_a_full_disk(db: &SqliteDb) {
+        let mut connection = db.get_conn().acquire().await.unwrap();
+        let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query(&format!("PRAGMA max_page_count = {pages}"))
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let full = sqlx::query("INSERT INTO written VALUES (zeroblob(1048576))")
+            .execute(&mut *transaction)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            full.as_database_error().unwrap().code().as_deref(),
+            Some("13")
+        );
+        drop(transaction);
+        connection.return_to_pool().await;
+    }
+
+    // SQLite ends by itself a transaction that fills the disk, so the rollback of sqlx fails and the connection stays counted
+    // in a transaction. On that connection the next BEGIN IMMEDIATE is refused, so it is not used again, and the writes go
+    // on without a restart.
+    #[tokio::test]
+    async fn a_connection_left_in_a_transaction_by_a_full_disk_is_not_used_again() {
+        for journal_mode in [JournalMode::Wal, JournalMode::Delete] {
+            let (_dir, _, db) = database_file(journal_mode).await;
+            a_transaction_ended_by_a_full_disk(&db).await;
+            // Taken all together, the one that failed is among them if it is still in the pool.
+            let mut connections = Vec::new();
+            for _ in 0..db.get_conn().size() {
+                connections.push(db.get_conn().acquire().await.unwrap());
+            }
+            for connection in &mut connections {
+                let transaction = connection.begin_with("BEGIN IMMEDIATE").await.unwrap();
+                transaction.commit().await.unwrap();
+            }
+            drop(connections);
+            let mut transaction = db.get_conn().begin_with("BEGIN IMMEDIATE").await.unwrap();
+            sqlx::query("INSERT INTO written VALUES (4)")
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+            transaction.commit().await.unwrap();
+            let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM written")
+                .fetch_one(db.get_conn())
+                .await
+                .unwrap();
+            assert_eq!(written, 4);
+            db.close().await;
+        }
+    }
+
+    // A transaction dropped without a commit, as when a request goes away, is rolled back as usual: its connection stays in
+    // the pool, even though the rollback is still queued when the connection comes back.
+    #[tokio::test]
+    async fn a_connection_whose_transaction_was_dropped_stays_in_the_pool() {
+        let (_dir, _, db) = database_file(JournalMode::default()).await;
+        let mut connection = db.get_conn().acquire().await.unwrap();
+        let connections = db.get_conn().size();
+        let transaction = connection.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        drop(transaction);
+        connection.return_to_pool().await;
+        assert_eq!(db.get_conn().size(), connections);
+        db.close().await;
     }
 
     // journal_mode delete keeps the rollback journal of Chroma, for a data path on a network filesystem.
