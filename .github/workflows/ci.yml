@@ -339,6 +339,11 @@ jobs:
         run: >-
           cargo nextest run --profile ci -p worker --lib
           -E 'test(/^execution::operators::(rank|ranked_group_by|select)::tests::/)'
+      - name: Tests of the local storage of the single node
+        # The saves of SPANN on the single node go through rust/storage/src/local.rs; the rest of the crate needs S3 or GCS
+        run: >-
+          cargo nextest run --profile ci -p chroma-storage --lib
+          -E 'test(/^local::tests::/)'
 
   python-tests:
     name: Python tests (single-node)
