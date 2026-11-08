@@ -265,7 +265,7 @@ def test_sync_threshold(settings: Settings) -> None:
 def copy_of_the_folder(folder: str) -> str:
     """A copy of a data folder that another process holds, as its disk has it now: on VecturaDB one program at a time
     uses a data folder. The database through the backup of SQLite, a snapshot under its locks; the folders of the
-    segments as they are, which a write changes before it returns; not the lock of the folder."""
+    segments as they are, with no save of the index in the background at that moment; not the lock of the folder."""
     copy = tempfile.mkdtemp()
     for entry in os.listdir(folder):
         source = os.path.join(folder, entry)
@@ -365,6 +365,8 @@ class PersistEmbeddingsStateMachine(EmbeddingStateMachineBase):
     def persist(self) -> None:
         self.on_state_change(PersistEmbeddingsStateMachineStates.persist)
         collection_name = self.collection.name
+        # The second process reads a copy of the folder: not while a save in the background writes its files.
+        wait_for_hnsw_save(self.client._system, self.collection.id)
         conn1, conn2 = multiprocessing.Pipe()
         ctx = get_multiprocessing_context()  # type: ignore[no-untyped-call]
         p = ctx.Process(
