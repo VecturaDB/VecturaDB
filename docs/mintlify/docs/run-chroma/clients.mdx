@@ -142,6 +142,8 @@ client = chromadb.PersistentClient(path="/path/to/save/to")
 
 The `path` is where Chroma will store its database files on disk, and load them on start. If you don't provide a path, the default is `.chroma`
 
+On VecturaDB, one program at a time uses a data folder: a `PersistentClient`, or a server. A second one on the same folder, in another process or another container, waits up to 30 seconds for it, then refuses with an error that names the folder. To use the data from several processes, for example with `multiprocessing`, run a server on the folder and connect to it with an `HttpClient`.
+
 The client object has a few useful convenience methods.
 
 - `heartbeat()` - returns a nanosecond heartbeat. Useful for making sure the client remains connected.

@@ -11,6 +11,8 @@ In most other cases, vacuuming is unnecessary. **It does not need to be run regu
 
 Vacuuming blocks all reads and writes to your database while it's running, so we recommend shutting down your Chroma server before vacuuming (although it's not strictly required).
 
+On VecturaDB, it is required: one program at a time uses a data folder, and vacuum is one of them. With a server or a `PersistentClient` on the folder, vacuum waits up to 30 seconds for it, then asks you to stop it.
+
 To vacuum your database, run:
 
 ```bash
