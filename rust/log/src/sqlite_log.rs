@@ -901,7 +901,11 @@ impl SqliteLog {
             hooks::after_commit(collection_id).await;
             if let Some(handle) = handle {
                 let backfill_message = BackfillMessage { collection_id };
-                let backfill_result = handle.request(backfill_message, None).await;
+                let backfill_result = handle
+                    .request(backfill_message, None)
+                    .await
+                    .map_err(SqlitePushLogsError::from)
+                    .and_then(|result| result.map_err(SqlitePushLogsError::from));
                 let purge_log_msg = PurgeLogsMessage { collection_id };
                 let purge_result = handle
                     .clone()
@@ -909,7 +913,16 @@ impl SqliteLog {
                     .await
                     .map_err(SqlitePushLogsError::from)
                     .and_then(|result| result.map_err(SqlitePushLogsError::from));
-                // Preserve purge failures even when the backfill error takes precedence.
+                // The write is in the log and is answered as written, as in distributed Chroma, where the compaction applies
+                // the log after the answer. What fails here, as on a full disk, leaves it in the log, and the next read or
+                // write of the collection applies it.
+                if let Err(err) = &backfill_result {
+                    tracing::error!(
+                        collection_id = %collection_id,
+                        error = %err,
+                        "A write in the log could not be applied yet; the next read or write of the collection applies it"
+                    );
+                }
                 if let Err(err) = &purge_result {
                     tracing::error!(
                         collection_id = %collection_id,
@@ -917,8 +930,6 @@ impl SqliteLog {
                         "Failed to purge logs after backfill attempt"
                     );
                 }
-                backfill_result??;
-                purge_result?;
             }
             Ok::<_, SqlitePushLogsError>(())
         })

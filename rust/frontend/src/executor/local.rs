@@ -6,7 +6,8 @@ use chroma_config::{registry::Registry, Configurable};
 use chroma_distance::{normalize, DistanceFunction};
 use chroma_error::{ChromaError, ErrorCodes};
 use chroma_log::{
-    sqlite_log::SqliteLog, BackfillMessage, LocalCompactionManager, Log, PurgeLogsMessage,
+    sqlite_log::SqliteLog, BackfillMessage, CompactionManagerError, LocalCompactionManager, Log,
+    PurgeLogsMessage,
 };
 use chroma_segment::blockfile_record::{
     RecordSegmentReaderOptions, RecordSegmentReaderShard, RecordSegmentReaderShardCreationError,
@@ -278,7 +279,7 @@ impl LocalExecutor {
             }
         }
         // Every read level counts the same records, as for a search: the local writes reach the indexes before they are
-        // acknowledged.
+        // acknowledged, unless they cannot be applied yet, as on a full disk.
         self.try_backfill_collection(&plan.scan.collection_and_segments)
             .await?;
         self.metadata_reader
@@ -421,11 +422,28 @@ impl LocalExecutor {
                 let backfill_msg = BackfillMessage {
                     collection_id: collection_and_segment.collection.collection_id,
                 };
-                self.compactor_handle
+                let applied = self
+                    .compactor_handle
                     .request(backfill_msg, None)
                     .await
-                    .map_err(|err| ExecutorError::BackfillError(Box::new(err)))?
                     .map_err(|err| ExecutorError::BackfillError(Box::new(err)))?;
+                match applied {
+                    // The records that cannot be applied yet, as on a full disk, stay in the log: this read answers with
+                    // what is applied, as a read of distributed Chroma with what is compacted, and the next one applies them.
+                    Err(
+                        err @ (CompactionManagerError::MetadataApplyLogsFailed
+                        | CompactionManagerError::HnswApplyLogsError),
+                    ) => {
+                        tracing::warn!(
+                            collection_id = %collection_and_segment.collection.collection_id,
+                            error = %err,
+                            "The log could not be applied yet; the read answers with what is applied"
+                        );
+                    }
+                    applied => {
+                        applied.map_err(|err| ExecutorError::BackfillError(Box::new(err)))?
+                    }
+                }
             }
             Ok::<_, ExecutorError>(reader)
         }
@@ -442,10 +460,16 @@ impl LocalExecutor {
                 .request(purge_log_msg, None)
                 .await
                 .map_err(|err| ExecutorError::BackfillError(Box::new(err)))
-                .and_then(|result| result.map_err(|err| ExecutorError::BackfillError(Box::new(err))))
         } else {
-            Ok(())
+            Ok(Ok(()))
         };
+        // A purge that cannot delete from the log, as on a full disk, leaves the log as it is: the read answers all the same.
+        let purge_refused = matches!(
+            purge_result,
+            Ok(Err(CompactionManagerError::PurgeLogsFailure))
+        );
+        let purge_result = purge_result
+            .and_then(|result| result.map_err(|err| ExecutorError::BackfillError(Box::new(err))));
         // Preserve purge failures even when the backfill error takes precedence.
         if let Err(err) = &purge_result {
             tracing::error!(
@@ -455,7 +479,9 @@ impl LocalExecutor {
             );
         }
         let reader = backfill_result?;
-        purge_result?;
+        if !purge_refused {
+            purge_result?;
+        }
         Ok(reader)
     }
 
