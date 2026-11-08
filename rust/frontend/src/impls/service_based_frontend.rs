@@ -1862,7 +1862,9 @@ impl ServiceBasedFrontend {
     /// collection, and its log holds only the writes not yet applied. So the sysdb copies the collection and its
     /// segments without their files, then the records of the source are written again into the copy through the local
     /// write path, in storage order. If the copy fails, the new collection is
-    /// removed and the fork fails as a whole.
+    /// removed and the fork fails as a whole. The copy runs in a task of its own, so that a client that goes away, which
+    /// drops this request, does not stop it; until it ends, the reads of the users do not show the new collection, which
+    /// they see whole or not at all, as a fork of distributed Chroma (sysdb migration 00019).
     async fn fork_local(
         &mut self,
         tenant_id: &str,
@@ -1890,43 +1892,114 @@ impl ServiceBasedFrontend {
                 target_collection_name,
             )
             .await?;
-        if let Err(err) = self
-            .copy_records_for_fork(
-                tenant_id,
-                database_name.clone(),
-                source,
-                target_collection_id,
-                cmek,
-            )
-            .await
-        {
-            let segments = [
-                target.metadata_segment.clone(),
-                target.record_segment.clone(),
-                target.vector_segment.clone(),
-            ];
-            if let Err(cleanup) = self
-                .sysdb_client
-                .delete_collection(
-                    tenant_id.to_string(),
-                    database_name,
+        let mut copier = self.clone();
+        let tenant_id = tenant_id.to_string();
+        let copied = target.clone();
+        let copy = tokio::spawn(async move {
+            match copier
+                .copy_records_for_fork(
+                    &tenant_id,
+                    database_name.clone(),
+                    source,
                     target_collection_id,
-                    segments.iter().map(|segment| segment.id).collect(),
+                    cmek,
                 )
                 .await
             {
+                Ok(()) => copier
+                    .sysdb_client
+                    .finish_fork(target_collection_id)
+                    .await
+                    .map_err(ForkCollectionError::Internal),
+                Err(err) => {
+                    copier
+                        .remove_incomplete_fork(&tenant_id, database_name, &copied)
+                        .await;
+                    Err(err)
+                }
+            }
+        });
+        match copy.await {
+            Ok(copied) => copied.map(|()| target),
+            Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+            Err(err) => Err(ForkCollectionError::Internal(Box::new(
+                std::io::Error::other(err),
+            ))),
+        }
+    }
+
+    // The target of a fork that never happened, as one whose copy failed or that a stop left halfway: removed with the
+    // normal deletion, then its row of the lineage, so that the fork does not count among the forks of its lineage. A
+    // target whose deletion fails stays hidden from the users, for the next start.
+    async fn remove_incomplete_fork(
+        &mut self,
+        tenant_id: &str,
+        database_name: DatabaseName,
+        target: &CollectionAndSegments,
+    ) {
+        let target_collection_id = target.collection.collection_id;
+        let segments = [
+            target.metadata_segment.clone(),
+            target.record_segment.clone(),
+            target.vector_segment.clone(),
+        ];
+        match self
+            .sysdb_client
+            .delete_collection(
+                tenant_id.to_string(),
+                database_name,
+                target_collection_id,
+                segments.iter().map(|segment| segment.id).collect(),
+            )
+            .await
+        {
+            Ok(()) => {
+                if let Err(cleanup) = self.sysdb_client.forget_fork(target_collection_id).await {
+                    tracing::warn!(error = %cleanup, "the lineage row of an incomplete fork stays");
+                }
+            }
+            Err(cleanup) => {
                 tracing::error!(error = %cleanup, "Failed to remove an incomplete fork");
             }
-            self.collections_with_segments_provider
-                .collections_with_segments_cache
-                .remove(&target_collection_id)
-                .await;
-            if let Err(cleanup) = self.executor.delete_segments(&segments).await {
-                tracing::warn!(error = %cleanup, "incomplete fork removed; index cleanup will retry");
-            }
-            return Err(err);
         }
-        Ok(target)
+        self.collections_with_segments_provider
+            .collections_with_segments_cache
+            .remove(&target_collection_id)
+            .await;
+        if let Err(cleanup) = self.executor.delete_segments(&segments).await {
+            tracing::warn!(error = %cleanup, "incomplete fork removed; index cleanup will retry");
+        }
+    }
+
+    /// The targets of the forks that a stop left halfway, which no user saw: removed at the start, as a fork that failed
+    /// (sysdb migration 00019).
+    pub(crate) async fn remove_unfinished_forks(&mut self) -> Result<(), Box<dyn ChromaError>> {
+        for target_collection_id in self.sysdb_client.unfinished_forks().await? {
+            match self
+                .sysdb_client
+                .get_collection_with_segments(None, target_collection_id)
+                .await
+            {
+                Ok(target) => {
+                    let tenant_id = target.collection.tenant.clone();
+                    let database_name = DatabaseName::new(target.collection.database.clone())
+                        .ok_or_else(|| -> Box<dyn ChromaError> {
+                            Box::new(GetCollectionWithSegmentsError::NotFound(
+                                target_collection_id.to_string(),
+                            ))
+                        })?;
+                    self.remove_incomplete_fork(&tenant_id, database_name, &target)
+                        .await;
+                }
+                // A stop between the deletion of the target and the one of its row of the lineage.
+                Err(GetCollectionWithSegmentsError::NotFound(_)) => {
+                    self.sysdb_client.forget_fork(target_collection_id).await?
+                }
+                Err(err) => return Err(err.boxed()),
+            }
+            tracing::warn!(collection_id = %target_collection_id, "A fork that a stop left halfway is removed");
+        }
+        Ok(())
     }
 
     async fn copy_records_for_fork(
@@ -4041,7 +4114,7 @@ impl Configurable<(FrontendConfig, System)> for ServiceBasedFrontend {
         let executor =
             Executor::try_from_config(&(config.executor.clone(), system.clone()), registry).await?;
 
-        Ok(ServiceBasedFrontend::new(
+        let mut frontend = ServiceBasedFrontend::new(
             config.allow_reset,
             sysdb,
             collections_with_segments_provider,
@@ -4057,7 +4130,11 @@ impl Configurable<(FrontendConfig, System)> for ServiceBasedFrontend {
             config.tenants_with_transactions_enabled.clone(),
             config.enable_log_scouting,
             config.enable_transactions,
-        ))
+        );
+        if let Err(err) = frontend.remove_unfinished_forks().await {
+            tracing::warn!(error = %err, "the forks that a stop left halfway could not be removed; they stay hidden");
+        }
+        Ok(frontend)
     }
 }
 
@@ -9979,6 +10056,138 @@ mod tests {
         assert_eq!(index_folders(root.path()).len(), 1);
         add_record(&mut frontend, &new, "newer").await;
         assert_eq!(count_records(&mut frontend, &new).await, 2);
+    }
+
+    // The records of a collection, added a thousand at a time, with embeddings of two dimensions.
+    async fn add_records(
+        frontend: &mut ServiceBasedFrontend,
+        collection: CollectionUuid,
+        n: usize,
+    ) {
+        for start in (0..n).step_by(1000) {
+            let ids: Vec<usize> = (start..n.min(start + 1000)).collect();
+            frontend
+                .add(
+                    AddCollectionRecordsRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection,
+                        ids.iter().map(|i| format!("r{i}")).collect(),
+                        ids.iter()
+                            .map(|i| vec![*i as f32, (*i as f32).sin()])
+                            .collect(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    // The collection of that name as a user reads it, by its name.
+    async fn collection_named(
+        frontend: &mut ServiceBasedFrontend,
+        name: &str,
+    ) -> Option<Collection> {
+        frontend
+            .sysdb_client
+            .get_collections(GetCollectionsOptions {
+                name: Some(name.to_string()),
+                tenant: Some(TENANT.to_string()),
+                database_or_topology: Some(DatabaseOrTopology::Database(
+                    DatabaseName::new(DATABASE).unwrap(),
+                )),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .pop()
+    }
+
+    fn fork_request(source: CollectionUuid, name: &str) -> ForkCollectionRequest {
+        ForkCollectionRequest::try_new(
+            TENANT.to_string(),
+            DATABASE.to_string(),
+            source,
+            name.to_string(),
+        )
+        .unwrap()
+    }
+
+    // A fork stopped halfway, as by a kill of the server: the database closes under the copy once the catalog has the
+    // target. After the restart the fork is not there, and the same fork can be done again, whole.
+    #[tokio::test]
+    async fn a_fork_stopped_halfway_is_not_there_after_the_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        let mut frontend = ServiceBasedFrontend::try_from_config(
+            &(persistent_config(root.path(), false), System::new()),
+            &registry,
+        )
+        .await
+        .unwrap();
+        let source = create_collection_for(&mut frontend, TENANT, DATABASE, "fork_source").await;
+        add_records(&mut frontend, source.collection_id, 5000).await;
+        let mut forking = frontend.clone();
+        let source_id = source.collection_id;
+        let fork = tokio::spawn(async move {
+            forking
+                .fork_collection(fork_request(source_id, "halfway"))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !catalog_has(&root.path().join("chroma.sqlite3"), "halfway") {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the fork wrote no target in the catalog");
+        close_the_database(&registry).await;
+        assert!(
+            !fork.is_finished() || fork.await.unwrap().is_err(),
+            "the fork ended before the stop: the test needs a longer copy"
+        );
+        drop(frontend);
+
+        let mut frontend = persistent_frontend(root.path()).await;
+        assert!(collection_named(&mut frontend, "halfway").await.is_none());
+        let fork = frontend
+            .fork_collection(fork_request(source.collection_id, "halfway"))
+            .await
+            .unwrap();
+        assert_eq!(count_records(&mut frontend, &fork).await, 5000);
+    }
+
+    // A fork whose client goes away during the copy, as one that times out: the copy goes on, and the fork, once a user
+    // sees it, has every record of the source.
+    #[tokio::test]
+    async fn a_fork_whose_client_goes_away_has_every_record_afterwards() {
+        let mut frontend = sqlite_frontend().await;
+        let source = create_collection_for(&mut frontend, TENANT, DATABASE, "fork_source").await;
+        add_records(&mut frontend, source.collection_id, 5000).await;
+        let given_up = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            frontend.fork_collection(fork_request(source.collection_id, "given_up")),
+        )
+        .await;
+        assert!(
+            given_up.is_err(),
+            "the fork answered before the client went away: the test needs a longer copy"
+        );
+        let forked = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                if let Some(forked) = collection_named(&mut frontend, "given_up").await {
+                    return forked;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the fork never showed");
+        assert_eq!(count_records(&mut frontend, &forked).await, 5000);
     }
 
     async fn create_collection_for(
