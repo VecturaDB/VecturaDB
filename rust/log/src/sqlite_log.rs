@@ -888,6 +888,8 @@ impl SqliteLog {
             }
         }
         tx.commit().await.map_err(WrappedSqlxError)?;
+        #[cfg(feature = "test-hooks")]
+        hooks::after_commit(collection_id).await;
 
         if let Some(handle) = self.compactor_handle.get() {
             let backfill_message = BackfillMessage { collection_id };
@@ -1316,6 +1318,43 @@ impl Configurable<SqliteLogConfig> for SqliteLog {
             .map_err(|e| e.boxed())?;
 
         Ok(log)
+    }
+}
+
+/// A test hook of the writes to the log: a write of the collection given waits after its commit, before its backfill, so
+/// that a test drops its request there, as a client that goes away.
+#[cfg(feature = "test-hooks")]
+pub mod hooks {
+    use chroma_types::CollectionUuid;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+
+    /// The wait of a write: `reached` after its commit, which then goes on at `go`.
+    #[derive(Debug, Default)]
+    pub struct Hold {
+        pub reached: Notify,
+        pub go: Notify,
+    }
+
+    static HOLDS: Mutex<Vec<(CollectionUuid, Arc<Hold>)>> = Mutex::new(Vec::new());
+
+    /// A hold of the next write of the collection, after its commit to the log.
+    pub fn hold_after_commit(collection_id: CollectionUuid) -> Arc<Hold> {
+        let hold = Arc::new(Hold::default());
+        HOLDS.lock().unwrap().push((collection_id, hold.clone()));
+        hold
+    }
+
+    pub(crate) async fn after_commit(collection_id: CollectionUuid) {
+        let hold = {
+            let mut holds = HOLDS.lock().unwrap();
+            let Some(position) = holds.iter().position(|(id, _)| *id == collection_id) else {
+                return;
+            };
+            holds.remove(position).1
+        };
+        hold.reached.notify_one();
+        hold.go.notified().await;
     }
 }
 

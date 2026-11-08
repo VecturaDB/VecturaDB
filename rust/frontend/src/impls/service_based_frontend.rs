@@ -12604,4 +12604,68 @@ mod tests {
         found.sort();
         assert_eq!(found, ["r5", "r6", "r7", "r8", "r9"]);
     }
+
+    // A write whose client goes away after its commit to the log, before its backfill, as a client that disconnects drops
+    // the future of its request there: the write is in the log, and a get of its record sees it, with no other write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_whose_client_goes_away_after_the_log_is_seen_by_a_get() {
+        let mut frontend = sqlite_frontend().await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "client_goes_away").await;
+        let collection_id = collection.collection_id;
+        let add = |id: &str, embedding: Vec<f32>| {
+            AddCollectionRecordsRequest::try_new(
+                TENANT.to_string(),
+                DATABASE.to_string(),
+                collection_id,
+                vec![id.to_string()],
+                vec![embedding],
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        // A first write gives the collection its dimension and its index.
+        frontend.add(add("r0", vec![0.0, 1.0])).await.unwrap();
+        let hold = chroma_log::sqlite_log::hooks::hold_after_commit(collection_id);
+        let mut adding = frontend.clone();
+        let request = add("gone", vec![1.0, 0.0]);
+        let writing = tokio::spawn(async move { adding.add(request).await });
+        tokio::time::timeout(std::time::Duration::from_secs(30), hold.reached.notified())
+            .await
+            .expect("the write never reached the log");
+        writing.abort();
+        let _ = writing.await;
+        hold.go.notify_one();
+        let mut seen = Vec::new();
+        for _ in 0..50 {
+            seen = frontend
+                .get(
+                    GetRequest::try_new(
+                        TENANT.to_string(),
+                        DATABASE.to_string(),
+                        collection_id,
+                        Some(vec!["gone".to_string()]),
+                        None,
+                        None,
+                        0,
+                        chroma_types::IncludeList(vec![]),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .ids;
+            if !seen.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            seen,
+            vec!["gone".to_string()],
+            "a write committed to the log stayed unseen for 5 s, with no other write"
+        );
+    }
 }

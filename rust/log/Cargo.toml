@@ -4,6 +4,10 @@ name = "chroma-log"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Hooks that tests of other crates use to hold a write at a point of its way to the log.
+test-hooks = []
+
 [dependencies]
 async-trait = { workspace = true }
 backon = { workspace = true }
