@@ -1937,7 +1937,8 @@ fn reconcile_checkpoint(
 // (take_save), and the position in the log that it publishes in SQLite once the files are durable; written without that
 // lock (write_files), with the lock of the files held until it ends (finish).
 struct Save {
-    files: tokio::sync::OwnedMutexGuard<()>,
+    // Held for as long as the save lasts, and never read: it is what keeps the lock of the files.
+    _files: tokio::sync::OwnedMutexGuard<()>,
     folder: std::path::PathBuf,
     journal: Vec<u8>,
     seq_id: u64,
@@ -1982,7 +1983,7 @@ fn take_save(
     guard.recovery_checkpoint_pending = false;
     guard.last_persist = Some(tokio::time::Instant::now());
     Ok(Save {
-        files,
+        _files: files,
         folder: folder.into(),
         journal,
         seq_id: guard.last_seen_seq_id,
