@@ -54,6 +54,10 @@ pub struct LocalSegmentManagerConfig {
     #[serde(default = "default_hnsw_index_pool_cache_config")]
     pub hnsw_index_pool_cache_config: CacheConfig,
     pub persist_path: Option<String>,
+    /// The shortest time, in seconds, between two saves of a local HNSW index after its first one, whatever
+    /// `sync_threshold` says; 30 without it, and 0 saves at every threshold, as Chroma 1.5.9 does.
+    #[serde(default)]
+    pub hnsw_min_save_interval_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -68,6 +72,8 @@ pub struct LocalSegmentManager {
     cleanup_task: Option<Arc<CleanupTask>>,
     sqlite: SqliteDb,
     persist_root: Option<String>,
+    // The shortest time between two saves of the local HNSW indexes it opens: see hnsw_min_save_interval_seconds.
+    hnsw_min_save_interval: std::time::Duration,
     spann_provider: Option<SpannProvider>,
     // The providers of the local compactor: see compaction_spann_provider.
     compaction_spann_provider: Option<SpannProvider>,
@@ -346,6 +352,10 @@ impl Configurable<LocalSegmentManagerConfig> for LocalSegmentManager {
             cleanup_task: None,
             sqlite: sqldb,
             persist_root: config.persist_path.clone(),
+            hnsw_min_save_interval: config
+                .hnsw_min_save_interval_seconds
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(crate::local_hnsw::SAVE_INTERVAL),
             spann_provider,
             compaction_spann_provider,
             spann_applied: Arc::default(),
@@ -436,9 +446,31 @@ impl LocalSegmentManager {
                 .await?;
             return Ok(());
         }
+        // The save in the background of an instance no longer live may still write the files.
+        let _files = crate::local_hnsw::files_lock(&path)
+            .try_lock_owned()
+            .map_err(|_| crate::local_hnsw::save_in_flight())?;
         tokio::task::spawn_blocking(move || validate_checkpoint(&path, watermark).map(|_| ()))
             .await
             .map_err(io::Error::other)?
+    }
+
+    /// Whether a save in the background writes the files of the local HNSW index of the segment now.
+    pub fn hnsw_save_in_flight(&self, segment: SegmentUuid) -> bool {
+        match &self.persist_root {
+            Some(root) => crate::local_hnsw::files_lock(&Path::new(root).join(segment.to_string()))
+                .try_lock()
+                .is_err(),
+            None => false,
+        }
+    }
+
+    /// Waits for the save in the background that writes the files of the local HNSW index of the segment, if one does.
+    pub async fn wait_for_hnsw_save(&self, segment: SegmentUuid) {
+        if let Some(root) = &self.persist_root {
+            let folder = Path::new(root).join(segment.to_string());
+            drop(crate::local_hnsw::files_lock(&folder).lock().await);
+        }
     }
 
     pub async fn get_hnsw_reader(
@@ -480,6 +512,10 @@ impl LocalSegmentManager {
             self.sqlite.clone(),
         )
         .await?;
+        reader
+            .index
+            .set_save_interval(self.hnsw_min_save_interval)
+            .await;
         live.insert(index_uuid, Arc::downgrade(&reader.index.inner));
         self.hnsw_index_pool
             .insert(index_uuid, reader.index.clone())
@@ -592,6 +628,10 @@ impl LocalSegmentManager {
             self.sqlite.clone(),
         )
         .await?;
+        writer
+            .index
+            .set_save_interval(self.hnsw_min_save_interval)
+            .await;
         live.insert(index_uuid, Arc::downgrade(&writer.index.inner));
         self.hnsw_index_pool
             .insert(index_uuid, writer.index.clone())
@@ -648,7 +688,10 @@ impl LocalSegmentManager {
         self.live_indexes.lock(&id).await.remove(&id);
         self.hnsw_index_pool.remove(&id).await;
         if let Some(root) = &self.persist_root {
-            match tokio::fs::remove_dir_all(Path::new(root).join(segment_id.to_string())).await {
+            let folder = Path::new(root).join(segment_id.to_string());
+            // After the save in the background that writes the files, if any: removed under its lock, they stay removed.
+            let _files = crate::local_hnsw::files_lock(&folder).lock_owned().await;
+            match tokio::fs::remove_dir_all(&folder).await {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err.into()),
@@ -1128,6 +1171,7 @@ mod tests {
         let config = LocalSegmentManagerConfig {
             hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
             persist_path: Some(root.path().to_str().unwrap().to_string()),
+            hnsw_min_save_interval_seconds: None,
         };
         let open = || async {
             let registry = Registry::new();
@@ -1263,6 +1307,7 @@ mod tests {
             &LocalSegmentManagerConfig {
                 hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                 persist_path: Some(root.path().to_str().unwrap().to_string()),
+                hnsw_min_save_interval_seconds: None,
             },
             &registry,
         )
@@ -1372,6 +1417,7 @@ mod tests {
             &LocalSegmentManagerConfig {
                 hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                 persist_path: Some(root.path().to_str().unwrap().to_string()),
+                hnsw_min_save_interval_seconds: None,
             },
             &registry,
         )
@@ -1408,6 +1454,7 @@ mod tests {
             &LocalSegmentManagerConfig {
                 hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                 persist_path: Some(root.path().to_str().unwrap().to_string()),
+                hnsw_min_save_interval_seconds: None,
             },
             &registry,
         )
@@ -1461,6 +1508,7 @@ mod tests {
             &LocalSegmentManagerConfig {
                 hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                 persist_path: Some(root.path().to_str().unwrap().to_string()),
+                hnsw_min_save_interval_seconds: None,
             },
             &registry,
         )
@@ -1530,6 +1578,7 @@ mod tests {
             &LocalSegmentManagerConfig {
                 hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                 persist_path: Some(root.path().to_str().unwrap().to_string()),
+                hnsw_min_save_interval_seconds: None,
             },
             &registry,
         )
@@ -1551,6 +1600,7 @@ mod tests {
             &LocalSegmentManagerConfig {
                 hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                 persist_path: Some(root.path().to_str().unwrap().to_string()),
+                hnsw_min_save_interval_seconds: None,
             },
             &registry,
         )
@@ -1696,6 +1746,7 @@ mod tests {
                 &LocalSegmentManagerConfig {
                     hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                     persist_path,
+                    hnsw_min_save_interval_seconds: None,
                 },
                 &registry,
             )
@@ -1721,6 +1772,7 @@ mod tests {
             &LocalSegmentManagerConfig {
                 hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                 persist_path: Some(root.path().to_str().unwrap().to_string()),
+                hnsw_min_save_interval_seconds: None,
             },
             &registry,
         )
@@ -1765,7 +1817,13 @@ mod tests {
             io::ErrorKind::NotFound
         );
         writer.index.set_sync_threshold(1).await;
+        // The deletion below saves too, as before SAVE_INTERVAL.
+        writer
+            .index
+            .set_save_interval(std::time::Duration::ZERO)
+            .await;
         writer.apply_log_chunk(add(1, "a")).await.unwrap();
+        writer.index.wait_for_save().await;
         manager
             .validate_persisted_checkpoint(&segment.id, 0)
             .await
@@ -1787,6 +1845,7 @@ mod tests {
             ))
             .await
             .unwrap();
+        writer.index.wait_for_save().await;
         // Tombstoned native slots with no live vectors are still a usable checkpoint.
         manager
             .validate_persisted_checkpoint(&segment.id, 0)
@@ -1826,6 +1885,7 @@ mod tests {
         let config = LocalSegmentManagerConfig {
             hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
             persist_path: Some(root.path().to_str().unwrap().to_owned()),
+            hnsw_min_save_interval_seconds: None,
         };
         let registry = Registry::new();
         registry.register(sqlite.clone());
@@ -1883,6 +1943,8 @@ mod tests {
                 .unwrap();
             writer.index.set_sync_threshold(1).await;
             writer.apply_log_chunk(add(2, "b")).await.unwrap();
+            // The save runs in the background; the check below loads the files.
+            writer.index.wait_for_save().await;
             assert_eq!(writer.index.applied_state().await, (2, 2));
         }
         // Reopen the checkpoints to verify that closing streams after saves
@@ -1910,6 +1972,7 @@ mod tests {
         let config = LocalSegmentManagerConfig {
             hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
             persist_path: Some(root.path().to_str().unwrap().to_string()),
+            hnsw_min_save_interval_seconds: None,
         };
         let registry = Registry::new();
         registry.register(sqlite.clone());
@@ -1945,6 +2008,11 @@ mod tests {
         let second = second.unwrap();
         assert!(Arc::ptr_eq(&first.index.inner, &second.index.inner));
         first.index.set_sync_threshold(1).await;
+        // A save at every record, as before SAVE_INTERVAL.
+        first
+            .index
+            .set_save_interval(std::time::Duration::ZERO)
+            .await;
         first.apply_log_chunk(add(1, "a")).await.unwrap();
 
         // Evict while a caller still holds the index. The listener closes its
@@ -1975,5 +2043,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reader.index.applied_state().await, (2, 2));
+    }
+
+    // hnsw_min_save_interval_seconds reaches the indexes that the manager opens: at 0 an index saves at every threshold,
+    // as Chroma 1.5.9 does; without it, the save after the first waits for the 30 seconds of SAVE_INTERVAL, and the
+    // position in SQLite stays at the first one.
+    #[tokio::test]
+    async fn the_min_save_interval_of_the_config_reaches_the_indexes() {
+        for (seconds, position) in [(Some(0), Some(2)), (None, Some(1))] {
+            let root = tempfile::tempdir().unwrap();
+            let sqlite = get_new_sqlite_db().await;
+            let config = LocalSegmentManagerConfig {
+                hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
+                persist_path: Some(root.path().to_str().unwrap().to_string()),
+                hnsw_min_save_interval_seconds: seconds,
+            };
+            let registry = Registry::new();
+            registry.register(sqlite.clone());
+            let manager = LocalSegmentManager::try_from_config(&config, &registry)
+                .await
+                .unwrap();
+            let mut collection = Collection::test_collection(3);
+            collection.schema = Some(Schema::new_default(KnnIndex::Hnsw));
+            let segment = Segment {
+                id: SegmentUuid::new(),
+                r#type: SegmentType::HnswLocalPersisted,
+                scope: SegmentScope::VECTOR,
+                collection: collection.collection_id,
+                metadata: None,
+                file_path: Default::default(),
+            };
+            sqlx::query("INSERT INTO segments (id, type, scope, collection) VALUES (?, ?, ?, ?)")
+                .bind(segment.id.to_string())
+                .bind("urn:chroma:segment/vector/hnsw-local-persisted")
+                .bind("VECTOR")
+                .bind(collection.collection_id.to_string())
+                .execute(sqlite.get_conn())
+                .await
+                .unwrap();
+            let mut writer = manager
+                .get_hnsw_writer(&collection, &segment, 3)
+                .await
+                .unwrap();
+            writer.index.set_sync_threshold(1).await;
+            for (seq_id, id) in [(1, "a"), (2, "b")] {
+                writer.apply_log_chunk(add(seq_id, id)).await.unwrap();
+                writer.index.wait_for_save().await;
+            }
+            let saved: Option<i64> =
+                sqlx::query_scalar("SELECT seq_id FROM max_seq_id WHERE segment_id = ?")
+                    .bind(segment.id.to_string())
+                    .fetch_optional(sqlite.get_conn())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                saved, position,
+                "hnsw_min_save_interval_seconds {seconds:?}"
+            );
+            writer.index.close().await;
+        }
     }
 }

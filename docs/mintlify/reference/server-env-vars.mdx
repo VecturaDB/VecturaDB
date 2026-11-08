@@ -23,6 +23,7 @@ These are the main environment variables for a current self-hosted Chroma server
 | `CHROMA_SQLITEDB__MIGRATION_MODE` | SQLite migration mode | Allowed values: `apply`, `validate`. Default: `apply`. |
 | `CHROMA_SQLITEDB__HASH_TYPE` | SQLite migration hash algorithm | Allowed values: `md5`, `sha256`. Default: `md5`. |
 | `CHROMA_SQLITE_FILENAME` | SQLite file name under the persist path | Default: `chroma.sqlite3`. |
+| `CHROMA_HNSW_MIN_SAVE_INTERVAL_SECONDS` | VecturaDB: the shortest time, in seconds, between two saves of a local HNSW index after its first one, whatever `sync_threshold` says. The records after the last save stay in the log of SQLite, which the next start applies again. Also `hnsw_min_save_interval_seconds` in the YAML, and `chroma_hnsw_min_save_interval_seconds` in the Settings of Python. | Default: `30`. `0` saves at every `sync_threshold`, as Chroma 1.5.9 does, in the background. |
 
 These are specifically for OpenTelemetry:
 

@@ -1,5 +1,7 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
-use crate::errors::{ChromaPyResult, InvalidDatabaseNameError, WrappedPyErr, WrappedUuidError};
+use crate::errors::{
+    ChromaPyError, ChromaPyResult, InvalidDatabaseNameError, WrappedPyErr, WrappedUuidError,
+};
 use chroma_api_types::{OccReadMode, OccReadToken};
 use chroma_cache::FoyerCacheConfig;
 use chroma_cli::chroma_cli;
@@ -14,12 +16,12 @@ use chroma_frontend::{
 };
 use chroma_log::{
     config::{LogConfig, SqliteLogConfig},
-    LocalCompactionManager,
+    LocalCompactionManager, PurgeLogsMessage,
 };
-use chroma_segment::local_segment_manager::LocalSegmentManagerConfig;
+use chroma_segment::local_segment_manager::{LocalSegmentManager, LocalSegmentManagerConfig};
 use chroma_sqlite::config::SqliteDBConfig;
 use chroma_sqlite::db::SqliteDb;
-use chroma_sysdb::{SqliteSysDbConfig, SysDbConfig};
+use chroma_sysdb::{SqliteSysDbConfig, SysDb, SysDbConfig};
 use chroma_system::{ComponentHandle, System};
 use chroma_types::{
     Collection, CollectionConfiguration, CollectionMetadataUpdate, ConditionalBufferedWrite,
@@ -49,6 +51,9 @@ pub(crate) struct Bindings {
     compactor_handle: ComponentHandle<LocalCompactionManager>,
     // The manager as the registry keeps it, whose work out of the actor a close waits for.
     compactor: LocalCompactionManager,
+    // The indexes and the catalog that _wait_for_hnsw_save reads.
+    segment_manager: LocalSegmentManager,
+    sysdb: SysDb,
     frontend: Frontend,
     closed: bool,
     // The lock of the data folder: one program at a time, a server or an embedded client (chroma_frontend::folder_lock).
@@ -448,12 +453,13 @@ pub fn cli(py: Python<'_>, py_args: Option<Vec<String>>) -> ChromaPyResult<()> {
 #[pymethods]
 impl Bindings {
     #[new]
-    #[pyo3(signature = (allow_reset, sqlite_db_config, hnsw_cache_size, persist_path=None))]
+    #[pyo3(signature = (allow_reset, sqlite_db_config, hnsw_cache_size, persist_path=None, hnsw_min_save_interval_seconds=None))]
     pub fn py_new(
         allow_reset: bool,
         sqlite_db_config: SqliteDBConfig,
         hnsw_cache_size: usize,
         persist_path: Option<String>,
+        hnsw_min_save_interval_seconds: Option<u64>,
         py: Python<'_>,
     ) -> ChromaPyResult<Self> {
         // Before the database opens: on a folder that another program holds, the client waits FOLDER_WAIT, then refuses.
@@ -482,6 +488,7 @@ impl Bindings {
         let segment_manager_config = LocalSegmentManagerConfig {
             hnsw_index_pool_cache_config: cache_config,
             persist_path,
+            hnsw_min_save_interval_seconds,
         };
 
         // TODO: consume the log configuration from the input python
@@ -541,6 +548,8 @@ impl Bindings {
         let sqlite_db = registry.get::<SqliteDb>()?;
         let compactor_handle = registry.get::<ComponentHandle<LocalCompactionManager>>()?;
         let compactor = registry.get::<LocalCompactionManager>()?;
+        let segment_manager = registry.get::<LocalSegmentManager>()?;
+        let sysdb = registry.get::<SysDb>()?;
 
         Ok(Bindings {
             runtime,
@@ -548,6 +557,8 @@ impl Bindings {
             sqlite_db,
             compactor_handle,
             compactor,
+            segment_manager,
+            sysdb,
             frontend,
             closed: false,
             folder_lock,
@@ -1615,6 +1626,28 @@ impl Bindings {
         Ok(response)
     }
 
+    /// For the tests of Chroma that read the files of an index or the log of SQLite right after a write: a write
+    /// returns before the save of the local HNSW index that it started in the background, and before the purge of the
+    /// log asked during that save, which comes after it. This waits for that save, then makes that purge.
+    fn _wait_for_hnsw_save(&self, collection_id: String) -> ChromaPyResult<()> {
+        let collection_id = chroma_types::CollectionUuid(
+            uuid::Uuid::parse_str(&collection_id).map_err(WrappedUuidError)?,
+        );
+        let mut sysdb = self.sysdb.clone();
+        self.runtime.block_on(async {
+            let segments = sysdb
+                .get_collection_with_segments(None, collection_id)
+                .await?;
+            self.segment_manager
+                .wait_for_hnsw_save(segments.vector_segment.id)
+                .await;
+            self.compactor_handle
+                .request(PurgeLogsMessage { collection_id }, None)
+                .await??;
+            Ok::<(), ChromaPyError>(())
+        })
+    }
+
     fn reset(&self) -> ChromaPyResult<bool> {
         let mut frontend = self.frontend.clone();
         self.runtime.block_on(async { frontend.reset().await })?;
@@ -1700,7 +1733,7 @@ mod tests {
         static PYTHON_INIT: std::sync::Once = std::sync::Once::new();
         PYTHON_INIT.call_once(pyo3::prepare_freethreaded_python);
         let bindings = Python::with_gil(|py| {
-            Bindings::py_new(true, sqlite_db_config, 16, Some(persist_path), py)
+            Bindings::py_new(true, sqlite_db_config, 16, Some(persist_path), None, py)
         })
         .expect("persistent bindings");
 

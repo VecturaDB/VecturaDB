@@ -35,6 +35,8 @@ async fn fixture() -> (
     )
     .await
     .unwrap();
+    // These tests save at every sync_threshold, as before SAVE_INTERVAL.
+    writer.index.set_save_interval(Duration::ZERO).await;
     (root, sqlite, collection, segment, writer)
 }
 
@@ -261,6 +263,7 @@ proptest! {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (root, sqlite, collection, segment, mut writer) = fixture().await;
             writer.apply_log_chunk(Chunk::new(vec![record(42, 1, 0)].into())).await.unwrap();
+            writer.index.wait_for_save().await;
             let mut guard = writer.index.inner.write().await;
             guard.id_map.max_seq_id = Some(42);
             drop(persist(guard).await.unwrap());
@@ -442,6 +445,7 @@ async fn interrupted_checkpoints_replay_add_update_and_delete() {
                     .apply_log_chunk(Chunk::new(vec![record(3, 9, 2)].into()))
                     .await
                     .unwrap();
+                writer.index.wait_for_save().await;
                 writer.index.inner.write().await.sync_threshold = 1000;
             }
             let tail = vec![record(4, 1, 2), record(5, 2, 3), record(6, 3, 0)];
@@ -819,6 +823,7 @@ async fn validation_reads_each_index_file_at_once() {
         .apply_log_chunk(Chunk::new(records.into()))
         .await
         .unwrap();
+    writer.index.wait_for_save().await;
     drop(persist(writer.index.inner.write().await).await.unwrap());
     writer.index.close().await;
     drop(writer);
@@ -863,16 +868,18 @@ async fn checkpoint_offset_prevents_replaying_ignored_updates_after_restart() {
                     .apply_log_chunk(Chunk::new(vec![record(1, 9, 0)].into()))
                     .await
                     .unwrap();
+                writer.index.wait_for_save().await;
             }
             writer.index.inner.write().await.sync_threshold = 2;
             // The update is ignored because ID 1 does not exist until the add.
             let chunk = Chunk::new(vec![record(2, 1, 2), record(3, 1, 0)].into());
             sqlx::query("CREATE TRIGGER reject_checkpoint BEFORE INSERT ON max_seq_id BEGIN SELECT RAISE(ABORT, 'checkpoint failure'); END")
                 .execute(sqlite.get_conn()).await.unwrap();
-            assert!(matches!(
-                writer.apply_log_chunk(chunk.clone()).await,
-                Err(LocalHnswSegmentWriterError::MaxSeqIdUpdateError(_))
-            ));
+            // The save writes the files in the background and fails to publish its position in SQLite: the apply does
+            // not wait for it, and its error goes to the log of the server.
+            writer.apply_log_chunk(chunk.clone()).await.unwrap();
+            writer.index.wait_for_save().await;
+            assert!(writer.index.inner.read().await.recovery_checkpoint_pending);
             assert_eq!(
                 get_current_seq_id(&segment, &sqlite).await.unwrap(),
                 u64::from(existing_watermark)
@@ -1127,6 +1134,7 @@ async fn checkpoint_validation_reuses_successful_saves_and_detects_external_chan
         .apply_log_chunk(Chunk::new(vec![record(1, 1, 0)].into()))
         .await
         .unwrap();
+    writer.index.wait_for_save().await;
     let path = root.path().join(segment.id.to_string());
     assert!(writer
         .index
@@ -1143,6 +1151,7 @@ async fn checkpoint_validation_reuses_successful_saves_and_detects_external_chan
             .apply_log_chunk(Chunk::new(vec![record(offset, 1, 1)].into()))
             .await
             .unwrap();
+        writer.index.wait_for_save().await;
         assert!(
             !writer
                 .index
@@ -1164,6 +1173,7 @@ async fn checkpoint_validation_reuses_successful_saves_and_detects_external_chan
         .apply_log_chunk(Chunk::new(vec![record(6, 1, 1)].into()))
         .await
         .unwrap();
+    writer.index.wait_for_save().await;
     assert!(writer
         .index
         .validate_persisted_checkpoint(&path, 0)
@@ -1200,10 +1210,14 @@ async fn checkpoint_validation_reuses_successful_saves_and_detects_external_chan
     let saved = std::fs::read(&pickle).unwrap();
     std::fs::remove_file(&pickle).unwrap();
     std::fs::create_dir(&pickle).unwrap();
-    assert!(writer
+    // The save in the background fails: the apply does not wait for it, its error goes to the log of the server, and
+    // the next apply saves again.
+    writer
         .apply_log_chunk(Chunk::new(vec![record(7, 1, 1)].into()))
         .await
-        .is_err());
+        .unwrap();
+    writer.index.wait_for_save().await;
+    assert!(writer.index.inner.read().await.recovery_checkpoint_pending);
     assert!(writer
         .index
         .inner
@@ -1218,6 +1232,7 @@ async fn checkpoint_validation_reuses_successful_saves_and_detects_external_chan
         .apply_log_chunk(Chunk::new(vec![].into()))
         .await
         .unwrap();
+    writer.index.wait_for_save().await;
     assert!(writer
         .index
         .validate_persisted_checkpoint(&path, 0)
@@ -1247,6 +1262,7 @@ async fn journal_fixture() -> (
         .apply_log_chunk(Chunk::new(first.into()))
         .await
         .unwrap();
+    writer.index.wait_for_save().await;
     writer.index.inner.write().await.sync_threshold = 1000;
     let tail: Vec<_> = (21..=60)
         .map(|id| record(id, id as u8, 0))

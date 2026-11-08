@@ -179,6 +179,9 @@ pub struct LocalCompactionManager {
     sync_retries: attached_functions::run::SyncRetries,
     // The storage of local_compaction_manager: storage, when set, for the files of the attached functions.
     function_storage: Option<chroma_storage::Storage>,
+    // The vector segment whose last purge found a save in the background writing the files of its index: the purge comes
+    // again once the save ends (Handler<PurgeLogsMessage>), out of the actor meanwhile.
+    purge_after_save: Option<SegmentUuid>,
 }
 
 // The purges asked, run together once the interval has passed since the last ones.
@@ -450,6 +453,7 @@ impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
             function_runs: FunctionRuns::default(),
             sync_retries: Default::default(),
             function_storage,
+            purge_after_save: None,
         };
         registry.register(res.clone());
         Ok(res)
@@ -923,7 +927,7 @@ impl Handler<PurgeLogsMessage> for LocalCompactionManager {
     async fn handle(
         &mut self,
         message: PurgeLogsMessage,
-        _: &ComponentContext<LocalCompactionManager>,
+        ctx: &ComponentContext<LocalCompactionManager>,
     ) -> Self::Result {
         // Every write, and every read that backfilled, asks for a purge. A collection without conditional transactions
         // keeps no record once applied: its purge runs now, on the few records since the last one, as in Chroma 1.5.9.
@@ -933,7 +937,21 @@ impl Handler<PurgeLogsMessage> for LocalCompactionManager {
             _ => false,
         };
         if !on_the_timer {
-            return self.purge_requested(message.collection_id).await;
+            let result = self.purge_requested(message.collection_id).await;
+            // A save in the background wrote the files of the index: the purge comes again once it ends, as the write that
+            // asked for it had come after it.
+            if let Some(segment) = self.purge_after_save.take() {
+                let manager = self.hnsw_segment_manager.clone();
+                let purge = ctx.receiver::<PurgeLogsMessage>();
+                let collection_id = message.collection_id;
+                self.background.spawn(async move {
+                    manager.wait_for_hnsw_save(segment).await;
+                    if let Err(err) = purge.send(PurgeLogsMessage { collection_id }, None).await {
+                        tracing::error!(collection_id = %collection_id, error = %err, "The purge after a save did not reach the compaction manager");
+                    }
+                });
+            }
+            return result;
         }
         self.purges.request(message.collection_id);
         Ok(())
@@ -1474,6 +1492,10 @@ impl LocalCompactionManager {
             return Ok(());
         }
         self.purge_logs(collection_id).await?;
+        // A purge that waits for a save in the background is not done: it comes again after the save.
+        if self.purge_after_save.is_some() {
+            return Ok(());
+        }
         if self.purged.len() >= MAX_PURGED_COLLECTIONS {
             self.purged.clear();
         }
@@ -1489,6 +1511,16 @@ impl LocalCompactionManager {
             .sysdb
             .get_collection_with_segments(None, collection_id)
             .await?;
+        // A save in the background of the vector index has not published its position in SQLite yet, and its files cannot
+        // be inspected: the purge comes again after it (purge_after_save), as the write that asked had come after it.
+        if collection_segments.vector_segment.r#type != SegmentType::Spann
+            && self
+                .hnsw_segment_manager
+                .hnsw_save_in_flight(collection_segments.vector_segment.id)
+        {
+            self.purge_after_save = Some(collection_segments.vector_segment.id);
+            return Ok(());
+        }
         // Read durable watermarks without loading HNSW, but do not trust a
         // watermark when its checkpoint has since become unusable.
         let max_seq_id = max_purge_seq_id(
@@ -1529,6 +1561,13 @@ impl LocalCompactionManager {
                 .await
             {
                 Ok(()) => {}
+                // A save in the background writes the files: nothing is purged without a verification, so the purge
+                // comes again after the save (purge_after_save), instead of holding the compactor until it ends. A purge
+                // of the timer comes again at the next round.
+                Err(err) if chroma_segment::local_hnsw::is_save_in_flight(&err) => {
+                    self.purge_after_save = Some(collection_segments.vector_segment.id);
+                    return Ok(());
+                }
                 // The checkpoint could not be verified now, as when a network file system reports its attributes
                 // late: nothing is purged without a verification, so the purge waits for the next write.
                 Err(err) if chroma_segment::local_hnsw::is_checkpoint_changed(&err) => {

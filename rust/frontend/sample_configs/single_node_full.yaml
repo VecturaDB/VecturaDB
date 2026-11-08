@@ -16,6 +16,7 @@ cors_allow_origins: ["*"]
 # General settings #
 ####################
 persist_path: "./chroma"
+hnsw_min_save_interval_seconds: 30 # the shortest time between two saves of a local HNSW index; 0 saves at every sync_threshold
 allow_reset: false # defaults to false
 sqlitedb:
   hash_type: "md5" # or "sha256"

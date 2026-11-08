@@ -131,6 +131,7 @@ class RustBindingsAPI(ServerAPI):
             sqlite_db_config=sqlite_config,
             persist_path=persist_path,
             hnsw_cache_size=self.hnsw_cache_size,
+            hnsw_min_save_interval_seconds=self._system.settings.chroma_hnsw_min_save_interval_seconds,
         )
 
     @override
@@ -866,6 +867,11 @@ class RustBindingsAPI(ServerAPI):
             first_inserted_record_offset=result.first_inserted_record_offset,
             record_count=result.record_count,
         )
+
+    def _wait_for_hnsw_save(self, collection_id: UUID) -> None:
+        """For tests that read the files of an index or the log right after a write: the save of the index that the
+        write started in the background, then the purge of the log that comes after it."""
+        self.bindings._wait_for_hnsw_save(str(collection_id))
 
     @override
     def reset(self) -> bool:

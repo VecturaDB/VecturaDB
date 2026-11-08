@@ -392,11 +392,14 @@ fn run_history(sync_threshold: usize, history: &[Action]) {
                     let c = &collections[slot];
                     running.runtime.block_on(async {
                         let db = running.registry.get::<SqliteDb>().unwrap();
-                        let before: i64 =
-                            sqlx::query_scalar("SELECT COUNT(*) FROM embeddings_queue")
-                                .fetch_one(db.get_conn())
-                                .await
-                                .unwrap();
+                        // The last record of the log, which no purge removes: a purge that comes after a save in the
+                        // background may remove older ones meanwhile.
+                        let before: i64 = sqlx::query_scalar(
+                            "SELECT COALESCE(MAX(seq_id), 0) FROM embeddings_queue",
+                        )
+                        .fetch_one(db.get_conn())
+                        .await
+                        .unwrap();
                         assert!(running
                             .frontend
                             .add(
@@ -414,11 +417,12 @@ fn run_history(sync_threshold: usize, history: &[Action]) {
                             )
                             .await
                             .is_err());
-                        let after: i64 =
-                            sqlx::query_scalar("SELECT COUNT(*) FROM embeddings_queue")
-                                .fetch_one(db.get_conn())
-                                .await
-                                .unwrap();
+                        let after: i64 = sqlx::query_scalar(
+                            "SELECT COALESCE(MAX(seq_id), 0) FROM embeddings_queue",
+                        )
+                        .fetch_one(db.get_conn())
+                        .await
+                        .unwrap();
                         assert_eq!(before, after, "rejected writes must not append logs");
                     });
                 }
@@ -511,6 +515,8 @@ proptest! {
             running.registry.get::<SysDb>().unwrap().get_collection_with_segments(None, collection.collection_id).await.unwrap().vector_segment.id
         });
         running.runtime.block_on(async {
+            // The save of the index runs in the background.
+            running.registry.get::<LocalSegmentManager>().unwrap().wait_for_hnsw_save(segment).await;
             let db = running.registry.get::<SqliteDb>().unwrap();
             let watermark: i64 = sqlx::query_scalar("SELECT seq_id FROM max_seq_id WHERE segment_id = ?")
                 .bind(segment.to_string()).fetch_one(db.get_conn()).await.unwrap();

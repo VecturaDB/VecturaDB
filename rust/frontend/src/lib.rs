@@ -80,16 +80,10 @@ async fn hold_folder_for_server(folder: std::path::PathBuf) -> folder_lock::Fold
     }
 }
 
-pub async fn frontend_service_entrypoint_with_config_system_registry(
-    auth: Arc<dyn auth::AuthenticateAndAuthorize>,
-    quota_enforcer: Arc<dyn QuotaEnforcer>,
-    system: System,
-    registry: Registry,
-    config: &FrontendServerConfig,
-) {
+/// The configuration of the frontend from the one of the server: on a single node, the folder of the data, the SQLite
+/// file in it and the shortest time between two saves of a local HNSW index, where the frontend block gives none.
+pub fn local_frontend_config(config: &FrontendServerConfig) -> FrontendConfig {
     let mut fe_cfg = config.frontend.clone();
-    // The lock of the data folder, held until the server has stopped and closed its database (folder_lock).
-    let mut _held_folder = None;
     if let (Some(sql_cfg), Some(local_segman_cfg)) =
         (fe_cfg.sqlitedb.as_mut(), fe_cfg.segment_manager.as_mut())
     {
@@ -101,8 +95,10 @@ pub async fn frontend_service_entrypoint_with_config_system_registry(
                 .expect("Persist path should be valid")
                 .to_string(),
         );
-        if let Some(folder) = &local_segman_cfg.persist_path {
-            _held_folder = Some(hold_folder_for_server(folder.into()).await);
+        if let Some(seconds) = config.hnsw_min_save_interval_seconds {
+            local_segman_cfg
+                .hnsw_min_save_interval_seconds
+                .get_or_insert(seconds);
         }
         sql_cfg.url.get_or_insert(
             sqlite_url
@@ -110,6 +106,28 @@ pub async fn frontend_service_entrypoint_with_config_system_registry(
                 .expect("Sqlite path should be valid")
                 .to_string(),
         );
+    }
+    fe_cfg
+}
+
+pub async fn frontend_service_entrypoint_with_config_system_registry(
+    auth: Arc<dyn auth::AuthenticateAndAuthorize>,
+    quota_enforcer: Arc<dyn QuotaEnforcer>,
+    system: System,
+    registry: Registry,
+    config: &FrontendServerConfig,
+) {
+    let fe_cfg = local_frontend_config(config);
+    // The lock of the data folder, held until the server has stopped and closed its database (folder_lock).
+    let mut _held_folder = None;
+    if fe_cfg.sqlitedb.is_some() {
+        if let Some(folder) = fe_cfg
+            .segment_manager
+            .as_ref()
+            .and_then(|manager| manager.persist_path.as_ref())
+        {
+            _held_folder = Some(hold_folder_for_server(folder.into()).await);
+        }
     }
 
     let frontend = Frontend::try_from_config(&(fe_cfg, system.clone()), &registry)
