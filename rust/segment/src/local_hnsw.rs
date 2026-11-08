@@ -1,4 +1,6 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
+#[cfg(feature = "test-hooks")]
+pub mod hooks;
 mod persistence;
 pub(crate) use persistence::validate_checkpoint;
 use persistence::{validate_checkpoint_seq_id, CheckpointFingerprint, VerifiedCheckpoint};
@@ -1220,6 +1222,10 @@ impl LocalHnswSegmentWriter {
         &mut self,
         log_chunk: Chunk<LogRecord>,
     ) -> Result<u32, LocalHnswSegmentWriterError> {
+        // Dropped after the guard, once the lock is released.
+        #[cfg(feature = "test-hooks")]
+        let _done =
+            hooks::hold_apply(log_chunk.iter().map(|(log, _)| log.record.id.as_str())).await;
         let mut guard = self.index.inner.write().await;
         if guard.deleted {
             return Err(LocalHnswSegmentWriterError::Deleted);
