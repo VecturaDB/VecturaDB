@@ -63,7 +63,7 @@ pub enum SchemaError {
     DefaultsMismatch,
     #[error("Conflicting configuration for {context}")]
     ConfigurationConflict { context: String },
-    #[error("Invalid HNSW configuration: {0}")]
+    #[error("Invalid HNSW configuration: {}", crate::bounds_message(.0))]
     InvalidHnswConfig(validator::ValidationErrors),
     #[error("Invalid SPANN configuration: {0}")]
     InvalidSpannConfig(validator::ValidationErrors),
@@ -241,6 +241,27 @@ pub struct Schema {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "utoipa", schema(value_type = Option<Object>))]
     pub cmek: Option<Cmek>,
+}
+
+// The HNSW settings of an index on the disk above the bounds of a request (Chroma #7825), as Chroma 1.5.9 stored them,
+// told in the log once for each segment that a process opens: the index is opened with them, as Chroma 1.5.9 opens it.
+fn warn_once_above_the_bounds(segment: &Segment, config: &InternalHnswConfiguration) {
+    static TOLD: LazyLock<std::sync::Mutex<std::collections::HashSet<crate::SegmentUuid>>> =
+        LazyLock::new(Default::default);
+    if let Err(errors) = config.validate() {
+        if TOLD
+            .lock()
+            .map(|mut told| told.insert(segment.id))
+            .unwrap_or(false)
+        {
+            tracing::warn!(
+                segment_id = %segment.id,
+                "The HNSW settings of a collection on the disk are above the bounds of a request, and stay as they \
+                 were stored: {}",
+                crate::bounds_message(&errors)
+            );
+        }
+    }
 }
 
 impl Schema {
@@ -1320,7 +1341,10 @@ impl Schema {
         segment: &Segment,
     ) -> Result<Option<InternalHnswConfiguration>, HnswParametersFromSegmentError> {
         if let Some(config) = self.get_internal_hnsw_config() {
-            config.validate()?;
+            // An index on the disk is opened with the checks of Chroma 1.5.9, and its settings above the bounds of a
+            // request are told once in the log.
+            config.validate_persisted()?;
+            warn_once_above_the_bounds(segment, &config);
             let config_from_metadata =
                 InternalHnswConfiguration::from_legacy_segment_metadata(&segment.metadata)?;
 

@@ -140,19 +140,21 @@ async fn checker_validates_configuration_in_current_and_legacy_stores_read_only(
                 .execute(&pool)
                 .await
                 .unwrap();
-            let ef = if invalid { 10000 } else { 100 };
+            // A setting that Chroma 1.5.9 refused too: one outside the bounds of a request, which Chroma 1.5.9 accepted, is
+            // read as stored.
+            let sync_threshold = if invalid { 1 } else { 1000 };
             let config = InternalCollectionConfiguration {
                 vector_index: VectorIndexConfiguration::Hnsw(InternalHnswConfiguration {
-                    ef_construction: ef,
+                    sync_threshold,
                     ..Default::default()
                 }),
                 embedding_function: None,
             };
             match layout {
                 "legacy" => {
-                    sqlx::query("INSERT INTO segment_metadata (segment_id, key, int_value) VALUES (?, 'hnsw:construction_ef', ?)")
+                    sqlx::query("INSERT INTO segment_metadata (segment_id, key, int_value) VALUES (?, 'hnsw:sync_threshold', ?)")
                         .bind(&row.vector_segment_id)
-                        .bind(ef as i64)
+                        .bind(sync_threshold as i64)
                         .execute(&pool)
                         .await
                         .unwrap();

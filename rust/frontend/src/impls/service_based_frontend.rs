@@ -4293,7 +4293,8 @@ mod tests {
             )
             .await
             .unwrap();
-        // Bypass API validation to model a configuration persisted by an older release.
+        // Bypass API validation to model a configuration persisted that Chroma 1.5.9 refused too: a configuration outside
+        // the bounds of a request, which Chroma 1.5.9 accepted, is read as stored.
         frontend
             .sysdb_client
             .update_collection(
@@ -4305,7 +4306,7 @@ mod tests {
                 Some(chroma_types::InternalUpdateCollectionConfiguration {
                     vector_index: Some(chroma_types::UpdateVectorIndexConfiguration::Hnsw(Some(
                         chroma_types::UpdateHnswConfiguration {
-                            ef_search: Some(4097),
+                            sync_threshold: Some(1),
                             ..Default::default()
                         },
                     ))),
