@@ -168,7 +168,9 @@ impl Fixture {
         let system = System::new();
         let handle = system.start_component(compactor);
         Self {
-            executor: LocalExecutor::new(manager, db.clone(), handle),
+            executor: LocalExecutor::new(manager, db.clone(), handle).with_log(Some(
+                SqliteLog::new(db.clone(), "default".into(), "default".into()),
+            )),
             db,
             sysdb,
             segments: CollectionAndSegments {
@@ -397,12 +399,11 @@ async fn a_read_of_a_replayed_instance_does_not_wait_for_the_compactor() {
     f.stop().await;
 }
 
-// A get with embeddings reads them from the index at its snapshot of SQLite. With the index holding every record of the
-// snapshot, it does not reach the compactor; with SQLite ahead of the index, as while a write's backfill has committed
-// its records and not yet applied them, it waits for the backfill, here a stopped compactor; a count, which reads only
-// SQLite, does not.
+// A get with embeddings reads them from the index and the tail of the log at its snapshot of SQLite: with the index holding
+// every record of the snapshot, and with SQLite ahead of the index, as while a write's backfill has committed its records
+// and not yet applied them, it does not reach the compactor, here stopped; nor does a count, which reads only SQLite.
 #[tokio::test]
-async fn a_read_waits_for_a_backfill_only_when_the_index_is_behind_its_snapshot() {
+async fn a_read_does_not_wait_for_a_backfill_when_the_index_is_behind_its_snapshot() {
     use chroma_types::operator::Scan;
     let mut f = Fixture::new().await;
     f.segments.collection.dimension = Some(3);
@@ -450,11 +451,12 @@ async fn a_read_waits_for_a_backfill_only_when_the_index_is_behind_its_snapshot(
         .execute(f.db.get_conn())
         .await
         .unwrap();
-    let behind = f.executor.get(get.clone(), |_| async { unreachable!() }).await;
-    assert!(
-        matches!(behind, Err(ExecutorError::BackfillError(_))),
-        "a get with embeddings must wait for the backfill: {behind:?}"
-    );
+    f.executor
+        .get(get.clone(), |_| async { unreachable!() })
+        .await
+        .expect(
+            "SQLite ahead of the index: the get reads the tail of the log, without the compactor",
+        );
     f.executor
         .count(
             chroma_types::plan::Count {

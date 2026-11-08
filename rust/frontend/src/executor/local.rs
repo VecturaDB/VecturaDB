@@ -14,7 +14,7 @@ use chroma_segment::blockfile_record::{
 use chroma_segment::distributed_spann::{SpannSegmentReaderShard, SpannSegmentReaderShardError};
 use chroma_segment::spann_provider::SpannProvider;
 use chroma_segment::{
-    local_hnsw::LocalHnswSegmentReader,
+    local_hnsw::{LocalHnswSegmentReader, LocalHnswView, QueriedRecord},
     local_segment_manager::LocalSegmentManager,
     sqlite_metadata::{
         DenseVectorReader, MetadataSnapshot, SqliteMetadataError, SqliteMetadataReader,
@@ -318,15 +318,8 @@ impl LocalExecutor {
 
     // A get of an HNSW collection at a snapshot of SQLite, which gives the records and the last record of the log applied
     // to the metadata segment at one moment, so that a conditional read takes as its token what it read, as
-    // log_upper_bound_offset in distributed Chroma. When its records are then read from the index given: while a write's
-    // backfill has committed its records to SQLite and not yet applied them to the index, the read waits for that
-    // backfill, so that the index holds every record of its snapshot (the read of Chroma 1.5.9, which waited for every
-    // backfill). Other reads do not wait for a running backfill.
-    async fn get_at_snapshot(
-        &mut self,
-        index: Option<&LocalHnswSegmentReader>,
-        plan: Get,
-    ) -> Result<GetResult, ExecutorError> {
+    // log_upper_bound_offset in distributed Chroma.
+    async fn get_at_snapshot(&mut self, plan: Get) -> Result<GetResult, ExecutorError> {
         let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
         let collection_and_segments = plan.scan.collection_and_segments.clone();
         let mut snapshot = self.metadata_reader.snapshot().await.map_err(internal)?;
@@ -334,16 +327,6 @@ impl LocalExecutor {
             .max_seq_id(&collection_and_segments.metadata_segment.id)
             .await
             .map_err(internal)?;
-        if index.is_some_and(|index| index.index.applied_seq_id_in_memory() < applied) {
-            let backfill_msg = BackfillMessage {
-                collection_id: collection_and_segments.collection.collection_id,
-            };
-            self.compactor_handle
-                .request(backfill_msg, None)
-                .await
-                .map_err(|err| ExecutorError::BackfillError(Box::new(err)))?
-                .map_err(|err| ExecutorError::BackfillError(Box::new(err)))?;
-        }
         let mut result = self
             .metadata_reader
             .get_at(&mut snapshot, plan)
@@ -352,6 +335,54 @@ impl LocalExecutor {
         snapshot.close().await.map_err(internal)?;
         result.applied_log_offset = Some(applied);
         Ok(result)
+    }
+
+    // The local HNSW index of a collection, the tail of the log after its position and a snapshot of SQLite, at one
+    // moment, in the order of distributed Chroma, whose reads take a version of every segment and the log after it
+    // (LocalHnswRead): the read lock of the index first, then the snapshot, which holds every record of the index, and
+    // from the snapshot the records of the log between the position of the index and the last one that SQLite applied.
+    // A read with them waits for no backfill; the backfills wait for the read lock of the index while the view is held.
+    // With the snapshot, the last record of the log that SQLite applied.
+    async fn hnsw_view<'r>(
+        &self,
+        index: &'r LocalHnswSegmentReader,
+        collection_and_segments: &CollectionAndSegments,
+    ) -> Result<(LocalHnswView<'r>, MetadataSnapshot, u64), ExecutorError> {
+        let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
+        let read = index
+            .begin_read()
+            .await
+            .map_err(|err| ExecutorError::Internal(Box::new(err)))?;
+        let mut snapshot = self.metadata_reader.snapshot().await.map_err(internal)?;
+        let applied = snapshot
+            .max_seq_id(&collection_and_segments.metadata_segment.id)
+            .await
+            .map_err(internal)?;
+        let position = read.position();
+        // A backfill commits to SQLite before it applies to the index: SQLite is never behind the index.
+        if position > applied {
+            return Err(ExecutorError::InconsistentData);
+        }
+        let tail = if position < applied {
+            self.log
+                .as_ref()
+                .ok_or(ExecutorError::InconsistentData)?
+                .read_tail(
+                    snapshot.connection(),
+                    collection_and_segments.collection.collection_id,
+                    position as i64,
+                    applied as i64,
+                    None,
+                )
+                .await
+                .map_err(|err| ExecutorError::Internal(err.boxed()))?
+        } else {
+            Vec::new()
+        };
+        let view = read
+            .with_tail(&tail)
+            .map_err(|err| ExecutorError::Internal(Box::new(err)))?;
+        Ok((view, snapshot, applied))
     }
 
     // Pin the index through replay and the read. A collection-level "backfilled"
@@ -450,29 +481,32 @@ impl LocalExecutor {
         let hnsw_reader = self
             .try_backfill_collection(&collection_and_segments)
             .await?;
-        let load_embedding = plan.proj.embedding;
-        // The embeddings come from the index: it must hold every record of the snapshot of the get.
-        let index = hnsw_reader.as_ref().filter(|_| load_embedding);
-        let mut result = if index.is_some() || Self::is_conditional_read(&plan) {
-            self.get_at_snapshot(index, plan).await?
-        } else {
-            self.metadata_reader
-                .get(plan)
+        let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
+        // The embeddings of the records of the snapshot come from the index and the tail of the log of the same moment.
+        let index = hnsw_reader.as_ref().filter(|_| plan.proj.embedding);
+        let result = if let Some(index) = index {
+            let (view, mut snapshot, applied) =
+                self.hnsw_view(index, &collection_and_segments).await?;
+            let mut result = self
+                .metadata_reader
+                .get_at(&mut snapshot, plan)
                 .await
-                .map_err(|err| ExecutorError::Internal(Box::new(err)))?
-        };
-        if load_embedding {
-            if let Some(hnsw_reader) = hnsw_reader {
-                for record in &mut result.result.records {
-                    record.embedding = Some(
-                        hnsw_reader
-                            .get_embedding_by_user_id(&record.id)
-                            .await
-                            .map_err(|err| ExecutorError::Internal(Box::new(err)))?,
-                    );
-                }
+                .map_err(internal)?;
+            for record in &mut result.result.records {
+                record.embedding = Some(
+                    view.embedding(&record.id)
+                        .map_err(|err| ExecutorError::Internal(Box::new(err)))?,
+                );
             }
-        }
+            drop(view);
+            snapshot.close().await.map_err(internal)?;
+            result.applied_log_offset = Some(applied);
+            result
+        } else if Self::is_conditional_read(&plan) {
+            self.get_at_snapshot(plan).await?
+        } else {
+            self.metadata_reader.get(plan).await.map_err(internal)?
+        };
         Ok(result)
     }
 
@@ -812,56 +846,8 @@ impl LocalExecutor {
         let Some(hnsw_reader) = hnsw_reader else {
             return empty_result;
         };
-
-        let allowed_user_ids = match plan.filter {
-            Filter {
-                query_ids: None,
-                where_clause: None,
-            } => Vec::new(),
-            Filter {
-                query_ids: Some(uids),
-                where_clause: _,
-            } if uids.is_empty() => return empty_result,
-            Filter {
-                query_ids: Some(uids),
-                where_clause: None,
-            } => uids,
-            filter => {
-                let filter_plan = Get {
-                    scan: plan.scan.clone(),
-                    filter: filter.clone(),
-                    limit: Limit {
-                        offset: 0,
-                        limit: None,
-                    },
-                    proj: Default::default(),
-                };
-
-                // The ids that the filter gives are looked up in the index, which must hold every record of its snapshot.
-                let allowed_uids = self
-                    .get_at_snapshot(Some(&hnsw_reader), filter_plan)
-                    .await?
-                    .result
-                    .records
-                    .into_iter()
-                    .map(|record| record.id)
-                    .collect::<Vec<_>>();
-
-                if allowed_uids.is_empty() {
-                    return empty_result;
-                }
-
-                allowed_uids
-            }
-        };
-
-        let mut allowed_offset_ids = Vec::new();
-        for user_id in allowed_user_ids {
-            let offset_id = hnsw_reader
-                .get_offset_id_by_user_id(&user_id)
-                .await
-                .map_err(|err| ExecutorError::Internal(Box::new(err)))?;
-            allowed_offset_ids.push(offset_id);
+        if matches!(&plan.filter.query_ids, Some(uids) if uids.is_empty()) {
+            return empty_result;
         }
 
         let hnsw_config = collection_and_segments
@@ -879,6 +865,49 @@ impl LocalExecutor {
             .ok_or(ExecutorError::CollectionMissingHnswConfiguration)?;
 
         let distance_function = hnsw_config.space;
+        let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
+
+        // The filter, the search and the documents of the results at one moment: the index, the tail of the log after it
+        // and a snapshot of SQLite (hnsw_view), as a query of distributed Chroma reads one version of every segment and
+        // the log after it. Every record that the query gives is in the snapshot, with its document.
+        let (view, mut snapshot, _) = self
+            .hnsw_view(&hnsw_reader, &collection_and_segments)
+            .await?;
+        let allowed_user_ids = match plan.filter {
+            Filter {
+                query_ids: None,
+                where_clause: None,
+            } => None,
+            Filter {
+                query_ids: Some(uids),
+                where_clause: None,
+            } => Some(uids),
+            filter => {
+                let filter_plan = Get {
+                    scan: plan.scan.clone(),
+                    filter,
+                    limit: Limit {
+                        offset: 0,
+                        limit: None,
+                    },
+                    proj: Default::default(),
+                };
+                let allowed_uids = self
+                    .metadata_reader
+                    .get_at(&mut snapshot, filter_plan)
+                    .await
+                    .map_err(internal)?
+                    .result
+                    .records
+                    .into_iter()
+                    .map(|record| record.id)
+                    .collect::<Vec<_>>();
+                if allowed_uids.is_empty() {
+                    return empty_result;
+                }
+                Some(allowed_uids)
+            }
+        };
 
         let mut results = Vec::new();
         let mut returned_user_ids = Vec::new();
@@ -888,41 +917,38 @@ impl LocalExecutor {
             } else {
                 embedding
             };
-            let distances = hnsw_reader
-                .query_embedding(
-                    allowed_offset_ids.as_slice(),
+            let queried = view
+                .query(
+                    allowed_user_ids.as_deref(),
                     query_embedding,
                     plan.knn.fetch,
+                    plan.proj.projection.embedding,
                 )
-                .await
                 .map_err(|err| ExecutorError::Internal(Box::new(err)))?;
 
             let mut records = Vec::new();
-            for RecordMeasure { offset_id, measure } in distances {
-                let user_id = hnsw_reader
-                    .get_user_id_by_offset_id(offset_id)
-                    .await
-                    .map_err(|err| ExecutorError::Internal(Box::new(err)))?;
+            for QueriedRecord {
+                user_id,
+                measure,
+                embedding,
+                ..
+            } in queried
+            {
                 returned_user_ids.push(user_id.clone());
-                let knn_projection = KnnProjectionRecord {
+                records.push(KnnProjectionRecord {
                     record: ProjectionRecord {
                         id: user_id,
                         document: None,
-                        embedding: plan.proj.projection.embedding.then_some(
-                            hnsw_reader
-                                .get_embedding_by_offset_id(offset_id)
-                                .await
-                                .map_err(|err| ExecutorError::Internal(Box::new(err)))?,
-                        ),
+                        embedding,
                         metadata: None,
                     },
                     distance: plan.proj.distance.then_some(measure),
-                };
-                records.push(knn_projection);
+                });
             }
 
             results.push(KnnProjectionOutput { records });
         }
+        drop(view);
 
         if plan.proj.projection.document || plan.proj.projection.metadata {
             let projection_plan = Get {
@@ -941,15 +967,11 @@ impl LocalExecutor {
                     metadata: plan.proj.projection.metadata,
                 },
             };
-
-            let replan = {
-                let plan = projection_plan.clone();
-                move |_: tonic::Code| {
-                    let plan = plan.clone();
-                    async move { Ok(plan) }
-                }
-            };
-            let hydrated_records = self.get(projection_plan, replan).await?;
+            let hydrated_records = self
+                .metadata_reader
+                .get_at(&mut snapshot, projection_plan)
+                .await
+                .map_err(internal)?;
             let mut user_id_to_document = HashMap::new();
             let mut user_id_to_metadata = HashMap::new();
             for ProjectionRecord {
@@ -976,6 +998,8 @@ impl LocalExecutor {
                 }
             }
         }
+
+        snapshot.close().await.map_err(internal)?;
 
         Ok(KnnBatchResult {
             pulled_log_bytes: 0,
@@ -1335,13 +1359,48 @@ impl LocalExecutor {
                 pulled_log_bytes: 0,
             });
         }
-        let vectors = hnsw_reader
+        let internal = |err: SqliteMetadataError| ExecutorError::Internal(Box::new(err));
+        // A dense KNN leaf and a selection of embeddings read the index and the tail of the log of the moment of the
+        // snapshot of the search (hnsw_view), as a search of distributed Chroma reads one version of every segment and
+        // the log after it. A search without them reads SQLite alone.
+        let index = hnsw_reader
             .as_ref()
-            .map(|hnsw| hnsw as &dyn DenseVectorReader);
-        self.metadata_reader
-            .search(plan.scan.collection_and_segments, vectors, plan.payloads)
+            .filter(|_| plan.payloads.iter().any(Self::reads_vectors));
+        let Some(index) = index else {
+            return self
+                .metadata_reader
+                .search(plan.scan.collection_and_segments, None, plan.payloads)
+                .await
+                .map_err(internal);
+        };
+        let collection_and_segments = plan.scan.collection_and_segments;
+        let (view, mut snapshot, _) = self.hnsw_view(index, &collection_and_segments).await?;
+        let result = self
+            .metadata_reader
+            .search_at(
+                &mut snapshot,
+                collection_and_segments,
+                Some(&view as &dyn DenseVectorReader),
+                plan.payloads,
+            )
             .await
-            .map_err(|error| ExecutorError::Internal(Box::new(error)))
+            .map_err(internal)?;
+        drop(view);
+        snapshot.close().await.map_err(internal)?;
+        Ok(result)
+    }
+
+    // Whether a payload of a search reads vectors: a dense KNN leaf, or a selection of embeddings.
+    fn reads_vectors(payload: &chroma_types::plan::SearchPayload) -> bool {
+        payload
+            .rank
+            .knn_queries()
+            .into_iter()
+            .any(|knn| matches!(knn.query, chroma_types::operator::QueryVector::Dense(_)))
+            || payload
+                .select
+                .keys
+                .contains(&chroma_types::operator::Key::Embedding)
     }
 
     // A search of a SPANN collection: its files and its records at one moment, as a get, a query and a count. In its
