@@ -51,6 +51,9 @@ pub(crate) struct Bindings {
     compactor: LocalCompactionManager,
     frontend: Frontend,
     closed: bool,
+    // The lock of the data folder: one program at a time, a server or an embedded client (chroma_frontend::folder_lock).
+    // Let go once the database is closed.
+    folder_lock: Option<chroma_frontend::folder_lock::FolderLock>,
 }
 
 #[pyclass]
@@ -451,7 +454,19 @@ impl Bindings {
         sqlite_db_config: SqliteDBConfig,
         hnsw_cache_size: usize,
         persist_path: Option<String>,
+        py: Python<'_>,
     ) -> ChromaPyResult<Self> {
+        // Before the database opens: on a folder that another program holds, the client waits FOLDER_WAIT, then refuses.
+        // The wait lets the other threads of the program run.
+        let folder_lock = match persist_path.clone() {
+            Some(folder) => Some(py.allow_threads(move || {
+                chroma_frontend::folder_lock::lock_folder(
+                    std::path::Path::new(&folder),
+                    chroma_frontend::folder_lock::FOLDER_WAIT,
+                )
+            })?),
+            None => None,
+        };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
         let system = System::new();
@@ -535,6 +550,7 @@ impl Bindings {
             compactor,
             frontend,
             closed: false,
+            folder_lock,
         })
     }
 
@@ -1639,6 +1655,7 @@ impl Bindings {
                 .close_within(grace.saturating_sub(started.elapsed()))
                 .await;
         });
+        self.folder_lock = None;
     }
 }
 
@@ -1679,8 +1696,13 @@ mod tests {
             migration_mode: MigrationMode::Apply,
             ..Default::default()
         };
-        let bindings = Bindings::py_new(true, sqlite_db_config, 16, Some(persist_path))
-            .expect("persistent bindings");
+        // The constructor lets the lock of the interpreter go while it waits for the data folder.
+        static PYTHON_INIT: std::sync::Once = std::sync::Once::new();
+        PYTHON_INIT.call_once(pyo3::prepare_freethreaded_python);
+        let bindings = Python::with_gil(|py| {
+            Bindings::py_new(true, sqlite_db_config, 16, Some(persist_path), py)
+        })
+        .expect("persistent bindings");
 
         (temp_dir, bindings)
     }

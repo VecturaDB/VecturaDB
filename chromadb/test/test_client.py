@@ -1,9 +1,13 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 import asyncio
+import threading
+import time
 from typing import Any, Awaitable, Callable, Generator, cast, Dict, Tuple
 from unittest.mock import MagicMock, patch
 import chromadb
 from chromadb.config import Settings, System
 from chromadb.api import ClientAPI
+from chromadb.errors import InternalError
 import chromadb.server.fastapi
 from chromadb.api.fastapi import FastAPI
 import pytest
@@ -323,6 +327,50 @@ def test_client_close_idempotent() -> None:
         # Third close should also be safe
         client.close()
 
+        client.clear_system_cache()
+
+
+def test_a_second_client_on_a_folder_in_use_waits_then_is_refused() -> None:
+    """One program at a time uses a data folder (VecturaDB): a second client on a folder that another holds waits
+    30 s, while the other threads of the program go on, then is refused with the folder in its message. Once the
+    folder is free, a new client opens it."""
+    if os.environ.get("CHROMA_INTEGRATION_TEST_ONLY"):
+        pytest.skip("Integration test only")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        first = chromadb.PersistentClient(path=tmpdir)
+        first.create_collection("test_collection").add(ids=["id1"], documents=["doc1"])
+        first_system = first._system
+        # The next client is a new one on the same folder, not the one the process shares.
+        first.clear_system_cache()
+
+        outcome: Dict[str, Any] = {}
+
+        def second() -> None:
+            started = time.monotonic()
+            try:
+                chromadb.PersistentClient(path=tmpdir)
+            except Exception as e:
+                outcome["error"] = e
+            outcome["waited"] = time.monotonic() - started
+
+        thread = threading.Thread(target=second)
+        thread.start()
+        ticks = 0
+        while thread.is_alive():
+            ticks += 1
+            time.sleep(0.1)
+        thread.join()
+
+        assert outcome["waited"] >= 30, outcome
+        assert ticks >= 100, ticks
+        assert isinstance(outcome.get("error"), InternalError), outcome
+        assert tmpdir in str(outcome["error"]), outcome
+
+        first_system.stop()
+        client = chromadb.PersistentClient(path=tmpdir)
+        assert client.get_collection("test_collection").count() == 1
+        client.close()
         client.clear_system_cache()
 
 
