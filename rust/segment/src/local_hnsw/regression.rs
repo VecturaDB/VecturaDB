@@ -404,7 +404,10 @@ async fn files_cut_by_a_power_cut_before_the_first_save_are_built_again() {
         )
         .await;
         assert!(
-            matches!(reader, Err(LocalHnswSegmentReaderError::UninitializedSegment)),
+            matches!(
+                reader,
+                Err(LocalHnswSegmentReaderError::UninitializedSegment)
+            ),
             "reader with {keep} bytes"
         );
         let mut reopened =
@@ -1460,12 +1463,21 @@ async fn a_journal_older_than_files_saved_by_chroma_1_5_9_is_discarded() {
     drop(writer);
     assert_eq!(HnswIndex::persist_journals(&folder).unwrap().len(), 1);
     let persist_path = Some(root.path().to_str().unwrap().to_string());
-    let reader = LocalHnswSegmentReader::from_segment(&collection, &segment, 3, persist_path, sqlite.clone())
-        .await
-        .unwrap();
+    let reader = LocalHnswSegmentReader::from_segment(
+        &collection,
+        &segment,
+        3,
+        persist_path,
+        sqlite.clone(),
+    )
+    .await
+    .unwrap();
     assert!(HnswIndex::persist_journals(&folder).unwrap().is_empty());
     assert_eq!(
-        reader.get_embedding_by_user_id(&"1".to_string()).await.unwrap(),
+        reader
+            .get_embedding_by_user_id(&"1".to_string())
+            .await
+            .unwrap(),
         vec![(saved + 1) as f32; 3]
     );
 }

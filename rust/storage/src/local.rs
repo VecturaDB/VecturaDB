@@ -399,6 +399,9 @@ mod tests {
         std::fs::write(&plain, b"bytes").unwrap();
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&root.path().join("block/key")), mode(&plain));
-        assert_eq!(std::fs::read(root.path().join("block/key")).unwrap(), b"bytes");
+        assert_eq!(
+            std::fs::read(root.path().join("block/key")).unwrap(),
+            b"bytes"
+        );
     }
 }

@@ -1253,7 +1253,9 @@ impl LocalHnswIndex {
     pub async fn set_replay_complete(&self, complete: bool) {
         let mut guard = self.inner.write().await;
         guard.replay_complete = complete;
-        self.inner.replay_complete.store(complete, Ordering::Release);
+        self.inner
+            .replay_complete
+            .store(complete, Ordering::Release);
     }
 
     // The lock of the files of this index (files_lock), once the save in the background that writes them, if any, ended;
@@ -1873,7 +1875,10 @@ impl LocalHnswSegmentWriter {
         // already applied records into this live instance.
         guard.last_seen_seq_id = max_seq_id;
         // The index holds the chunk in memory: a read that waits for these records may go on.
-        self.index.inner.applied_seq_id.store(max_seq_id, Ordering::Release);
+        self.index
+            .inner
+            .applied_seq_id
+            .store(max_seq_id, Ordering::Release);
         guard.id_map.total_elements_added = next_label - 1;
         // A save takes its journal here, under the write lock, and writes the files in the background with the lock of
         // the files held: reads and writes do not wait for the disk. While another holds the files, as a save of this
