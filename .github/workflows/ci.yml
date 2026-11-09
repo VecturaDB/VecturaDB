@@ -18,8 +18,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A pull request drops the run of its older push; each push to main has a group of its own and keeps its run.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -329,6 +330,10 @@ jobs:
       - uses: ./.github/actions/rust
         with:
           github-token: ${{ github.token }}
+      - name: Formatting
+        run: |
+          rustup component add rustfmt
+          cargo fmt --all -- --check
       - name: Test
         run: >-
           cargo nextest run --profile ci
