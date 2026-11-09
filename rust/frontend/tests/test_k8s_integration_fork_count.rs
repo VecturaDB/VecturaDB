@@ -114,7 +114,11 @@ async fn test_fork_count_local_counts_forks() {
     add_records(&mut frontend, &collection, vec!["doc1"]).await;
 
     let result = frontend.fork_count(collection.collection_id).await;
-    assert!(matches!(result, Ok(0)), "Expected 0 forks, got {:?}", result);
+    assert!(
+        matches!(result, Ok(0)),
+        "Expected 0 forks, got {:?}",
+        result
+    );
 
     let forked = frontend
         .fork_collection(

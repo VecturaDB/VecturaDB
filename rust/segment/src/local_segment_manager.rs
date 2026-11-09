@@ -65,8 +65,7 @@ pub struct LocalSegmentManager {
     hnsw_index_pool: Arc<dyn Cache<IndexUuid, LocalHnswIndex>>,
     // Cache eviction must not allow a second native writer while a caller
     // still holds the first index. Serialize misses and retain weak identities.
-    live_indexes:
-        AysncPartitionedMutex<IndexUuid, HashMap<IndexUuid, Weak<IndexShared>>>,
+    live_indexes: AysncPartitionedMutex<IndexUuid, HashMap<IndexUuid, Weak<IndexShared>>>,
     #[allow(dead_code)]
     eviction_callback_task_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     cleanup_task: Option<Arc<CleanupTask>>,

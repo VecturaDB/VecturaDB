@@ -59,7 +59,10 @@ impl SqliteDb {
         }
         // sqlx waits for the connections still taken to come back before its close ends: within the grace.
         let started = std::time::Instant::now();
-        if tokio::time::timeout(grace, self.conn.close()).await.is_err() {
+        if tokio::time::timeout(grace, self.conn.close())
+            .await
+            .is_err()
+        {
             tracing::warn!(
                 "{} connections of SQLite still taken {} s after the close: closed without waiting, with the log of the writes",
                 self.conn.size(),

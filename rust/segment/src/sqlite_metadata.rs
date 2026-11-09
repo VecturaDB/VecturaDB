@@ -5392,14 +5392,17 @@ mod tests {
     async fn sparse_presence_starts_from_the_sparse_table() {
         let db = get_new_sqlite_db().await;
         // The detail of each step of the plan, its fourth column.
-        let plan: Vec<String> = sqlx::query(&format!("EXPLAIN QUERY PLAN {}", super::SPARSE_PRESENCE_QUERY))
-            .bind("segment")
-            .fetch_all(db.get_conn())
-            .await
-            .unwrap()
-            .iter()
-            .map(|row| sqlx::Row::get::<String, _>(row, 3))
-            .collect();
+        let plan: Vec<String> = sqlx::query(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::SPARSE_PRESENCE_QUERY
+        ))
+        .bind("segment")
+        .fetch_all(db.get_conn())
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| sqlx::Row::get::<String, _>(row, 3))
+        .collect();
         let sparse = plan.iter().position(|step| step.contains("sparse"));
         let embeddings = plan.iter().position(|step| step.contains("embeddings"));
         assert!(
@@ -5407,7 +5410,9 @@ mod tests {
             "the sparse table must be scanned before the embeddings are searched: {plan:?}"
         );
         assert!(
-            !plan.iter().any(|step| step.contains("embeddings") && step.contains("segment_id")),
+            !plan
+                .iter()
+                .any(|step| step.contains("embeddings") && step.contains("segment_id")),
             "the embeddings must not be walked by segment: {plan:?}"
         );
     }
@@ -5417,14 +5422,16 @@ mod tests {
     async fn sparse_presence_answers_for_the_segment_only() {
         let db = get_new_sqlite_db().await;
         for (id, segment) in [(1, "a"), (2, "a"), (3, "b"), (4, "b")] {
-            sqlx::query("INSERT INTO embeddings (id, segment_id, embedding_id, seq_id) VALUES (?, ?, ?, ?)")
-                .bind(id)
-                .bind(segment)
-                .bind(format!("e{id}"))
-                .bind(vec![0u8])
-                .execute(db.get_conn())
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO embeddings (id, segment_id, embedding_id, seq_id) VALUES (?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(segment)
+            .bind(format!("e{id}"))
+            .bind(vec![0u8])
+            .execute(db.get_conn())
+            .await
+            .unwrap();
         }
         let present = |segment: &'static str| {
             let db = db.clone();

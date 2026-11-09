@@ -69,7 +69,9 @@ pub enum TokenAuthenticationError {
     File(String, String),
     #[error("Invalid token. Must contain only ASCII letters, digits, and punctuation.")]
     InvalidToken,
-    #[error("Token already in use: wanted to use it for user {0} but it's already in use by user {1}")]
+    #[error(
+        "Token already in use: wanted to use it for user {0} but it's already in use by user {1}"
+    )]
     TokenInUse(String, String),
     #[error("Invalid token transport header: {0}. Must be one of [Authorization, X-Chroma-Token]")]
     InvalidHeader(String),
@@ -106,13 +108,13 @@ impl TokenAuthentication {
         ) {
             (Some(_), Some(_)) => return Err(TokenAuthenticationError::Both),
             (Some(path), None) => {
-                let read_error =
-                    |err: &dyn std::fmt::Display| TokenAuthenticationError::File(path.clone(), err.to_string());
+                let read_error = |err: &dyn std::fmt::Display| {
+                    TokenAuthenticationError::File(path.clone(), err.to_string())
+                };
                 let content = std::fs::read_to_string(path).map_err(|err| read_error(&err))?;
-                let file: CredentialsFile =
-                    figment::Figment::from(Yaml::string(&content))
-                        .extract()
-                        .map_err(|err| read_error(&err))?;
+                let file: CredentialsFile = figment::Figment::from(Yaml::string(&content))
+                    .extract()
+                    .map_err(|err| read_error(&err))?;
                 file.users
                     .into_iter()
                     .map(|user| {
@@ -206,9 +208,9 @@ impl TokenAuthentication {
         }
         match action {
             AuthzAction::GetTenant | AuthzAction::ListDatabases => Ok(()),
-            AuthzAction::CreateDatabase | AuthzAction::DeleteDatabase | AuthzAction::UpdateTenant => {
-                forbidden()
-            }
+            AuthzAction::CreateDatabase
+            | AuthzAction::DeleteDatabase
+            | AuthzAction::UpdateTenant => forbidden(),
             _ => match &resource.database {
                 Some(database) if user.databases.contains(database) => Ok(()),
                 _ => forbidden(),
@@ -337,35 +339,116 @@ users:
     fn keys_answer_as_chroma_cloud() {
         let auth = auth_with(CREDENTIALS, None);
         let list = AuthzAction::ListCollections;
-        assert_eq!(status(&auth, &HeaderMap::new(), list, resource("tenant_a", Some("db_a"))), StatusCode::UNAUTHORIZED);
-        assert_eq!(status(&auth, &token("wrong"), list, resource("tenant_a", Some("db_a"))), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            status(
+                &auth,
+                &HeaderMap::new(),
+                list,
+                resource("tenant_a", Some("db_a"))
+            ),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(
+                &auth,
+                &token("wrong"),
+                list,
+                resource("tenant_a", Some("db_a"))
+            ),
+            StatusCode::UNAUTHORIZED
+        );
         // The tenant key: every database of its tenant, no other tenant.
         let a = token("token-a");
-        assert_eq!(status(&auth, &a, list, resource("tenant_a", Some("db_a"))), StatusCode::OK);
-        assert_eq!(status(&auth, &a, list, resource("tenant_a", Some("other"))), StatusCode::OK);
-        assert_eq!(status(&auth, &a, AuthzAction::CreateDatabase, resource("tenant_a", Some("new"))), StatusCode::OK);
-        assert_eq!(status(&auth, &a, list, resource("tenant_b", Some("db_b"))), StatusCode::FORBIDDEN);
-        assert_eq!(status(&auth, &a, AuthzAction::GetTenant, resource("default_tenant", None)), StatusCode::FORBIDDEN);
+        assert_eq!(
+            status(&auth, &a, list, resource("tenant_a", Some("db_a"))),
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&auth, &a, list, resource("tenant_a", Some("other"))),
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(
+                &auth,
+                &a,
+                AuthzAction::CreateDatabase,
+                resource("tenant_a", Some("new"))
+            ),
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&auth, &a, list, resource("tenant_b", Some("db_b"))),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(
+                &auth,
+                &a,
+                AuthzAction::GetTenant,
+                resource("default_tenant", None)
+            ),
+            StatusCode::FORBIDDEN
+        );
         // The key of one database: that database, the list of the databases, nothing else.
         let db = token("token-a-db");
-        assert_eq!(status(&auth, &db, list, resource("tenant_a", Some("db_a"))), StatusCode::OK);
-        assert_eq!(status(&auth, &db, AuthzAction::ListDatabases, resource("tenant_a", None)), StatusCode::OK);
-        assert_eq!(status(&auth, &db, list, resource("tenant_a", Some("other"))), StatusCode::FORBIDDEN);
-        assert_eq!(status(&auth, &db, AuthzAction::CreateDatabase, resource("tenant_a", Some("new"))), StatusCode::FORBIDDEN);
+        assert_eq!(
+            status(&auth, &db, list, resource("tenant_a", Some("db_a"))),
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(
+                &auth,
+                &db,
+                AuthzAction::ListDatabases,
+                resource("tenant_a", None)
+            ),
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&auth, &db, list, resource("tenant_a", Some("other"))),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(
+                &auth,
+                &db,
+                AuthzAction::CreateDatabase,
+                resource("tenant_a", Some("new"))
+            ),
+            StatusCode::FORBIDDEN
+        );
         // The key of every tenant.
         let admin = token("admin-token");
-        assert_eq!(status(&auth, &admin, list, resource("tenant_b", Some("db_b"))), StatusCode::OK);
-        assert_eq!(status(&auth, &admin, AuthzAction::CreateTenant, resource("new", None)), StatusCode::OK);
-        assert_eq!(status(&auth, &a, AuthzAction::CreateTenant, resource("new", None)), StatusCode::FORBIDDEN);
+        assert_eq!(
+            status(&auth, &admin, list, resource("tenant_b", Some("db_b"))),
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(
+                &auth,
+                &admin,
+                AuthzAction::CreateTenant,
+                resource("new", None)
+            ),
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&auth, &a, AuthzAction::CreateTenant, resource("new", None)),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[test]
     fn identity_is_the_identity_of_the_key() {
         let auth = auth_with(CREDENTIALS, None);
-        let identity = TokenAuthentication::identity(auth.authenticate(&token("token-a-db")).unwrap());
+        let identity =
+            TokenAuthentication::identity(auth.authenticate(&token("token-a-db")).unwrap());
         assert_eq!(identity.user_id, "team_a_db");
         assert_eq!(identity.tenant, "tenant_a");
-        assert_eq!(identity.databases, ["db_a".to_string()].into_iter().collect());
+        assert_eq!(
+            identity.databases,
+            ["db_a".to_string()].into_iter().collect()
+        );
         // As Chroma Cloud, a key of every database has an empty list of databases.
         let identity = TokenAuthentication::identity(auth.authenticate(&token("token-a")).unwrap());
         assert!(identity.databases.is_empty());
@@ -391,7 +474,8 @@ users:
     #[test]
     fn invalid_credentials_are_rejected_at_startup() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(b"users:\n  - id: a\n    tokens: [same]\n  - id: b\n    tokens: [same]\n").unwrap();
+        file.write_all(b"users:\n  - id: a\n    tokens: [same]\n  - id: b\n    tokens: [same]\n")
+            .unwrap();
         let mut config = FrontendServerConfig::single_node_default();
         config.server_authn_credentials_file = Some(file.path().to_str().unwrap().to_string());
         assert!(matches!(

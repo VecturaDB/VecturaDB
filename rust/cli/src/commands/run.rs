@@ -143,9 +143,7 @@ fn display_run_message(config: &FrontendServerConfig, term: &mut dyn Terminal) {
     ));
     term.println(&format!(
         "Getting started guide: {}",
-        "https://vecturadb.org\n"
-            .underline()
-            .blue()
+        "https://vecturadb.org\n".underline().blue()
     ));
 }
 
