@@ -162,6 +162,8 @@ pub struct LocalCompactionManager {
     spann_version_grace: Duration,
     // When SPANN collections flush: see LocalCompactionManagerConfig.
     compaction_interval: Duration,
+    // How often the attached functions left half-way are looked for (cleanup_expired_partial).
+    partial_attach_cleanup_interval: Duration,
     min_compaction_size: usize,
     max_compaction_size: usize,
     max_partition_size: usize,
@@ -220,6 +222,11 @@ impl PurgeSchedule {
 // writes records BackfillFn to the log of its input collection, and the apply that sees them reads the catalog again.
 // How long the queue of a collection waits for a window before it goes.
 const QUEUE_IDLE: Duration = Duration::from_secs(600);
+
+// How old an attached function left half-way must be to go. In distributed Chroma, the caller of
+// CleanupExpiredPartialAttachedFunctions gives it.
+const PARTIAL_ATTACH_MAX_AGE: Duration = Duration::from_secs(3600);
+const PARTIAL_ATTACH_CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
 
 #[derive(Clone, Default)]
 struct FunctionRuns {
@@ -441,6 +448,7 @@ impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
             spann_versions: HashMap::new(),
             spann_version_grace: registry.get::<SpannVersionGrace>().unwrap_or_default().0,
             compaction_interval: Duration::from_secs(config.compaction_interval_sec),
+            partial_attach_cleanup_interval: PARTIAL_ATTACH_CLEANUP_INTERVAL,
             min_compaction_size: config.min_compaction_size,
             max_compaction_size: config.max_compaction_size,
             max_partition_size: config.max_partition_size,
@@ -486,6 +494,20 @@ impl Component for LocalCompactionManager {
                 ))
             },
         );
+        self.schedule_partial_attach_cleanup(Duration::ZERO, ctx);
+    }
+}
+
+impl LocalCompactionManager {
+    fn schedule_partial_attach_cleanup(&self, after: Duration, ctx: &ComponentContext<Self>) {
+        ctx.scheduler
+            .schedule(CleanupPartialAttachesMessage {}, after, ctx, || {
+                Some(tracing::span!(
+                    parent: None,
+                    tracing::Level::INFO,
+                    "Cleanup of the partial attaches"
+                ))
+            });
     }
 }
 
@@ -555,6 +577,11 @@ impl ChromaError for CompactionManagerError {
 pub struct PurgeLogsMessage {
     pub collection_id: CollectionUuid,
 }
+
+/// The cleanup of the attached functions left half-way by a stop during their attach, when the manager starts and then
+/// at every PARTIAL_ATTACH_CLEANUP_INTERVAL: without it, their completion offset of 0 keeps the log of their input.
+#[derive(Clone, Debug)]
+pub struct CleanupPartialAttachesMessage {}
 
 #[derive(Clone, Debug)]
 pub struct BackfillMessage {
@@ -955,6 +982,42 @@ impl Handler<PurgeLogsMessage> for LocalCompactionManager {
         }
         self.purges.request(message.collection_id);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<CleanupPartialAttachesMessage> for LocalCompactionManager {
+    type Result = ();
+
+    async fn handle(
+        &mut self,
+        _message: CleanupPartialAttachesMessage,
+        ctx: &ComponentContext<LocalCompactionManager>,
+    ) -> Self::Result {
+        self.schedule_partial_attach_cleanup(self.partial_attach_cleanup_interval, ctx);
+        let inputs = match attached_functions::run::cleanup_expired_partial(
+            &self.sqlite_db,
+            PARTIAL_ATTACH_MAX_AGE,
+        )
+        .await
+        {
+            Ok(inputs) => inputs,
+            Err(err) => {
+                tracing::error!(error = %err, "Cleanup of the partial attaches failed");
+                return;
+            }
+        };
+        // The log that these functions held back goes now, not at the next write of their input collections.
+        for collection_id in inputs {
+            self.purged.remove(&collection_id);
+            if let Err(err) = self.purge_requested(collection_id).await {
+                tracing::warn!(
+                    collection_id = %collection_id,
+                    error = %err,
+                    "Purge of the log after the cleanup of a partial attach failed"
+                );
+            }
+        }
     }
 }
 
@@ -1523,27 +1586,16 @@ impl LocalCompactionManager {
         }
         // Read durable watermarks without loading HNSW, but do not trust a
         // watermark when its checkpoint has since become unusable.
-        let max_seq_id = max_purge_seq_id(
+        let PurgeLimit {
+            max_seq_id,
+            purge_seq_id,
+        } = purge_limit(
             &self.sqlite_db,
+            collection_id,
             &collection_segments.metadata_segment.id,
             &collection_segments.vector_segment.id,
         )
         .await?;
-        // As the garbage collector of distributed Chroma keeps the log that its attached functions have not run on
-        // (fetch_min_attached_function_completion_offset.rs): no record after the lowest completion offset of the
-        // functions of the collection goes, as GetMinCompletionOffsetForCollection of the coordinator reads it. A
-        // function that keeps failing holds back the purge of its input collection, as in distributed Chroma.
-        let min_completion_offset: Option<i64> = sqlx::query_scalar(
-            "SELECT MIN(completion_offset) FROM attached_functions WHERE input_collection_id = $1 AND is_deleted = FALSE",
-        )
-        .bind(collection_id.to_string())
-        .fetch_one(self.sqlite_db.get_conn())
-        .await
-        .map_err(|_| CompactionManagerError::PurgeLogsFailure)?;
-        let purge_seq_id = match min_completion_offset {
-            Some(offset) => max_seq_id.min(offset.max(0) as u64 + 1),
-            None => max_seq_id,
-        };
         if let Log::Sqlite(log) = &mut self.log {
             if !log
                 .has_purge_work(collection_id, purge_seq_id)
@@ -2057,6 +2109,43 @@ async fn max_purge_seq_id(
         .current_max_seq_id(metadata)
         .await?
         .min(reader.current_max_seq_id(vector).await?))
+}
+
+/// How far the log of a collection can be purged: the same limit for the server and for vacuum.
+pub struct PurgeLimit {
+    /// The lowest position of the segments of the collection.
+    pub max_seq_id: u64,
+    /// The records below this one can go.
+    pub purge_seq_id: u64,
+}
+
+/// The limit of the purge of the log of a collection, from the positions of its segments and its attached functions.
+pub async fn purge_limit(
+    sqlite: &SqliteDb,
+    collection_id: CollectionUuid,
+    metadata: &SegmentUuid,
+    vector: &SegmentUuid,
+) -> Result<PurgeLimit, CompactionManagerError> {
+    let max_seq_id = max_purge_seq_id(sqlite, metadata, vector).await?;
+    // As the garbage collector of distributed Chroma keeps the log that its attached functions have not run on
+    // (fetch_min_attached_function_completion_offset.rs): no record after the lowest completion offset of the
+    // functions of the collection goes, as GetMinCompletionOffsetForCollection of the coordinator reads it. A
+    // function that keeps failing holds back the purge of its input collection, as in distributed Chroma.
+    let min_completion_offset: Option<i64> = sqlx::query_scalar(
+        "SELECT MIN(completion_offset) FROM attached_functions WHERE input_collection_id = $1 AND is_deleted = FALSE",
+    )
+    .bind(collection_id.to_string())
+    .fetch_one(sqlite.get_conn())
+    .await
+    .map_err(|_| CompactionManagerError::PurgeLogsFailure)?;
+    let purge_seq_id = match min_completion_offset {
+        Some(offset) => max_seq_id.min(offset.max(0) as u64 + 1),
+        None => max_seq_id,
+    };
+    Ok(PurgeLimit {
+        max_seq_id,
+        purge_seq_id,
+    })
 }
 
 #[cfg(test)]

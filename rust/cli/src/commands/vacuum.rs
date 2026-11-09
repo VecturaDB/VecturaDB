@@ -1,4 +1,4 @@
-// Changed by VecturaDB contributors for the VecturaDB branding and the lock of the data folder.
+// Changed by VecturaDB contributors for the VecturaDB branding, the lock of the data folder and the limit of the purge.
 // Copyright VecturaDB contributors. Licensed under the Apache License, Version 2.0.
 use crate::terminal::{SystemTerminal, Terminal};
 use crate::utils::CliError;
@@ -7,6 +7,7 @@ use chroma_config::Configurable;
 use chroma_frontend::config::FrontendServerConfig;
 use chroma_frontend::folder_lock::{lock_folder, FolderLock, FolderLockError, FOLDER_WAIT};
 use chroma_frontend::{Frontend, FrontendConfig};
+use chroma_log::local_compaction_manager::purge_limit;
 use chroma_log::sqlite_log::{
     legacy_embeddings_queue_config_default_kind, LegacyEmbeddingsQueueConfig, SqliteLog,
 };
@@ -189,29 +190,19 @@ pub async fn vacuum_chroma(config: FrontendConfig) -> Result<(), Box<dyn Error>>
     }
 
     for collection in collections {
-        let seq_ids = sqlx::query(
-            r#"
-                SELECT COALESCE(max_seq_id.seq_id, -1) AS seq_id
-                FROM segments
-                    LEFT JOIN max_seq_id ON segments.id = max_seq_id.segment_id
-                WHERE segments.collection = ?
-            "#,
+        // The limit of the purge of the server: no record that an attached function has not run on goes.
+        let segments = sysdb
+            .get_collection_with_segments(None, collection.collection_id)
+            .await?;
+        let limit = purge_limit(
+            &sqlite,
+            collection.collection_id,
+            &segments.metadata_segment.id,
+            &segments.vector_segment.id,
         )
-        .bind(collection.collection_id.to_string())
-        .fetch_all(sqlite.get_conn())
         .await?;
 
-        let min_seq_id: Option<i64> = seq_ids.iter().map(|row| row.get(0)).min().unwrap_or(None);
-
-        if min_seq_id.is_none() {
-            continue;
-        }
-
-        if min_seq_id.is_some() && min_seq_id.unwrap() < 0 {
-            continue;
-        }
-
-        log.purge_logs(collection.collection_id, min_seq_id.unwrap() as u64)
+        log.purge_logs(collection.collection_id, limit.purge_seq_id)
             .await?;
 
         pb.inc(1);
@@ -341,6 +332,145 @@ pub fn vacuum(args: VacuumArgs) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chroma_frontend::impls::service_based_frontend::ServiceBasedFrontend;
+    use chroma_log::LocalCompactionManager;
+    use chroma_system::ComponentHandle;
+    use chroma_types::{
+        AddCollectionRecordsRequest, AttachFunctionRequest, CreateCollectionRequest,
+        InternalCollectionConfiguration, InternalHnswConfiguration, VectorIndexConfiguration,
+    };
+
+    // The configuration of a frontend on the folder given, which vacuum opens as it is.
+    fn config_on(root: &Path) -> FrontendConfig {
+        let mut config = FrontendConfig::sqlite_in_memory();
+        config.sqlitedb.as_mut().unwrap().url =
+            Some(root.join("chroma.sqlite3").to_str().unwrap().into());
+        config.segment_manager.as_mut().unwrap().persist_path = Some(root.to_str().unwrap().into());
+        config
+    }
+
+    // The records of the log of a collection after the offset given.
+    async fn log_rows_after(root: &Path, collection: CollectionUuid, offset: i64) -> i64 {
+        let db = sqlx::SqlitePool::connect(root.join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let rows = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM embeddings_queue WHERE topic LIKE '%' || ? AND seq_id > ?",
+        )
+        .bind(collection.to_string())
+        .bind(offset)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        db.close().await;
+        rows
+    }
+
+    // A function behind its input keeps the log it has not run on, as the purge of the server keeps it (the lowest
+    // completion offset of the functions of the collection, in local_compaction_manager.rs): a vacuum must keep it too.
+    #[tokio::test]
+    async fn vacuum_keeps_the_log_a_function_has_not_run_on() {
+        let root = tempfile::tempdir().unwrap();
+        let config = config_on(root.path());
+        let registry = Registry::new();
+        let system = System::new();
+        let mut frontend =
+            ServiceBasedFrontend::try_from_config(&(config.clone(), system.clone()), &registry)
+                .await
+                .unwrap();
+        let collection = frontend
+            .create_collection(
+                CreateCollectionRequest::try_new(
+                    "default_tenant".into(),
+                    DatabaseName::new("default_database").unwrap(),
+                    "vacuumed".into(),
+                    None,
+                    Some(InternalCollectionConfiguration {
+                        vector_index: VectorIndexConfiguration::Hnsw(InternalHnswConfiguration {
+                            sync_threshold: 2,
+                            ..Default::default()
+                        }),
+                        embedding_function: None,
+                    }),
+                    None,
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        frontend
+            .attach_function(
+                "default_tenant".into(),
+                DatabaseName::new("default_database").unwrap(),
+                collection.collection_id.to_string(),
+                AttachFunctionRequest::try_new(
+                    "counter".into(),
+                    "record_counter".into(),
+                    "counts".into(),
+                    serde_json::json!({}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let db = registry.get::<SqliteDb>().unwrap();
+        // The function stays behind its input: with no output collection, a run skips it.
+        sqlx::query(
+            "UPDATE attached_functions SET output_collection_id = NULL WHERE input_collection_id = ?",
+        )
+        .bind(collection.collection_id.to_string())
+        .execute(db.get_conn())
+        .await
+        .unwrap();
+        for id in 0..10 {
+            frontend
+                .add(
+                    AddCollectionRecordsRequest::try_new(
+                        "default_tenant".into(),
+                        "default_database".into(),
+                        collection.collection_id,
+                        vec![format!("r{id}")],
+                        vec![vec![1.0, 2.0, 3.0]],
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let offset: i64 = sqlx::query_scalar(
+            "SELECT completion_offset FROM attached_functions WHERE input_collection_id = ?",
+        )
+        .bind(collection.collection_id.to_string())
+        .fetch_one(db.get_conn())
+        .await
+        .unwrap();
+        drop(db);
+        let mut handle = registry
+            .get::<ComponentHandle<LocalCompactionManager>>()
+            .unwrap();
+        handle.stop();
+        handle.join().await.unwrap();
+        system.stop().await;
+        system.join().await;
+        registry.get::<SqliteDb>().unwrap().close().await;
+        drop(frontend);
+        drop(registry);
+        let before = log_rows_after(root.path(), collection.collection_id, offset).await;
+        assert!(
+            before >= 10,
+            "the server kept the log of the function behind: {before} rows"
+        );
+        vacuum_chroma(config).await.unwrap();
+        let after = log_rows_after(root.path(), collection.collection_id, offset).await;
+        assert_eq!(
+            after, before,
+            "the vacuum removed records that the function behind has not run on"
+        );
+    }
 
     // One program at a time on a data folder: vacuum on a folder that a server or an embedded client holds waits for it,
     // then refuses, with the folder in its message, and leaves the database as it was.

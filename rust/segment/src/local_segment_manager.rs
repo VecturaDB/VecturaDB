@@ -2030,6 +2030,8 @@ mod tests {
             tokio::task::yield_now().await;
         }
         reused.apply_log_chunk(add(2, "b")).await.unwrap();
+        // The save of this write runs in the background: the fresh manager reads what it wrote.
+        reused.index.wait_for_save().await;
         drop((first, second, reused));
 
         // A fresh manager loads both records from disk.

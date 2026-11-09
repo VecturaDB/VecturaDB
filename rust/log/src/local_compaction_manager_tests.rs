@@ -29,6 +29,10 @@ impl Fixture {
     }
 
     async fn with_persistence(persistent: bool) -> Self {
+        Self::with(persistent, PARTIAL_ATTACH_CLEANUP_INTERVAL).await
+    }
+
+    async fn with(persistent: bool, partial_attach_cleanup_interval: Duration) -> Self {
         let db = chroma_sqlite::db::test_utils::get_new_sqlite_db().await;
         let registry = Registry::new();
         registry.register(db.clone());
@@ -94,6 +98,7 @@ impl Fixture {
             spann_versions: HashMap::new(),
             spann_version_grace: SpannVersionGrace::default().0,
             compaction_interval: Duration::from_secs(10),
+            partial_attach_cleanup_interval,
             min_compaction_size: 10,
             max_compaction_size: 10_000,
             max_partition_size: 5_000,
@@ -257,6 +262,7 @@ impl Fixture {
             spann_versions: HashMap::new(),
             spann_version_grace: SpannVersionGrace::default().0,
             compaction_interval: Duration::from_secs(10),
+            partial_attach_cleanup_interval: PARTIAL_ATTACH_CLEANUP_INTERVAL,
             min_compaction_size: 10,
             max_compaction_size: 10_000,
             max_partition_size: 5_000,
@@ -428,6 +434,65 @@ async fn purge_keeps_the_records_its_attached_functions_have_not_run_on() {
     f.purge().await.unwrap();
     let expected: Vec<_> = original.into_iter().filter(|r| r.log_offset >= 2).collect();
     assert_records(f.records().await, expected);
+    f.stop().await;
+}
+
+// The attached functions left half-way are looked for again after the start, at every interval: one that turns up after
+// the cleanup at the start goes at a later round. In the server the interval is an hour.
+#[tokio::test]
+async fn the_cleanup_of_the_partial_attaches_comes_again_after_the_start() {
+    let f = Fixture::with(true, Duration::from_millis(100)).await;
+    // The round at the start is over.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    sqlx::query(
+        "INSERT INTO attached_functions (id, name, tenant_id, database_id, input_collection_id, \
+         output_collection_name, function_id, function_params, updated_at) \
+         VALUES (?, 'half_way', 't', 'd', ?, 'out', 'f', '{}', datetime('now', '-2 hours'))",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(f.collection.collection_id.to_string())
+    .execute(f.db.get_conn())
+    .await
+    .unwrap();
+    let mut deleted = false;
+    for _ in 0..100 {
+        deleted = sqlx::query_scalar("SELECT is_deleted FROM attached_functions")
+            .fetch_one(f.db.get_conn())
+            .await
+            .unwrap();
+        if deleted {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        deleted,
+        "no round of the cleanup after the one at the start"
+    );
+    f.stop().await;
+}
+
+// The cleanup runs at every start, next to the first commands of the program: with nothing to clean it does not write,
+// so here it ends while another connection holds the lock of the writes.
+#[tokio::test]
+async fn the_cleanup_of_the_partial_attaches_does_not_write_with_nothing_to_clean() {
+    let f = Fixture::new().await;
+    let mut writer = f.db.get_conn().acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let cleaned = tokio::time::timeout(
+        Duration::from_secs(5),
+        attached_functions::run::cleanup_expired_partial(&f.db, PARTIAL_ATTACH_MAX_AGE),
+    )
+    .await;
+    sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+    drop(writer);
+    assert!(cleaned
+        .expect("the cleanup waited for the lock of the writes")
+        .unwrap()
+        .is_empty());
     f.stop().await;
 }
 
@@ -1844,6 +1909,7 @@ async fn replaced_spann_versions_are_forgotten_after_the_grace() {
         spann_versions: HashMap::new(),
         spann_version_grace: Duration::ZERO,
         compaction_interval: Duration::from_secs(10),
+        partial_attach_cleanup_interval: PARTIAL_ATTACH_CLEANUP_INTERVAL,
         min_compaction_size: 10,
         max_compaction_size: 10_000,
         max_partition_size: 5_000,
