@@ -166,6 +166,8 @@ class Settings(BaseSettings):  # type: ignore
     # The shortest time, in seconds, between two saves of a local HNSW index after its first one, whatever
     # hnsw:sync_threshold says: 0 saves at every threshold, as Chroma 1.5.9 does, in the background (VecturaDB).
     chroma_hnsw_min_save_interval_seconds: int = Field(default=30, ge=0)
+    # The limit, in MiB, of the memory that the cache of the blocks of the SPANN indexes holds (VecturaDB).
+    chroma_spann_block_cache_mib: int = Field(default=256, ge=1)
 
     allow_reset: bool = False
 
