@@ -1,7 +1,7 @@
 // Changed from the original Chroma file; see the git history for the changes and their authors.
 use crate::grpc_log::{GrpcLog, GrpcPushLogsError, GrpcSealLogError, ScoutLogFragmentsResponse};
 use crate::in_memory_log::InMemoryLog;
-use crate::sqlite_log::{SqliteLog, SqlitePushLogsError};
+use crate::sqlite_log::{FunctionPosition, SqliteLog, SqlitePushLogsError};
 use crate::types::CollectionInfo;
 use chroma_api_types::{StaleReadError, CONDITIONAL_WRITE_CONFLICT_MESSAGE};
 use chroma_error::{ChromaError, ErrorCodes};
@@ -72,6 +72,20 @@ pub enum PushLogsError {
     /// Any other push failure.
     #[error(transparent)]
     Other(Box<dyn ChromaError>),
+}
+
+// A log too full answers as the log service of distributed Chroma, through the frontend.
+fn push_error_of_sqlite(error: SqlitePushLogsError) -> PushLogsError {
+    match error {
+        SqlitePushLogsError::BackoffCompaction { retry_after } => {
+            PushLogsError::BackoffCompaction {
+                retry_after: Some(retry_after),
+            }
+        }
+        SqlitePushLogsError::ConditionalWriteConflict => PushLogsError::ConditionalWriteConflict,
+        SqlitePushLogsError::StaleRead(err) => PushLogsError::StaleRead(err),
+        other => PushLogsError::Other(Box::new(other)),
+    }
 }
 
 impl ChromaError for PushLogsError {
@@ -258,22 +272,10 @@ impl Log {
             .map_err(|_| PushLogsError::RecordCountOutOfRange(records.len()))?;
         match self {
             Log::Sqlite(log) => {
-                // A log too full answers as the log service of distributed Chroma, through the frontend.
                 let first_inserted_record_offset = log
                     .push_logs_with_condition(collection_id, records, condition.as_ref())
                     .await
-                    .map_err(|e| match e {
-                        SqlitePushLogsError::BackoffCompaction { retry_after } => {
-                            PushLogsError::BackoffCompaction {
-                                retry_after: Some(retry_after),
-                            }
-                        }
-                        SqlitePushLogsError::ConditionalWriteConflict => {
-                            PushLogsError::ConditionalWriteConflict
-                        }
-                        SqlitePushLogsError::StaleRead(err) => PushLogsError::StaleRead(err),
-                        other => PushLogsError::Other(Box::new(other)),
-                    })?;
+                    .map_err(push_error_of_sqlite)?;
                 Ok(PushLogsResult {
                     record_count,
                     first_inserted_record_offset,
@@ -290,6 +292,27 @@ impl Log {
                     unimplemented!()
                 }
             }
+        }
+    }
+
+    /// The output of a run of an attached function and the new position of the function, in one transaction of the log
+    /// of the single node: the only log whose runner writes the position of a function itself.
+    pub async fn push_output_of_function(
+        &mut self,
+        collection_id: CollectionUuid,
+        records: Vec<OperationRecord>,
+        position: FunctionPosition,
+    ) -> Result<(), PushLogsError> {
+        match self {
+            Log::Sqlite(log) => log
+                .push_output_of_function(collection_id, records, position)
+                .await
+                .map_err(push_error_of_sqlite),
+            Log::Grpc(_) | Log::InMemory(_) => Err(PushLogsError::Other(Box::new(
+                SqlitePushLogsError::Unimplemented(
+                    "the output of an attached function and its position in one write".to_string(),
+                ),
+            ))),
         }
     }
 
