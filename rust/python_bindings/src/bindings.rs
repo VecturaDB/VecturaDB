@@ -453,13 +453,14 @@ pub fn cli(py: Python<'_>, py_args: Option<Vec<String>>) -> ChromaPyResult<()> {
 #[pymethods]
 impl Bindings {
     #[new]
-    #[pyo3(signature = (allow_reset, sqlite_db_config, hnsw_cache_size, persist_path=None, hnsw_min_save_interval_seconds=None))]
+    #[pyo3(signature = (allow_reset, sqlite_db_config, hnsw_cache_size, persist_path=None, hnsw_min_save_interval_seconds=None, spann_block_cache_mib=None))]
     pub fn py_new(
         allow_reset: bool,
         sqlite_db_config: SqliteDBConfig,
         hnsw_cache_size: usize,
         persist_path: Option<String>,
         hnsw_min_save_interval_seconds: Option<u64>,
+        spann_block_cache_mib: Option<usize>,
         py: Python<'_>,
     ) -> ChromaPyResult<Self> {
         // Before the database opens: on a folder that another program holds, the client waits FOLDER_WAIT, then refuses.
@@ -489,6 +490,7 @@ impl Bindings {
             hnsw_index_pool_cache_config: cache_config,
             persist_path,
             hnsw_min_save_interval_seconds,
+            spann_block_cache_mib,
         };
 
         // TODO: consume the log configuration from the input python
@@ -1733,7 +1735,15 @@ mod tests {
         static PYTHON_INIT: std::sync::Once = std::sync::Once::new();
         PYTHON_INIT.call_once(pyo3::prepare_freethreaded_python);
         let bindings = Python::with_gil(|py| {
-            Bindings::py_new(true, sqlite_db_config, 16, Some(persist_path), None, py)
+            Bindings::py_new(
+                true,
+                sqlite_db_config,
+                16,
+                Some(persist_path),
+                None,
+                None,
+                py,
+            )
         })
         .expect("persistent bindings");
 

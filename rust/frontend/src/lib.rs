@@ -100,6 +100,9 @@ pub fn local_frontend_config(config: &FrontendServerConfig) -> FrontendConfig {
                 .hnsw_min_save_interval_seconds
                 .get_or_insert(seconds);
         }
+        if let Some(mib) = config.spann_block_cache_mib {
+            local_segman_cfg.spann_block_cache_mib.get_or_insert(mib);
+        }
         sql_cfg.url.get_or_insert(
             sqlite_url
                 .to_str()

@@ -58,6 +58,10 @@ pub struct LocalSegmentManagerConfig {
     /// `sync_threshold` says; 30 without it, and 0 saves at every threshold, as Chroma 1.5.9 does.
     #[serde(default)]
     pub hnsw_min_save_interval_seconds: Option<u64>,
+    /// The limit, in MiB, of the memory that the cache of the blocks of the SPANN indexes holds; 256 without it, where the
+    /// compaction service of distributed Chroma holds 1000.
+    #[serde(default)]
+    pub spann_block_cache_mib: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +100,16 @@ impl std::fmt::Debug for SpannFlushListener {
 }
 
 #[derive(Error, Debug)]
+#[error("spann_block_cache_mib must be at least 1")]
+struct SpannBlockCacheIsZero;
+
+impl ChromaError for SpannBlockCacheIsZero {
+    fn code(&self) -> ErrorCodes {
+        ErrorCodes::InvalidArgument
+    }
+}
+
+#[derive(Error, Debug)]
 #[error("Error reading the defaults of the SPANN providers: {0}")]
 struct SpannDefaultsError(serde_json::Error);
 
@@ -118,14 +132,30 @@ fn local_spann_config() -> Result<SpannProviderConfig, serde_json::Error> {
     }))
 }
 
+// The limit of the cache of the blocks of the SPANN indexes on the single node, without spann_block_cache_mib.
+const DEFAULT_SPANN_BLOCK_CACHE_MIB: usize = 256;
+
+// The most blocks of 8 MiB at the limit of a shard: a shard keeps a block heavier than its share of the capacity anyway, so
+// a limit divided in shards smaller than a block would not hold.
+fn spann_block_cache_shards(mib: usize) -> usize {
+    (mib / 8).clamp(1, 32)
+}
+
 // The blockfiles of the SPANN index, with the settings of the compaction service of the worker
-// (rust/worker/chroma_config.yaml): blocks of 8 MiB, and a cache of 1000 of them and of 1000 roots in memory.
-fn local_blockfile_config() -> Result<BlockfileProviderConfig, serde_json::Error> {
+// (rust/worker/chroma_config.yaml), blocks of 8 MiB and a cache of 1000 roots in memory, except the cache of the blocks: a
+// single node shares its memory with the rest of the server, so it holds the limit given.
+fn local_blockfile_config(
+    block_cache_mib: usize,
+) -> Result<BlockfileProviderConfig, serde_json::Error> {
     serde_json::from_value(serde_json::json!({
         "arrow": {
             "block_manager_config": {
                 "max_block_size_bytes": 8388608,
-                "block_cache_config": {"lru": {"name": "block_cache", "capacity": 1000}},
+                "block_cache_config": {"lru": {
+                    "name": "block_cache",
+                    "capacity": block_cache_mib,
+                    "shards": spann_block_cache_shards(block_cache_mib),
+                }},
                 "num_concurrent_block_flushes": 40,
             },
             "sparse_index_manager_config": {
@@ -139,12 +169,20 @@ fn local_blockfile_config() -> Result<BlockfileProviderConfig, serde_json::Error
 // the blockfiles, and the HNSW index of the centers.
 async fn local_spann_provider(
     persist_path: &str,
+    block_cache_mib: Option<usize>,
     registry: &Registry,
 ) -> Result<SpannProvider, Box<dyn ChromaError>> {
+    let block_cache_mib = block_cache_mib.unwrap_or(DEFAULT_SPANN_BLOCK_CACHE_MIB);
+    if block_cache_mib == 0 {
+        return Err(Box::new(SpannBlockCacheIsZero));
+    }
     let storage = Storage::Local(LocalStorage::new(persist_path));
     let defaults = |e| -> Box<dyn ChromaError> { Box::new(SpannDefaultsError(e)) };
     let blockfile_provider = BlockfileProvider::try_from_config(
-        &(local_blockfile_config().map_err(defaults)?, storage.clone()),
+        &(
+            local_blockfile_config(block_cache_mib).map_err(defaults)?,
+            storage.clone(),
+        ),
         registry,
     )
     .await?;
@@ -328,7 +366,9 @@ impl Configurable<LocalSegmentManagerConfig> for LocalSegmentManager {
             }
         });
         let spann_provider = match &config.persist_path {
-            Some(persist_path) => Some(local_spann_provider(persist_path, registry).await?),
+            Some(persist_path) => Some(
+                local_spann_provider(persist_path, config.spann_block_cache_mib, registry).await?,
+            ),
             None => None,
         };
         // The compactor forks the HNSW index of the centers with a provider of its own, so that a reader does not find
@@ -336,7 +376,9 @@ impl Configurable<LocalSegmentManagerConfig> for LocalSegmentManager {
         // copy of every block in memory held twice as much as 1.0.0-preview.4.
         let compaction_spann_provider = match &config.persist_path {
             Some(persist_path) => {
-                let mut provider = local_spann_provider(persist_path, registry).await?;
+                let mut provider =
+                    local_spann_provider(persist_path, config.spann_block_cache_mib, registry)
+                        .await?;
                 if let Some(readers) = &spann_provider {
                     provider.blockfile_provider = readers.blockfile_provider.clone();
                 }
@@ -1140,16 +1182,53 @@ mod tests {
         ] {
             assert_eq!(local[setting], compaction[setting], "{setting}");
         }
-        let blockfiles = serde_json::to_value(
+        let mut blockfiles = serde_json::to_value(
             serde_json::from_value::<BlockfileProviderConfig>(
                 worker.compaction_service.blockfile_provider,
             )
             .unwrap(),
         )
         .unwrap();
+        let mut local =
+            serde_json::to_value(local_blockfile_config(DEFAULT_SPANN_BLOCK_CACHE_MIB).unwrap())
+                .unwrap();
+        // The cache of the blocks is the one setting of the single node: see the test after this one.
+        for config in [&mut local, &mut blockfiles] {
+            config["Arrow"]["block_manager_config"]["block_cache_config"] = serde_json::Value::Null;
+        }
+        assert_eq!(local, blockfiles);
+    }
+
+    // The cache of the blocks of SPANN holds 256 MiB by default, in shards that each take at least a block of 8 MiB, so that
+    // the limit holds.
+    #[test]
+    fn the_block_cache_of_spann_holds_its_limit_in_shards_of_at_least_a_block() {
+        let read = |mib: usize| {
+            let config = serde_json::to_value(local_blockfile_config(mib).unwrap()).unwrap();
+            let cache = config["Arrow"]["block_manager_config"]["block_cache_config"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            (cache["capacity"].as_u64(), cache["shards"].as_u64())
+        };
+        assert_eq!(DEFAULT_SPANN_BLOCK_CACHE_MIB, 256);
+        assert_eq!(read(256), (Some(256), Some(32)));
+        assert_eq!(read(100), (Some(100), Some(12)));
+        assert_eq!(read(1000), (Some(1000), Some(32)));
+        assert_eq!(read(1), (Some(1), Some(1)));
+    }
+
+    #[tokio::test]
+    async fn a_block_cache_of_zero_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let refused =
+            local_spann_provider(root.path().to_str().unwrap(), Some(0), &Registry::new()).await;
         assert_eq!(
-            serde_json::to_value(local_blockfile_config().unwrap()).unwrap(),
-            blockfiles
+            refused.err().map(|e| e.code()),
+            Some(ErrorCodes::InvalidArgument)
         );
     }
 
@@ -1171,6 +1250,7 @@ mod tests {
             hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
             persist_path: Some(root.path().to_str().unwrap().to_string()),
             hnsw_min_save_interval_seconds: None,
+            spann_block_cache_mib: None,
         };
         let open = || async {
             let registry = Registry::new();
@@ -1307,6 +1387,7 @@ mod tests {
                 hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                 persist_path: Some(root.path().to_str().unwrap().to_string()),
                 hnsw_min_save_interval_seconds: None,
+                spann_block_cache_mib: None,
             },
             &registry,
         )
@@ -1417,6 +1498,7 @@ mod tests {
                 hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                 persist_path: Some(root.path().to_str().unwrap().to_string()),
                 hnsw_min_save_interval_seconds: None,
+                spann_block_cache_mib: None,
             },
             &registry,
         )
@@ -1454,6 +1536,7 @@ mod tests {
                 hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                 persist_path: Some(root.path().to_str().unwrap().to_string()),
                 hnsw_min_save_interval_seconds: None,
+                spann_block_cache_mib: None,
             },
             &registry,
         )
@@ -1508,6 +1591,7 @@ mod tests {
                 hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                 persist_path: Some(root.path().to_str().unwrap().to_string()),
                 hnsw_min_save_interval_seconds: None,
+                spann_block_cache_mib: None,
             },
             &registry,
         )
@@ -1578,6 +1662,7 @@ mod tests {
                 hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                 persist_path: Some(root.path().to_str().unwrap().to_string()),
                 hnsw_min_save_interval_seconds: None,
+                spann_block_cache_mib: None,
             },
             &registry,
         )
@@ -1600,6 +1685,7 @@ mod tests {
                 hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                 persist_path: Some(root.path().to_str().unwrap().to_string()),
                 hnsw_min_save_interval_seconds: None,
+                spann_block_cache_mib: None,
             },
             &registry,
         )
@@ -1746,6 +1832,7 @@ mod tests {
                     hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                     persist_path,
                     hnsw_min_save_interval_seconds: None,
+                    spann_block_cache_mib: None,
                 },
                 &registry,
             )
@@ -1772,6 +1859,7 @@ mod tests {
                 hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                 persist_path: Some(root.path().to_str().unwrap().to_string()),
                 hnsw_min_save_interval_seconds: None,
+                spann_block_cache_mib: None,
             },
             &registry,
         )
@@ -1885,6 +1973,7 @@ mod tests {
             hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
             persist_path: Some(root.path().to_str().unwrap().to_owned()),
             hnsw_min_save_interval_seconds: None,
+            spann_block_cache_mib: None,
         };
         let registry = Registry::new();
         registry.register(sqlite.clone());
@@ -1972,6 +2061,7 @@ mod tests {
             hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
             persist_path: Some(root.path().to_str().unwrap().to_string()),
             hnsw_min_save_interval_seconds: None,
+            spann_block_cache_mib: None,
         };
         let registry = Registry::new();
         registry.register(sqlite.clone());
@@ -2058,6 +2148,7 @@ mod tests {
                 hnsw_index_pool_cache_config: default_hnsw_index_pool_cache_config(),
                 persist_path: Some(root.path().to_str().unwrap().to_string()),
                 hnsw_min_save_interval_seconds: seconds,
+                spann_block_cache_mib: None,
             };
             let registry = Registry::new();
             registry.register(sqlite.clone());
