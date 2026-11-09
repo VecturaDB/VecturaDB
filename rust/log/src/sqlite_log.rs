@@ -11,8 +11,8 @@ use chroma_sqlite::{db::SqliteDb, helpers::get_embeddings_queue_topic_name};
 use chroma_system::{ChannelError, ComponentHandle, RequestError};
 use chroma_types::chroma_proto::PushLogsCondition;
 use chroma_types::{
-    CollectionUuid, LogRecord, Operation, OperationRecord, ResetError, ResetResponse,
-    ScalarEncoding, ScalarEncodingConversionError, SegmentType, UpdateMetadata,
+    AttachedFunctionUuid, CollectionUuid, LogRecord, Operation, OperationRecord, ResetError,
+    ResetResponse, ScalarEncoding, ScalarEncodingConversionError, SegmentType, UpdateMetadata,
     UpdateMetadataValue,
 };
 use futures::TryStreamExt;
@@ -53,8 +53,17 @@ impl ChromaError for SqlitePullLogsError {
     }
 }
 
+/// The new position of an attached function, written with the output of its run.
+#[derive(Clone, Copy, Debug)]
+pub struct FunctionPosition {
+    pub id: AttachedFunctionUuid,
+    pub completion_offset: u64,
+}
+
 #[derive(Error, Debug)]
 pub enum SqlitePushLogsError {
+    #[error("The attached function is no longer attached")]
+    FunctionNotAttached,
     #[error("Error in compaction: {0}")]
     CompactionError(#[from] CompactionManagerError),
     #[error("Error setting compactor handle")]
@@ -97,6 +106,7 @@ pub enum SqlitePushLogsError {
 impl ChromaError for SqlitePushLogsError {
     fn code(&self) -> ErrorCodes {
         match self {
+            SqlitePushLogsError::FunctionNotAttached => ErrorCodes::NotFound,
             SqlitePushLogsError::CompactionError(e) => e.code(),
             SqlitePushLogsError::CompactorHandleSetError => ErrorCodes::FailedPrecondition,
             SqlitePushLogsError::MaxBatchSizeSetError => ErrorCodes::FailedPrecondition,
@@ -777,6 +787,31 @@ impl SqliteLog {
         records: Vec<OperationRecord>,
         condition: Option<&PushLogsCondition>,
     ) -> Result<Option<i64>, SqlitePushLogsError> {
+        self.write_logs(collection_id, records, condition, None)
+            .await
+    }
+
+    // The output of a run of an attached function into the log of its output collection, and the new position of the
+    // function, in one transaction: a run that a kill interrupts has written both or neither, so a function that reads the
+    // log again from its position never writes the same output twice.
+    pub(super) async fn push_output_of_function(
+        &mut self,
+        collection_id: CollectionUuid,
+        records: Vec<OperationRecord>,
+        position: FunctionPosition,
+    ) -> Result<(), SqlitePushLogsError> {
+        self.write_logs(collection_id, records, None, Some(position))
+            .await
+            .map(|_| ())
+    }
+
+    async fn write_logs(
+        &mut self,
+        collection_id: CollectionUuid,
+        records: Vec<OperationRecord>,
+        condition: Option<&PushLogsCondition>,
+        position: Option<FunctionPosition>,
+    ) -> Result<Option<i64>, SqlitePushLogsError> {
         if records.is_empty() {
             // As the log service of distributed Chroma: a commit of a delete with a filter has no records.
             if condition.is_some() {
@@ -889,6 +924,20 @@ impl SqliteLog {
             } else {
                 let query = query_builder.build();
                 query.execute(&mut *tx).await.map_err(WrappedSqlxError)?;
+            }
+        }
+        if let Some(position) = position {
+            let updated = sqlx::query(
+                "UPDATE attached_functions SET completion_offset = $1, failure_count = 0, \
+                 updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') WHERE id = $2 AND is_deleted = FALSE",
+            )
+            .bind(position.completion_offset as i64)
+            .bind(position.id.0.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(WrappedSqlxError)?;
+            if updated.rows_affected() == 0 {
+                return Err(SqlitePushLogsError::FunctionNotAttached);
             }
         }
         // The commit and the backfill of the write run in a task of their own. A client that goes away drops the future of

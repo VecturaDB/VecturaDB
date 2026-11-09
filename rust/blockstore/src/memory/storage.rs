@@ -1,6 +1,6 @@
 use crate::key::{CompositeKey, KeyWrapper};
 use chroma_error::ChromaError;
-use chroma_types::{DataRecord, QuantizedCluster, SpannPostingList, SparsePostingBlock};
+use chroma_types::{DataRecord, Metadata, QuantizedCluster, SpannPostingList, SparsePostingBlock};
 use parking_lot::RwLock;
 use roaring::RoaringBitmap;
 use std::{
@@ -572,9 +572,33 @@ impl Writeable for &DataRecord<'_> {
             .insert(
                 CompositeKey {
                     prefix: prefix.to_string(),
-                    key,
+                    key: key.clone(),
                 },
                 value.embedding.to_vec(),
+            );
+        storage
+            .data_record_metadata_storage
+            .write()
+            .as_mut()
+            .unwrap()
+            .insert(
+                CompositeKey {
+                    prefix: prefix.to_string(),
+                    key: key.clone(),
+                },
+                value.metadata.clone(),
+            );
+        storage
+            .data_record_document_storage
+            .write()
+            .as_mut()
+            .unwrap()
+            .insert(
+                CompositeKey {
+                    prefix: prefix.to_string(),
+                    key,
+                },
+                value.document.map(str::to_string),
             );
     }
 
@@ -590,6 +614,24 @@ impl Writeable for &DataRecord<'_> {
             });
         storage
             .data_record_embedding_storage
+            .write()
+            .as_mut()
+            .unwrap()
+            .remove(&CompositeKey {
+                prefix: prefix.to_string(),
+                key: key.clone(),
+            });
+        storage
+            .data_record_metadata_storage
+            .write()
+            .as_mut()
+            .unwrap()
+            .remove(&CompositeKey {
+                prefix: prefix.to_string(),
+                key: key.clone(),
+            });
+        storage
+            .data_record_document_storage
             .write()
             .as_mut()
             .unwrap()
@@ -704,13 +746,24 @@ impl<'referred_data> Readable<'referred_data> for DataRecord<'referred_data> {
         })?;
         let embedding = storage.data_record_embedding_storage.get(&CompositeKey {
             prefix: prefix.to_string(),
-            key,
+            key: key.clone(),
         })?;
+        let composite = CompositeKey {
+            prefix: prefix.to_string(),
+            key,
+        };
         Some(DataRecord {
             id,
             embedding,
-            metadata: None,
-            document: None,
+            metadata: storage
+                .data_record_metadata_storage
+                .get(&composite)
+                .cloned()
+                .flatten(),
+            document: storage
+                .data_record_document_storage
+                .get(&composite)
+                .and_then(|document| document.as_deref()),
         })
     }
 
@@ -736,8 +789,15 @@ impl<'referred_data> Readable<'referred_data> for DataRecord<'referred_data> {
                     DataRecord {
                         id: v,
                         embedding,
-                        metadata: None,
-                        document: None,
+                        metadata: storage
+                            .data_record_metadata_storage
+                            .get(k)
+                            .cloned()
+                            .flatten(),
+                        document: storage
+                            .data_record_document_storage
+                            .get(k)
+                            .and_then(|document| document.as_deref()),
                     },
                 )
             })
@@ -850,6 +910,10 @@ pub struct StorageBuilder {
     data_record_id_storage: Arc<RwLock<Option<BTreeMap<CompositeKey, String>>>>,
     #[allow(clippy::type_complexity)]
     data_record_embedding_storage: Arc<RwLock<Option<BTreeMap<CompositeKey, Vec<f32>>>>>,
+    #[allow(clippy::type_complexity)]
+    data_record_metadata_storage: Arc<RwLock<Option<BTreeMap<CompositeKey, Option<Metadata>>>>>,
+    #[allow(clippy::type_complexity)]
+    data_record_document_storage: Arc<RwLock<Option<BTreeMap<CompositeKey, Option<String>>>>>,
     pub(super) id: uuid::Uuid,
 }
 
@@ -869,6 +933,8 @@ pub struct Storage {
     // Data Record Fields
     data_record_id_storage: Arc<BTreeMap<CompositeKey, String>>,
     data_record_embedding_storage: Arc<BTreeMap<CompositeKey, Vec<f32>>>,
+    data_record_metadata_storage: Arc<BTreeMap<CompositeKey, Option<Metadata>>>,
+    data_record_document_storage: Arc<BTreeMap<CompositeKey, Option<String>>>,
     pub(super) id: uuid::Uuid,
 }
 
@@ -903,6 +969,8 @@ impl StorageManager {
             uint32_array_storage: Arc::new(RwLock::new(Some(BTreeMap::new()))),
             data_record_id_storage: Arc::new(RwLock::new(Some(BTreeMap::new()))),
             data_record_embedding_storage: Arc::new(RwLock::new(Some(BTreeMap::new()))),
+            data_record_metadata_storage: Arc::new(RwLock::new(Some(BTreeMap::new()))),
+            data_record_document_storage: Arc::new(RwLock::new(Some(BTreeMap::new()))),
             id,
         };
         let mut cache_guard = self.write_cache.write();
@@ -933,6 +1001,18 @@ impl StorageManager {
                 .into(),
             data_record_embedding_storage: builder
                 .data_record_embedding_storage
+                .write()
+                .take()
+                .unwrap()
+                .into(),
+            data_record_metadata_storage: builder
+                .data_record_metadata_storage
+                .write()
+                .take()
+                .unwrap()
+                .into(),
+            data_record_document_storage: builder
+                .data_record_document_storage
                 .write()
                 .take()
                 .unwrap()

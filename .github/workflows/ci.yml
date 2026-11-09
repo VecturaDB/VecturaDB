@@ -344,6 +344,11 @@ jobs:
         run: >-
           cargo nextest run --profile ci -p chroma-storage --lib
           -E 'test(/^local::tests::/)'
+      - name: Tests of the in-memory blockfile of the single node
+        # The attached functions of the single node rebuild the records as they were before a write in rust/blockstore/src/memory
+        run: >-
+          cargo nextest run --profile ci -p chroma-blockstore --lib
+          -E 'test(/^memory::/)'
 
   python-tests:
     name: Python tests (single-node)

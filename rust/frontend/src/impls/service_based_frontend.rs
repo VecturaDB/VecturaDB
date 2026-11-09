@@ -7140,6 +7140,456 @@ mod tests {
         assert_eq!(tombstones, 1);
     }
 
+    // The upsert of one record with the metadata given.
+    async fn upsert_with(
+        frontend: &mut ServiceBasedFrontend,
+        collection: &Collection,
+        id: &str,
+        metadata: &[(&str, chroma_types::UpdateMetadataValue)],
+    ) {
+        frontend
+            .upsert(
+                chroma_types::UpsertCollectionRecordsRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    collection.collection_id,
+                    vec![id.to_string()],
+                    vec![vec![1.0, 2.0]],
+                    None,
+                    None,
+                    Some(vec![Some(chroma_types::UpdateMetadata::from_iter(
+                        metadata
+                            .iter()
+                            .map(|(key, value)| (key.to_string(), value.clone())),
+                    ))]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // The attached function of the name given, made with the function given, and the id of its output collection.
+    async fn attach_named(
+        frontend: &mut ServiceBasedFrontend,
+        collection: &Collection,
+        name: &str,
+        function: &str,
+        output: &str,
+    ) -> CollectionUuid {
+        frontend
+            .attach_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                AttachFunctionRequest::try_new(
+                    name.to_string(),
+                    function.to_string(),
+                    output.to_string(),
+                    serde_json::json!({}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        frontend
+            .get_attached_function(
+                TENANT.to_string(),
+                DatabaseName::new(DATABASE).unwrap(),
+                collection.collection_id.to_string(),
+                name.to_string(),
+            )
+            .await
+            .unwrap()
+            .output_collection_id
+            .unwrap()
+    }
+
+    // The ids and metadatas of every record of an output collection.
+    async fn output_records(
+        frontend: &mut ServiceBasedFrontend,
+        output: CollectionUuid,
+    ) -> Vec<(String, chroma_types::Metadata)> {
+        let got = frontend
+            .get(
+                GetRequest::try_new(
+                    TENANT.to_string(),
+                    DATABASE.to_string(),
+                    output,
+                    None,
+                    None,
+                    None,
+                    0,
+                    chroma_types::IncludeList(vec![chroma_types::Include::Metadata]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        got.ids
+            .into_iter()
+            .zip(
+                got.metadatas
+                    .into_iter()
+                    .flatten()
+                    .map(Option::unwrap_or_default),
+            )
+            .collect()
+    }
+
+    // The records of an output collection once the test given holds of them, within 10 seconds, or as they are then.
+    async fn wait_for_output(
+        frontend: &mut ServiceBasedFrontend,
+        output: CollectionUuid,
+        done: impl Fn(&[(String, chroma_types::Metadata)]) -> bool,
+    ) -> Vec<(String, chroma_types::Metadata)> {
+        let mut records = Vec::new();
+        for _ in 0..100 {
+            records = output_records(frontend, output).await;
+            if done(&records) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        records
+    }
+
+    // The state that a kill of the server leaves between the apply of a window and the run of its synchronous
+    // functions, the window applied and the functions behind it: the window of the write given runs while the functions
+    // of the collection have no output collection, which a run skips (as in a_window_where_no_function_runs_counts_its_
+    // apply_only), and their output collection comes back after it. The write makes the number of windows given.
+    async fn miss_the_window_of<F: std::future::Future<Output = ()>>(
+        db: &sqlx::SqlitePool,
+        collection: &Collection,
+        windows: i64,
+        write: F,
+    ) {
+        let outputs: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, output_collection_id FROM attached_functions WHERE input_collection_id = $1",
+        )
+        .bind(collection.collection_id.to_string())
+        .fetch_all(db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE attached_functions SET output_collection_id = NULL WHERE input_collection_id = $1",
+        )
+        .bind(collection.collection_id.to_string())
+        .execute(db)
+        .await
+        .unwrap();
+        let before = version_of(db, collection).await;
+        write.await;
+        assert_eq!(
+            wait_for_version(db, collection, before + windows).await,
+            before + windows,
+            "the windows of the write were applied"
+        );
+        for (id, output) in outputs {
+            sqlx::query("UPDATE attached_functions SET output_collection_id = $1 WHERE id = $2")
+                .bind(output)
+                .bind(id)
+                .execute(db)
+                .await
+                .unwrap();
+        }
+    }
+
+    fn int_of(metadata: &chroma_types::Metadata, key: &str) -> Option<i64> {
+        match metadata.get(key) {
+            Some(MetadataValue::Int(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    // A synchronous function behind its input, as after a kill between the apply of a window and its run, reads what it
+    // has missed from the log at the next window. revision_history keeps the revisions it archived before it: a::v1 and
+    // a::v2 still hold the versions 1 and 2 of the record.
+    #[tokio::test]
+    async fn revision_history_keeps_its_revisions_after_a_missed_window() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 3_600).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "revised_after_a_miss").await;
+        let output = attach_named(
+            &mut frontend,
+            &collection,
+            "history",
+            chroma_types::FUNCTION_REVISION_HISTORY_NAME,
+            "revisions_after_a_miss",
+        )
+        .await;
+        let version = |n| [("version", chroma_types::UpdateMetadataValue::Int(n))];
+        upsert_with(&mut frontend, &collection, "a", &version(1)).await;
+        upsert_with(&mut frontend, &collection, "a", &version(2)).await;
+        let archived = wait_for_output(&mut frontend, output, |records| {
+            records.iter().any(|(id, _)| id == "a::v2")
+        })
+        .await;
+        assert!(archived.iter().any(|(id, _)| id == "a::v2"), "{archived:?}");
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut missed = frontend.clone();
+        miss_the_window_of(&db, &collection, 1, async {
+            upsert_with(&mut missed, &collection, "a", &version(3)).await
+        })
+        .await;
+        upsert_with(&mut frontend, &collection, "a", &version(4)).await;
+        let records = wait_for_output(&mut frontend, output, |records| {
+            records.iter().any(|(id, _)| id == "a::v4")
+        })
+        .await;
+        let source_version = |id: &str| {
+            records
+                .iter()
+                .find(|(record, _)| record == id)
+                .and_then(|(_, metadata)| int_of(metadata, "source_version"))
+        };
+        assert_eq!(source_version("a::v1"), Some(1), "{records:?}");
+        assert_eq!(source_version("a::v2"), Some(2), "{records:?}");
+        assert_eq!(source_version("a::v3"), Some(3), "{records:?}");
+        assert_eq!(source_version("a::v4"), Some(4), "{records:?}");
+    }
+
+    // The same for statistics: after the run of a function behind, a value that no current record holds any more counts
+    // nothing.
+    #[tokio::test]
+    async fn statistics_count_nothing_stale_after_a_missed_window() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 3_600).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "counted_after_a_miss").await;
+        let output = attach_named(
+            &mut frontend,
+            &collection,
+            "statistics",
+            chroma_types::FUNCTION_STATISTICS_NAME,
+            "statistics_after_a_miss",
+        )
+        .await;
+        let color = |value: &str| {
+            [(
+                "color",
+                chroma_types::UpdateMetadataValue::Str(value.to_string()),
+            )]
+        };
+        let count_of = |records: &[(String, chroma_types::Metadata)], value: &str| {
+            records
+                .iter()
+                .find(|(_, metadata)| {
+                    metadata.get("key") == Some(&MetadataValue::Str("color".to_string()))
+                        && metadata.get("value") == Some(&MetadataValue::Str(value.to_string()))
+                })
+                .and_then(|(_, metadata)| int_of(metadata, "count"))
+        };
+        upsert_with(&mut frontend, &collection, "a", &color("red")).await;
+        upsert_with(&mut frontend, &collection, "b", &color("red")).await;
+        let counted = wait_for_output(&mut frontend, output, |records| {
+            count_of(records, "red") == Some(2)
+        })
+        .await;
+        assert_eq!(count_of(&counted, "red"), Some(2), "{counted:?}");
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut missed = frontend.clone();
+        miss_the_window_of(&db, &collection, 2, async {
+            upsert_with(&mut missed, &collection, "a", &color("green")).await;
+            upsert_with(&mut missed, &collection, "b", &color("green")).await;
+        })
+        .await;
+        upsert_with(&mut frontend, &collection, "c", &color("green")).await;
+        let records = wait_for_output(&mut frontend, output, |records| {
+            count_of(records, "green") == Some(3)
+        })
+        .await;
+        assert_eq!(count_of(&records, "green"), Some(3), "{records:?}");
+        assert!(
+            matches!(count_of(&records, "red"), None | Some(0)),
+            "no record is red: {records:?}"
+        );
+    }
+
+    // A record that changes takes its old value out of the statistics, with no kill: a function reads the record as it was
+    // before the write.
+    #[tokio::test]
+    async fn statistics_take_out_the_old_value_of_a_record_that_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 3_600).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "counted_as_it_changes").await;
+        let output = attach_named(
+            &mut frontend,
+            &collection,
+            "statistics",
+            chroma_types::FUNCTION_STATISTICS_NAME,
+            "statistics_as_it_changes",
+        )
+        .await;
+        let color = |value: &str| {
+            [(
+                "color",
+                chroma_types::UpdateMetadataValue::Str(value.to_string()),
+            )]
+        };
+        let count_of = |records: &[(String, chroma_types::Metadata)], value: &str| {
+            records
+                .iter()
+                .find(|(_, metadata)| {
+                    metadata.get("key") == Some(&MetadataValue::Str("color".to_string()))
+                        && metadata.get("value") == Some(&MetadataValue::Str(value.to_string()))
+                })
+                .and_then(|(_, metadata)| int_of(metadata, "count"))
+        };
+        upsert_with(&mut frontend, &collection, "a", &color("red")).await;
+        let counted = wait_for_output(&mut frontend, output, |records| {
+            count_of(records, "red") == Some(1)
+        })
+        .await;
+        assert_eq!(count_of(&counted, "red"), Some(1), "{counted:?}");
+        upsert_with(&mut frontend, &collection, "a", &color("green")).await;
+        let records = wait_for_output(&mut frontend, output, |records| {
+            count_of(records, "green") == Some(1)
+        })
+        .await;
+        assert_eq!(count_of(&records, "green"), Some(1), "{records:?}");
+        assert!(
+            matches!(count_of(&records, "red"), None | Some(0)),
+            "no record is red: {records:?}"
+        );
+    }
+
+    // A kill between the output of a run and its apply leaves that output in the log of the output collection, with the
+    // function already past it: the next run reads it, so a write into that log with no apply stands for it. The count of
+    // red there is 5; the next red record makes it 6.
+    #[tokio::test]
+    async fn a_run_reads_the_output_a_kill_left_in_the_log() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 3_600).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "output_left_in_the_log").await;
+        let output = attach_named(
+            &mut frontend,
+            &collection,
+            "statistics",
+            chroma_types::FUNCTION_STATISTICS_NAME,
+            "statistics_left_in_the_log",
+        )
+        .await;
+        let red = [(
+            "color",
+            chroma_types::UpdateMetadataValue::Str("red".to_string()),
+        )];
+        let is_red = |metadata: &chroma_types::Metadata| {
+            metadata.get("key") == Some(&MetadataValue::Str("color".to_string()))
+                && metadata.get("value") == Some(&MetadataValue::Str("red".to_string()))
+        };
+        let count_of_red = |records: &[(String, chroma_types::Metadata)]| {
+            records
+                .iter()
+                .find(|(_, metadata)| is_red(metadata))
+                .and_then(|(_, metadata)| int_of(metadata, "count"))
+        };
+        upsert_with(&mut frontend, &collection, "a", &red).await;
+        let counted = wait_for_output(&mut frontend, output, |records| {
+            count_of_red(records) == Some(1)
+        })
+        .await;
+        assert_eq!(count_of_red(&counted), Some(1), "{counted:?}");
+        let (id, mut metadata) = counted
+            .into_iter()
+            .find(|(_, metadata)| is_red(metadata))
+            .unwrap();
+        metadata.insert("count".to_string(), MetadataValue::Int(5));
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO embeddings_queue (topic, id, operation, vector, encoding, metadata) \
+             VALUES ($1, $2, 2, $3, 'FLOAT32', $4)",
+        )
+        .bind(chroma_sqlite::helpers::get_embeddings_queue_topic_name(
+            "default", "default", output,
+        ))
+        .bind(id)
+        .bind(vec![0u8; 4])
+        .bind(serde_json::to_string(&metadata).unwrap())
+        .execute(&db)
+        .await
+        .unwrap();
+        upsert_with(&mut frontend, &collection, "b", &red).await;
+        let records = wait_for_output(&mut frontend, output, |records| {
+            count_of_red(records) == Some(6)
+        })
+        .await;
+        assert_eq!(count_of_red(&records), Some(6), "{records:?}");
+    }
+
+    // The output of a run and the position of its function are written in one step: a run that cannot move the position
+    // leaves no output, and the run that follows writes it once.
+    #[tokio::test]
+    async fn a_run_that_cannot_move_its_position_leaves_no_output() {
+        let root = tempfile::tempdir().unwrap();
+        let mut frontend = frontend_with_timer(root.path(), 1).await;
+        let collection =
+            create_collection_for(&mut frontend, TENANT, DATABASE, "position_refused").await;
+        let output = attach_named(
+            &mut frontend,
+            &collection,
+            "history",
+            chroma_types::FUNCTION_REVISION_HISTORY_NAME,
+            "revisions_position_refused",
+        )
+        .await;
+        let version = |n| [("version", chroma_types::UpdateMetadataValue::Int(n))];
+        upsert_with(&mut frontend, &collection, "a", &version(1)).await;
+        upsert_with(&mut frontend, &collection, "a", &version(2)).await;
+        let archived = wait_for_output(&mut frontend, output, |records| {
+            records.iter().any(|(id, _)| id == "a::v2")
+        })
+        .await;
+        assert!(archived.iter().any(|(id, _)| id == "a::v2"), "{archived:?}");
+        let db = sqlx::SqlitePool::connect(root.path().join("chroma.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER refuse_the_position BEFORE UPDATE OF completion_offset ON attached_functions \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        upsert_with(&mut frontend, &collection, "a", &version(3)).await;
+        let mut failures = 0i64;
+        for _ in 0..100 {
+            failures = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(failure_count), 0) FROM attached_functions WHERE input_collection_id = $1",
+            )
+            .bind(collection.collection_id.to_string())
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            if failures > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(failures > 0, "the run was refused");
+        let records = output_records(&mut frontend, output).await;
+        assert!(records.iter().all(|(id, _)| id != "a::v3"), "{records:?}");
+        sqlx::query("DROP TRIGGER refuse_the_position")
+            .execute(&db)
+            .await
+            .unwrap();
+        let records = wait_for_output(&mut frontend, output, |records| {
+            records.iter().any(|(id, _)| id == "a::v3")
+        })
+        .await;
+        assert!(records.iter().any(|(id, _)| id == "a::v3"), "{records:?}");
+        assert!(records.iter().all(|(id, _)| id != "a::v4"), "{records:?}");
+    }
+
     // Each run reads the output of the run before it once applied: fifty writes at once, each with its window queued
     // before the output of the first run reaches the compaction manager, are all counted.
     #[tokio::test]

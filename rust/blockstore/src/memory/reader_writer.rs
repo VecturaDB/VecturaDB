@@ -258,6 +258,42 @@ mod tests {
     }
 
     #[test]
+    fn a_data_record_keeps_its_metadata_and_its_document() {
+        let storage_manager = StorageManager::new();
+        let writer = MemoryBlockfileWriter::new(storage_manager.clone());
+        let id = writer.id();
+        let metadata = chroma_types::Metadata::from([(
+            "color".to_string(),
+            chroma_types::MetadataValue::Str("red".to_string()),
+        )]);
+        let embedding = vec![1.0, 2.0, 3.0];
+        let with = DataRecord {
+            id: "with",
+            embedding: &embedding,
+            metadata: Some(metadata.clone()),
+            document: Some("a document"),
+        };
+        let without = DataRecord {
+            id: "without",
+            embedding: &embedding,
+            metadata: None,
+            document: None,
+        };
+        writer.set("prefix", "with", &with).unwrap();
+        writer.set("prefix", "without", &without).unwrap();
+        writer.commit().unwrap();
+
+        let reader: MemoryBlockfileReader<&str, DataRecord> =
+            MemoryBlockfileReader::open(id, storage_manager);
+        let record = reader.get("prefix", "with").unwrap().unwrap();
+        assert_eq!(record.metadata, Some(metadata));
+        assert_eq!(record.document, Some("a document"));
+        let record = reader.get("prefix", "without").unwrap().unwrap();
+        assert_eq!(record.metadata, None);
+        assert_eq!(record.document, None);
+    }
+
+    #[test]
     fn test_bool_key() {
         let storage_manager = StorageManager::new();
         let writer = MemoryBlockfileWriter::new(storage_manager.clone());

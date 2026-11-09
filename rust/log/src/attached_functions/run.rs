@@ -5,15 +5,20 @@
 //   those records before the apply, as the worker materializes them against the record segment before its compaction;
 //   the single node writes that state into a record segment in memory and calls materialize_logs and hydrate of the
 //   worker unchanged;
-// - a function whose completion offset is behind the window, as after a restart or right after its attach (the records
-//   BackfillFn that the attach writes), runs as the backfill of the worker does: on every current record of its input
-//   collection, as new, with no output read (materialize_logs_for_rebuild);
+// - a function that has never run, right after its attach (the records BackfillFn that the attach writes), runs as the
+//   backfill of the worker does: on every current record of its input collection, as new, with no output read
+//   (materialize_logs_for_rebuild);
+// - a function behind the window that has already run, as after a kill, runs on the applies it has missed, one by one, each
+//   from the log and against the state of its records before it, so that its output is the one it would have written with
+//   no kill; the worker repeats the whole compaction instead, which keeps the input and the output of a function in one step;
 // - its output goes through the log of its output collection, where the worker applies it to the segments of the
-//   output collection: the single node fills its segments only from the log, by seq_id (Federico's choice, 01/11);
-// - its completion offset moves to the end of what it ran on, as finish_attached_function.rs of the worker.
+//   output collection: the single node fills its segments only from the log, by seq_id;
+// - its completion offset moves to the end of what it ran on, as finish_attached_function.rs of the worker, in the
+//   transaction that writes its output.
 
 use super::{sync_executor, HydratedInputBatch, OutputRecords};
 use crate::local_compaction_manager::BackfillMessage;
+use crate::sqlite_log::FunctionPosition;
 use crate::{Log, PushLogsError};
 use async_trait::async_trait;
 use backon::{BackoffBuilder, ExponentialBuilder};
@@ -28,11 +33,12 @@ use chroma_system::ReceiverForMessage;
 use chroma_types::operator::{Filter, Limit, Projection, ProjectionRecord, Scan};
 use chroma_types::plan::Get;
 use chroma_types::{
-    AttachedFunction, AttachedFunctionUpdateInfo, Chunk, CollectionAndSegments, CollectionUuid,
-    DatabaseName, LogRecord, Metadata, Operation, OperationRecord, ScalarEncoding, Segment,
-    SegmentScope, SegmentShard, SegmentType, SegmentUuid, UpdateMetadataValue,
+    AttachedFunction, AttachedFunctionUpdateInfo, AttachedFunctionUuid, Chunk,
+    CollectionAndSegments, CollectionUuid, DatabaseName, LogRecord, Metadata, Operation,
+    OperationRecord, ScalarEncoding, Segment, SegmentScope, SegmentShard, SegmentType, SegmentUuid,
+    UpdateMetadataValue,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
@@ -426,9 +432,50 @@ impl FunctionRunner {
                 .get_collection_with_segments(None, output_id)
                 .await
                 .map_err(|e| e.boxed())?;
-            // As the worker: a function that has not run on every record applied before the window runs as its backfill.
-            let backfill = function.completion_offset < window.applied_before;
-            let (records, end) = if backfill {
+            // A kill can leave the output of the last run in the log of the output collection: what this run reads of its
+            // output comes after it.
+            self.apply_output(&output).await?;
+            let reader = SqliteOutputRecords {
+                sqlite_db: self.sqlite_db.clone(),
+                output: output.clone(),
+            };
+            // A function that has not run on every record applied before the window runs on the applies it has missed. One that
+            // has never run, or that is behind what the collection keeps of the state before its applies, runs as its backfill,
+            // as the worker.
+            let behind = function.completion_offset < window.applied_before;
+            let missed = if behind && function.completion_offset > 0 {
+                let (logs, covered) = self
+                    .records_after(&window.input, function.completion_offset, window.end)
+                    .await?;
+                covered.then_some(logs)
+            } else {
+                None
+            };
+            if let Some(logs) = missed {
+                let applies = self
+                    .missed_applies(&window.input, function.completion_offset, logs, window.end)
+                    .await?;
+                if applies.is_empty() {
+                    self.finish_run(&output, function.id, Vec::new(), window.end)
+                        .await?;
+                }
+                for apply in applies {
+                    let records = self
+                        .execute_window(&apply, &*executor, Some(&reader))
+                        .await?;
+                    self.finish_run(&output, function.id, records, apply.end)
+                        .await?;
+                    self.apply_output(&output).await?;
+                }
+                ran = true;
+                continue;
+            }
+            let (records, end) = if !behind {
+                let records = self
+                    .execute_window(window, &*executor, Some(&reader))
+                    .await?;
+                (records, window.end)
+            } else {
                 // The records and the log position they cover, at one moment, so that a record applied meanwhile is
                 // counted once: here, or by its own window.
                 let (current, end) = self.current_records(&window.input).await?;
@@ -436,46 +483,181 @@ impl FunctionRunner {
                     .execute_backfill(&window.input, current, &*executor)
                     .await?;
                 (records, end.max(window.end))
-            } else {
-                let reader = SqliteOutputRecords {
-                    sqlite_db: self.sqlite_db.clone(),
-                    output: output.clone(),
-                };
-                let records = self
-                    .execute_window(window, &*executor, Some(&reader))
-                    .await?;
-                (records, window.end)
             };
-            self.push_output(&output, records).await?;
-            // As the worker applies its output to the output collection in the same compaction, the output is applied
-            // to its segments from its log now, not at a later read.
-            if let Some(backfill) = &self.backfill {
-                backfill
-                    .send(
-                        BackfillMessage {
-                            collection_id: output_id,
-                        },
-                        None,
-                    )
-                    .await
-                    .map_err(|e| e.boxed())?;
-                // The next run of the function reads this output: it waits for its apply.
-                self.wait_for_apply(&output).await?;
-            }
+            self.finish_run(&output, function.id, records, end).await?;
+            self.apply_output(&output).await?;
+            ran = true;
+        }
+        if ran {
+            self.forget_prior(input_id).await?;
+        }
+        Ok(ran)
+    }
+
+    // The output of a run and the new position of its function, in one transaction when there is an output.
+    async fn finish_run(
+        &self,
+        output: &CollectionAndSegments,
+        function: AttachedFunctionUuid,
+        records: Vec<OperationRecord>,
+        end: u64,
+    ) -> Result<(), Box<dyn ChromaError>> {
+        if records.is_empty() {
             self.sysdb
                 .clone()
                 .flush_compaction_and_attached_function(
                     Vec::new(),
                     AttachedFunctionUpdateInfo {
-                        attached_function_id: function.id,
+                        attached_function_id: function,
                         completion_offset: end,
                     },
                 )
                 .await
                 .map_err(|e| e.boxed())?;
-            ran = true;
+            return Ok(());
         }
-        Ok(ran)
+        self.push_output(
+            output,
+            records,
+            Some(FunctionPosition {
+                id: function,
+                completion_offset: end,
+            }),
+        )
+        .await
+    }
+
+    // As the worker applies its output to the output collection in the same compaction, the output is applied to its
+    // segments from its log now, not at a later read: the next run of the function reads it.
+    async fn apply_output(
+        &self,
+        output: &CollectionAndSegments,
+    ) -> Result<(), Box<dyn ChromaError>> {
+        if let Some(backfill) = &self.backfill {
+            backfill
+                .send(
+                    BackfillMessage {
+                        collection_id: output.collection.collection_id,
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| e.boxed())?;
+            self.wait_for_apply(output).await?;
+        }
+        Ok(())
+    }
+
+    // What a function behind reads: the records of the log after its position up to the end, and whether the collection
+    // keeps the state before their applies, which a run on them needs.
+    async fn records_after(
+        &self,
+        input: &CollectionAndSegments,
+        completion_offset: u64,
+        end: u64,
+    ) -> Result<(Vec<LogRecord>, bool), Box<dyn ChromaError>> {
+        let input_id = input.collection.collection_id;
+        let database = DatabaseName::new(input.collection.database.clone()).ok_or_else(|| {
+            Box::new(chroma_error::TonicError(tonic::Status::invalid_argument(
+                "invalid database name of an input collection",
+            ))) as Box<dyn ChromaError>
+        })?;
+        let logs = self
+            .log
+            .clone()
+            .read(
+                &input.collection.tenant,
+                database,
+                input_id,
+                completion_offset as i64,
+                -1,
+                None,
+            )
+            .await?
+            .into_iter()
+            .filter(|record| record.log_offset as u64 <= end)
+            .collect::<Vec<_>>();
+        let since: Option<i64> = sqlx::query_scalar(
+            "SELECT since FROM attached_function_prior_since WHERE input_collection_id = $1",
+        )
+        .bind(input_id.to_string())
+        .fetch_optional(self.sqlite_db.get_conn())
+        .await
+        .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)?;
+        let covered = match (logs.first().map(|record| record.log_offset), since) {
+            (None, _) => true,
+            (Some(first), Some(since)) => since <= first,
+            (Some(_), None) => false,
+        };
+        Ok((logs, covered))
+    }
+
+    // The applies after the position of a function, each with its records from the log and the state of those records before
+    // it, in the order they were applied. The last one reaches the end given.
+    async fn missed_applies(
+        &self,
+        input: &CollectionAndSegments,
+        completion_offset: u64,
+        logs: Vec<LogRecord>,
+        end: u64,
+    ) -> Result<Vec<FunctionWindow>, Box<dyn ChromaError>> {
+        let rows: Vec<PriorRow> = sqlx::query_as(
+            "SELECT window_start, id, existed, metadata, document FROM attached_function_prior \
+             WHERE input_collection_id = $1 AND window_start > $2 ORDER BY window_start",
+        )
+        .bind(input.collection.collection_id.to_string())
+        .bind(completion_offset as i64)
+        .fetch_all(self.sqlite_db.get_conn())
+        .await
+        .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)?;
+        let mut before = BTreeMap::<i64, Vec<ProjectionRecord>>::new();
+        for (start, id, existed, metadata, document) in rows {
+            let records = before.entry(start).or_default();
+            if existed {
+                records.push(prior_record(id, metadata, document)?);
+            }
+        }
+        let first = before.keys().next().copied().unwrap_or_default();
+        let mut applies = BTreeMap::<i64, Vec<LogRecord>>::new();
+        for record in logs {
+            let start = before
+                .range(..=record.log_offset)
+                .next_back()
+                .map_or(first, |(start, _)| *start);
+            applies.entry(start).or_default().push(record);
+        }
+        let count = applies.len();
+        Ok(applies
+            .into_iter()
+            .enumerate()
+            .map(|(index, (start, logs))| {
+                let last = logs.last().map_or(end, |record| record.log_offset as u64);
+                FunctionWindow {
+                    input: input.clone(),
+                    before: before.remove(&start).unwrap_or_default(),
+                    logs: Chunk::new(Arc::from(logs)),
+                    end: if index + 1 == count { end } else { last },
+                    applied_before: completion_offset,
+                    asynchronous: false,
+                    counts_version: false,
+                }
+            })
+            .collect())
+    }
+
+    // The state before the applies that every function of the collection has run past goes.
+    async fn forget_prior(&self, input_id: CollectionUuid) -> Result<(), Box<dyn ChromaError>> {
+        sqlx::query(
+            "DELETE FROM attached_function_prior WHERE input_collection_id = $1 AND window_start <= \
+             (SELECT MIN(completion_offset) FROM attached_functions WHERE input_collection_id = $1 \
+              AND is_deleted = FALSE AND failure_count < $2)",
+        )
+        .bind(input_id.to_string())
+        .bind(MAX_FAILURE_COUNT)
+        .execute(self.sqlite_db.get_conn())
+        .await
+        .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)?;
+        Ok(())
     }
 
     async fn current_records(
@@ -621,12 +803,13 @@ impl FunctionRunner {
             .collect())
     }
 
-    // The output into the log of the output collection; a write refused for backpressure waits as it asks, and tries
-    // again, so that no output is lost and the completion offset moves only after it.
+    // The output into the log of the output collection, with the new position of its function when given; a write refused
+    // for backpressure waits as it asks, and tries again, so that no output is lost.
     async fn push_output(
         &self,
         output: &CollectionAndSegments,
         records: Vec<OperationRecord>,
+        position: Option<FunctionPosition>,
     ) -> Result<(), Box<dyn ChromaError>> {
         if records.is_empty() {
             return Ok(());
@@ -647,19 +830,32 @@ impl FunctionRunner {
             ))) as Box<dyn ChromaError>
         })?;
         loop {
-            match self
-                .log
-                .clone()
-                .push_logs(
-                    &output.collection.tenant,
-                    database.clone(),
-                    output.collection.collection_id,
-                    records.clone(),
-                    None,
-                    None,
-                )
-                .await
-            {
+            let written = match position {
+                Some(position) => {
+                    self.log
+                        .clone()
+                        .push_output_of_function(
+                            output.collection.collection_id,
+                            records.clone(),
+                            position,
+                        )
+                        .await
+                }
+                None => {
+                    self.log
+                        .clone()
+                        .push_logs(
+                            &output.collection.tenant,
+                            database.clone(),
+                            output.collection.collection_id,
+                            records.clone(),
+                            None,
+                            None,
+                        )
+                        .await
+                }
+            };
+            match written {
                 Ok(()) => return Ok(()),
                 Err(PushLogsError::BackoffCompaction { retry_after }) => {
                     tokio::time::sleep(Duration::from_secs(retry_after.unwrap_or(1).max(1))).await;
@@ -777,6 +973,46 @@ pub async fn has_live_async_functions(
     .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)
 }
 
+/// Whether a collection has an attached function, of either kind, that may read the state before an apply.
+pub async fn has_live_functions(
+    sqlite_db: &SqliteDb,
+    collection_id: CollectionUuid,
+) -> Result<bool, Box<dyn ChromaError>> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM attached_functions WHERE input_collection_id = $1 \
+         AND is_deleted = FALSE AND failure_count < $2)",
+    )
+    .bind(collection_id.to_string())
+    .bind(MAX_FAILURE_COUNT)
+    .fetch_one(sqlite_db.get_conn())
+    .await
+    .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)
+}
+
+// The columns of a row of attached_function_prior: window_start, id, existed, metadata, document.
+type PriorRow = (i64, String, bool, Option<String>, Option<String>);
+
+// A record as attached_function_prior keeps it.
+fn prior_record(
+    id: String,
+    metadata: Option<String>,
+    document: Option<String>,
+) -> Result<ProjectionRecord, Box<dyn ChromaError>> {
+    Ok(ProjectionRecord {
+        id,
+        document,
+        embedding: None,
+        metadata: metadata
+            .map(|metadata| serde_json::from_str::<Metadata>(&metadata))
+            .transpose()
+            .map_err(|e| {
+                Box::new(chroma_error::TonicError(tonic::Status::internal(
+                    e.to_string(),
+                ))) as Box<dyn ChromaError>
+            })?,
+    })
+}
+
 /// The state before an apply of the records it touches, in the transaction of the apply (00017).
 pub async fn record_prior(
     conn: &mut sqlx::SqliteConnection,
@@ -842,10 +1078,8 @@ pub async fn async_due(
     sqlite_db: &SqliteDb,
 ) -> Result<Vec<(CollectionUuid, u64)>, Box<dyn ChromaError>> {
     let sqlx_error = |e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>;
-    let live = "SELECT attached_functions.input_collection_id FROM attached_functions \
-                JOIN functions ON functions.id = attached_functions.function_id \
-                WHERE attached_functions.is_deleted = FALSE AND functions.is_async = TRUE \
-                AND attached_functions.failure_count < $1";
+    let live = "SELECT input_collection_id FROM attached_functions \
+                WHERE is_deleted = FALSE AND failure_count < $1";
     for table in ["attached_function_prior", "attached_function_prior_since"] {
         sqlx::query(&format!(
             "DELETE FROM {table} WHERE input_collection_id NOT IN ({live})"
@@ -945,39 +1179,10 @@ impl FunctionRunner {
                 function.function_id
             )));
         };
-        let database = DatabaseName::new(input.collection.database.clone())
-            .ok_or_else(|| invalid("invalid database name of an input collection".to_string()))?;
         let completion_offset = function.completion_offset;
-        let logs = self
-            .log
-            .clone()
-            .read(
-                &input.collection.tenant,
-                database,
-                input_id,
-                completion_offset as i64,
-                -1,
-                None,
-            )
-            .await?
-            .into_iter()
-            .filter(|record| record.log_offset as u64 <= window.end)
-            .collect::<Vec<_>>();
-        let since: Option<i64> = sqlx::query_scalar(
-            "SELECT since FROM attached_function_prior_since WHERE input_collection_id = $1",
-        )
-        .bind(input_id.to_string())
-        .fetch_optional(self.sqlite_db.get_conn())
-        .await
-        .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)?;
-        let first = logs.first().map(|record| record.log_offset);
-        // As distributed Chroma runs a function behind what it keeps of the collection as its backfill: on every current
-        // record, as new, with no output read.
-        let covered = match (first, since) {
-            (None, _) => true,
-            (Some(first), Some(since)) => since <= first,
-            (Some(_), None) => false,
-        };
+        let (logs, covered) = self
+            .records_after(input, completion_offset, window.end)
+            .await?;
         let output = match function.output_collection_id {
             Some(output_id) => Some(
                 self.sysdb
@@ -1021,19 +1226,8 @@ impl FunctionRunner {
         };
         if let Some(output) = &output {
             if !records.is_empty() {
-                self.push_output(output, records).await?;
-                if let Some(backfill) = &self.backfill {
-                    backfill
-                        .send(
-                            BackfillMessage {
-                                collection_id: output.collection.collection_id,
-                            },
-                            None,
-                        )
-                        .await
-                        .map_err(|e| e.boxed())?;
-                    self.wait_for_apply(output).await?;
-                }
+                self.push_output(output, records, None).await?;
+                self.apply_output(output).await?;
             }
         }
         self.sysdb
@@ -1047,19 +1241,7 @@ impl FunctionRunner {
             )
             .await
             .map_err(|e| Box::new(chroma_error::TonicError(e)) as Box<dyn ChromaError>)?;
-        // The state before the applies that every asynchronous function of the collection has run past goes.
-        sqlx::query(
-            "DELETE FROM attached_function_prior WHERE input_collection_id = $1 AND window_start <= \
-             (SELECT MIN(attached_functions.completion_offset) FROM attached_functions \
-              JOIN functions ON functions.id = attached_functions.function_id \
-              WHERE attached_functions.input_collection_id = $1 AND attached_functions.is_deleted = FALSE \
-              AND functions.is_async = TRUE AND attached_functions.failure_count < $2)",
-        )
-        .bind(input_id.to_string())
-        .bind(MAX_FAILURE_COUNT)
-        .execute(self.sqlite_db.get_conn())
-        .await
-        .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)?;
+        self.forget_prior(input_id).await?;
         Ok(())
     }
 
@@ -1087,21 +1269,7 @@ impl FunctionRunner {
         .map_err(|e| Box::new(chroma_error::WrappedSqlxError(e)) as Box<dyn ChromaError>)?;
         rows.into_iter()
             .filter(|(_, existed, _, _)| *existed)
-            .map(|(id, _, metadata, document)| {
-                Ok(ProjectionRecord {
-                    id,
-                    document,
-                    embedding: None,
-                    metadata: metadata
-                        .map(|metadata| serde_json::from_str::<Metadata>(&metadata))
-                        .transpose()
-                        .map_err(|e| {
-                            Box::new(chroma_error::TonicError(tonic::Status::internal(
-                                e.to_string(),
-                            ))) as Box<dyn ChromaError>
-                        })?,
-                })
-            })
+            .map(|(id, _, metadata, document)| prior_record(id, metadata, document))
             .collect()
     }
 }

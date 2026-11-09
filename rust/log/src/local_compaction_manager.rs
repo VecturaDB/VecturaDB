@@ -836,16 +836,22 @@ impl LocalCompactionManager {
         } else {
             None
         };
-        // An asynchronous function runs later, from its queue, on the records after its completion offset: the state
-        // before this apply is kept for it, in the transaction of the apply (attached_functions::run::record_prior).
-        let keeps_prior = match &function_window {
-            Some(_) => attached_functions::run::has_live_async_functions(
-                &self.sqlite_db,
-                message.collection_id,
-            )
-            .await
-            .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?,
-            None => false,
+        // An asynchronous function runs later, from its queue, on the records after its completion offset, and a synchronous
+        // one that a kill left behind reads them from the log in the same way: the state before this apply is kept for
+        // them, in the transaction of the apply (attached_functions::run::record_prior).
+        let (keeps_prior, has_async) = match &function_window {
+            Some(_) => (
+                attached_functions::run::has_live_functions(&self.sqlite_db, message.collection_id)
+                    .await
+                    .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?,
+                attached_functions::run::has_live_async_functions(
+                    &self.sqlite_db,
+                    message.collection_id,
+                )
+                .await
+                .map_err(|_| CompactionManagerError::MetadataApplyLogsFailed)?,
+            ),
+            None => (false, false),
         };
         mt_data_chunk.set_visibility(mt_visibility);
         hnsw_data_chunk.set_visibility(hnsw_visibility);
@@ -908,7 +914,7 @@ impl LocalCompactionManager {
             runner.backfill = Some(ctx.receiver::<BackfillMessage>());
             // The asynchronous functions of the collection run after its synchronous ones, in the same queue, up to the
             // end of this apply; the round of the timer runs them too when they are behind (async_due).
-            let asynchronous = keeps_prior.then(|| FunctionWindow {
+            let asynchronous = has_async.then(|| FunctionWindow {
                 input: window.input.clone(),
                 logs: Chunk::new(Arc::from(Vec::new())),
                 before: Vec::new(),
@@ -1051,7 +1057,7 @@ impl Handler<ScheduledCompactMessage> for LocalCompactionManager {
             },
         );
         // A synchronous function behind the records applied to its input, as after a kill that lost the queue of its
-        // windows, runs as its backfill, as the scheduler of distributed Chroma compacts a collection whose functions
+        // windows, runs on what it has missed, as the scheduler of distributed Chroma compacts a collection whose functions
         // are behind its log position (stale_attached_function_ids in compact.rs).
         match attached_functions::run::behind(&self.sqlite_db).await {
             Ok(behind) => {
