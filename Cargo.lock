@@ -4595,7 +4595,7 @@ dependencies = [
 [[package]]
 name = "hnswlib"
 version = "0.8.2"
-source = "git+https://github.com/VecturaDB/hnswlib.git?rev=d676c0c#d676c0c69676c951ef56023a603fabad51b16383"
+source = "git+https://github.com/VecturaDB/hnswlib.git?rev=eced679#eced67921bb27293c69bcff3754acb31ab9cc428"
 dependencies = [
  "cc",
  "thiserror 1.0.69",
