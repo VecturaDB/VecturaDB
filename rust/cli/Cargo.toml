@@ -49,6 +49,9 @@ tempfile = { workspace = true }
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tikv-jemalloc-ctl = "0.6.1"
+
 [dev-dependencies]
 axum = { workspace = true }
 chroma-types = { workspace = true, features = ["testing"] }

@@ -166,10 +166,10 @@ impl Configurable<SqliteDBConfig, SqliteCreationError> for SqliteDb {
             // we turn it off
             .pragma("foreign_keys", "OFF")
             .pragma("case_sensitive_like", "ON")
-            // Each connection keeps a page cache of its own (.cargo/config.toml), of 8000 KiB: the default of 2000 KiB
-            // holds 483 pages of 4 KiB, fewer than the 985 that a get of 20000 records reads, so every get read all of
-            // them again from the file.
-            .pragma("cache_size", "-8000")
+            // Each connection keeps a page cache of its own (.cargo/config.toml), of the 2000 KiB of SQLite: a connection
+            // takes memory for a page when it reads it and keeps it, so the pool of up to 10 connections holds up to about
+            // 20000 KiB of pages. A get that reads more than its 483 pages of 4 KiB reads the rest again from the file.
+            .pragma("cache_size", "-2000")
             .busy_timeout(Duration::from_secs(1000))
             .with_regexp();
         let conn = if let Some(url) = &config.url {

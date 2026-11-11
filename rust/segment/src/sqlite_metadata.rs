@@ -232,6 +232,8 @@ impl SqliteMetadataWriter {
         Self { db }
     }
 
+    // No statement of these four has RETURNING: SQLite gathers the rows of RETURNING in a temporary table, with a pager,
+    // a page cache and a journal of its own, opened and freed at each run, that is once for every record written.
     fn add_record_stmt(
         segment_id: SegmentUuid,
         seq_id: u64,
@@ -250,8 +252,31 @@ impl SqliteMetadataWriter {
                     .do_nothing()
                     .to_owned(),
             )
-            .returning_col(Embeddings::Id)
             .to_owned())
+    }
+
+    async fn record_id<C>(
+        tx: &mut C,
+        segment_id: SegmentUuid,
+        user_id: &str,
+    ) -> Result<Option<u32>, SqliteMetadataError>
+    where
+        for<'connection> &'connection mut C: sqlx::Executor<'connection, Database = sqlx::Sqlite>,
+    {
+        let (stmt, values) = Query::select()
+            .column(Embeddings::Id)
+            .from(Embeddings::Table)
+            .and_where(
+                Expr::col(Embeddings::SegmentId)
+                    .eq(segment_id.to_string())
+                    .and(Expr::col(Embeddings::EmbeddingId).eq(user_id)),
+            )
+            .build_sqlx(SqliteQueryBuilder);
+        Ok(sqlx::query_with(&stmt, values)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|row| row.try_get(0))
+            .transpose()?)
     }
 
     async fn add_record<C>(
@@ -265,11 +290,16 @@ impl SqliteMetadataWriter {
     {
         let (add_rec_stmt, values) =
             Self::add_record_stmt(segment_id, seq_id, user_id)?.build_sqlx(SqliteQueryBuilder);
-        Ok(sqlx::query_with(&add_rec_stmt, values)
-            .fetch_optional(&mut *tx)
-            .await?
-            .map(|row| row.try_get(0))
-            .transpose()?)
+        let done = sqlx::query_with(&add_rec_stmt, values)
+            .execute(&mut *tx)
+            .await?;
+        if done.rows_affected() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(
+            u32::try_from(done.last_insert_rowid())
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
+        ))
     }
 
     fn update_record_stmt(
@@ -285,7 +315,6 @@ impl SqliteMetadataWriter {
                     .and(Expr::col(Embeddings::EmbeddingId).eq(user_id)),
             )
             .value(Embeddings::SeqId, seq_id)
-            .returning_col(Embeddings::Id)
             .to_owned()
     }
 
@@ -298,13 +327,15 @@ impl SqliteMetadataWriter {
     where
         for<'connection> &'connection mut C: sqlx::Executor<'connection, Database = sqlx::Sqlite>,
     {
+        let Some(id) = Self::record_id(tx, segment_id, &user_id).await? else {
+            return Ok(None);
+        };
         let (update_rec_stmt, values) =
             Self::update_record_stmt(segment_id, seq_id, user_id).build_sqlx(SqliteQueryBuilder);
-        Ok(sqlx::query_with(&update_rec_stmt, values)
-            .fetch_optional(&mut *tx)
-            .await?
-            .map(|row| row.try_get(0))
-            .transpose()?)
+        sqlx::query_with(&update_rec_stmt, values)
+            .execute(&mut *tx)
+            .await?;
+        Ok(Some(id))
     }
 
     fn upsert_record_stmt(
@@ -331,11 +362,14 @@ impl SqliteMetadataWriter {
         for<'connection> &'connection mut C: sqlx::Executor<'connection, Database = sqlx::Sqlite>,
     {
         let (upsert_rec_stmt, values) =
-            Self::upsert_record_stmt(segment_id, seq_id, user_id)?.build_sqlx(SqliteQueryBuilder);
-        Ok(sqlx::query_with(&upsert_rec_stmt, values)
-            .fetch_one(&mut *tx)
+            Self::upsert_record_stmt(segment_id, seq_id, user_id.clone())?
+                .build_sqlx(SqliteQueryBuilder);
+        sqlx::query_with(&upsert_rec_stmt, values)
+            .execute(&mut *tx)
+            .await?;
+        Self::record_id(tx, segment_id, &user_id)
             .await?
-            .try_get(0)?)
+            .ok_or_else(|| SqliteMetadataError::from(sqlx::Error::RowNotFound))
     }
 
     fn delete_record_stmt(segment_id: SegmentUuid, user_id: String) -> DeleteStatement {
@@ -346,7 +380,6 @@ impl SqliteMetadataWriter {
                     .eq(segment_id.to_string())
                     .and(Expr::col(Embeddings::EmbeddingId).eq(user_id)),
             )
-            .returning_col(Embeddings::Id)
             .to_owned()
     }
 
@@ -358,13 +391,15 @@ impl SqliteMetadataWriter {
     where
         for<'connection> &'connection mut C: sqlx::Executor<'connection, Database = sqlx::Sqlite>,
     {
+        let Some(id) = Self::record_id(tx, segment_id, &user_id).await? else {
+            return Ok(None);
+        };
         let (delete_rec_stmt, values) =
             Self::delete_record_stmt(segment_id, user_id).build_sqlx(SqliteQueryBuilder);
-        Ok(sqlx::query_with(&delete_rec_stmt, values)
-            .fetch_optional(&mut *tx)
-            .await?
-            .map(|r| r.try_get(0))
-            .transpose()?)
+        sqlx::query_with(&delete_rec_stmt, values)
+            .execute(&mut *tx)
+            .await?;
+        Ok(Some(id))
     }
 
     fn add_document_stmt(
@@ -2250,6 +2285,168 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::HashMap;
     use tokio::runtime::Runtime;
+
+    // The ids of the rows given by each record operation, in every case: a new record, a duplicate in the same batch, a
+    // duplicate already stored, an update, an upsert of a stored and of a new record, the delete of a stored and of a
+    // missing record; and the sequence ids the operations leave, the same as those of an add.
+    #[tokio::test]
+    async fn the_record_operations_give_the_ids_of_their_rows() {
+        let writer = SqliteMetadataWriter::new(get_new_sqlite_db().await);
+        let segment = chroma_types::SegmentUuid::new();
+        let other = chroma_types::SegmentUuid::new();
+        let mut tx = writer.begin().await.unwrap();
+        for (seq_id, user_id) in [(5, "five"), (7, "seven"), (8, "eight")] {
+            SqliteMetadataWriter::add_record(&mut *tx, other, seq_id, user_id.into())
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+        let seq_of = |segment: chroma_types::SegmentUuid, user_id: &'static str| {
+            let db = writer.db.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT hex(seq_id) FROM embeddings WHERE segment_id = ? AND embedding_id = ?",
+                )
+                .bind(segment.to_string())
+                .bind(user_id)
+                .fetch_one(db.get_conn())
+                .await
+                .unwrap()
+            }
+        };
+        let mut tx = writer.begin().await.unwrap();
+        assert_eq!(
+            SqliteMetadataWriter::add_record(&mut *tx, segment, 1, "a".into())
+                .await
+                .unwrap(),
+            Some(4)
+        );
+        assert_eq!(
+            SqliteMetadataWriter::add_record(&mut *tx, segment, 2, "b".into())
+                .await
+                .unwrap(),
+            Some(5)
+        );
+        assert_eq!(
+            SqliteMetadataWriter::add_record(&mut *tx, segment, 3, "a".into())
+                .await
+                .unwrap(),
+            None
+        );
+        tx.commit().await.unwrap();
+        let mut tx = writer.begin().await.unwrap();
+        assert_eq!(
+            SqliteMetadataWriter::add_record(&mut *tx, segment, 4, "b".into())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            SqliteMetadataWriter::update_record(&mut *tx, segment, 5, "a".into())
+                .await
+                .unwrap(),
+            Some(4)
+        );
+        assert_eq!(
+            SqliteMetadataWriter::update_record(&mut *tx, segment, 6, "missing".into())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            SqliteMetadataWriter::upsert_record(&mut *tx, segment, 7, "b".into())
+                .await
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            SqliteMetadataWriter::upsert_record(&mut *tx, segment, 8, "c".into())
+                .await
+                .unwrap(),
+            6
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(seq_of(segment, "a").await, seq_of(other, "five").await);
+        assert_eq!(seq_of(segment, "b").await, seq_of(other, "seven").await);
+        assert_eq!(seq_of(segment, "c").await, seq_of(other, "eight").await);
+        let mut tx = writer.begin().await.unwrap();
+        assert_eq!(
+            SqliteMetadataWriter::delete_record(&mut *tx, segment, "a".into())
+                .await
+                .unwrap(),
+            Some(4)
+        );
+        assert_eq!(
+            SqliteMetadataWriter::delete_record(&mut *tx, segment, "a".into())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            SqliteMetadataWriter::delete_record(&mut *tx, segment, "missing".into())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            SqliteMetadataWriter::add_record(&mut *tx, segment, 9, "d".into())
+                .await
+                .unwrap(),
+            Some(7)
+        );
+        tx.commit().await.unwrap();
+        let ids: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, embedding_id FROM embeddings WHERE segment_id = ? ORDER BY id",
+        )
+        .bind(segment.to_string())
+        .fetch_all(writer.db.get_conn())
+        .await
+        .unwrap();
+        assert_eq!(
+            ids,
+            vec![
+                (5, "b".to_string()),
+                (6, "c".to_string()),
+                (7, "d".to_string())
+            ]
+        );
+    }
+
+    // A statement with RETURNING makes SQLite gather its rows in a temporary table, with a pager, a page cache and a
+    // journal of its own, opened and freed at each run: here once for every record written.
+    #[tokio::test]
+    async fn the_record_operations_open_no_temporary_table() {
+        use sea_query::SqliteQueryBuilder;
+        use sea_query_binder::SqlxBinder;
+        use sqlx::Row;
+        let db = get_new_sqlite_db().await;
+        let segment = chroma_types::SegmentUuid::new();
+        let statements = [
+            SqliteMetadataWriter::add_record_stmt(segment, 1, "a".into())
+                .unwrap()
+                .build_sqlx(SqliteQueryBuilder),
+            SqliteMetadataWriter::upsert_record_stmt(segment, 1, "a".into())
+                .unwrap()
+                .build_sqlx(SqliteQueryBuilder),
+            SqliteMetadataWriter::update_record_stmt(segment, 1, "a".into())
+                .build_sqlx(SqliteQueryBuilder),
+            SqliteMetadataWriter::delete_record_stmt(segment, "a".into())
+                .build_sqlx(SqliteQueryBuilder),
+        ];
+        for (sql, values) in statements {
+            let opcodes: Vec<String> = sqlx::query_with(&format!("EXPLAIN {sql}"), values)
+                .fetch_all(db.get_conn())
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.get::<String, _>(1))
+                .collect();
+            assert!(
+                !opcodes.iter().any(|op| op == "OpenEphemeral"),
+                "{sql}: {opcodes:?}"
+            );
+        }
+    }
 
     proptest! {
         #[test]
