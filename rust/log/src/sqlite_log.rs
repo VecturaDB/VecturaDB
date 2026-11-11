@@ -1195,16 +1195,18 @@ impl SqliteLog {
     async fn get_legacy_embeddings_queue_config(
         &mut self,
     ) -> Result<LegacyEmbeddingsQueueConfig, SqliteGetLegacyEmbeddingsQueueConfigError> {
+        // Read outside a transaction first: the configuration is there once it has been written. A transaction that has
+        // read and then writes gets "database is locked" at once from SQLite while another connection holds the write
+        // lock, without busy_timeout, so the write of the default takes the write lock first and reads again under it.
+        if let Some(config) = Self::read_legacy_embeddings_queue_config(self.db.get_conn()).await? {
+            return Ok(config);
+        }
         let mut tx = self.db.get_conn().begin().await.map_err(WrappedSqlxError)?;
-
-        let row = sqlx::query("SELECT * FROM embeddings_queue_config")
-            .fetch_optional(&mut *tx)
+        self.db
+            .begin_immediate(&mut *tx)
             .await
             .map_err(WrappedSqlxError)?;
-
-        if let Some(row) = row {
-            let value: String = row.get("config_json_str");
-            let config: LegacyEmbeddingsQueueConfig = serde_json::from_str(&value)?;
+        if let Some(config) = Self::read_legacy_embeddings_queue_config(&mut *tx).await? {
             return Ok(config);
         }
 
@@ -1228,6 +1230,21 @@ impl SqliteLog {
         tx.commit().await.map_err(WrappedSqlxError)?;
 
         Ok(default_config)
+    }
+
+    async fn read_legacy_embeddings_queue_config<'c, E>(
+        executor: E,
+    ) -> Result<Option<LegacyEmbeddingsQueueConfig>, SqliteGetLegacyEmbeddingsQueueConfigError>
+    where
+        E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+    {
+        let row = sqlx::query("SELECT * FROM embeddings_queue_config")
+            .fetch_optional(executor)
+            .await
+            .map_err(WrappedSqlxError)?;
+        Ok(row
+            .map(|row| serde_json::from_str(&row.get::<String, _>("config_json_str")))
+            .transpose()?)
     }
 
     pub async fn update_legacy_embeddings_queue_config(
@@ -1454,6 +1471,31 @@ mod tests {
         .unwrap();
 
         SqliteLog::new(db, "default".to_string(), "default".to_string())
+    }
+
+    // A reset of a new database writes the default configuration of the log. While another connection holds the write
+    // lock of SQLite, as another write does, the reset waits for it instead of failing with "database is locked".
+    #[tokio::test]
+    async fn a_reset_waits_for_the_write_lock_of_another_connection() {
+        let mut log = setup_sqlite_log().await;
+        let db = log.db.clone();
+        let configs = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM embeddings_queue_config")
+                .fetch_one(db.get_conn())
+                .await
+                .unwrap()
+        };
+        assert_eq!(configs().await, 0);
+        let holder = chroma_sqlite::db::test_utils::hold_the_write_lock(&db).await;
+        let reset =
+            tokio::spawn(async move { log.reset().await.map(|_| ()).map_err(|e| e.to_string()) });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if reset.is_finished() {
+            panic!("the reset did not wait: {:?}", reset.await.unwrap());
+        }
+        chroma_sqlite::db::test_utils::release_the_write_lock(holder).await;
+        reset.await.unwrap().unwrap();
+        assert_eq!(configs().await, 1);
     }
 
     fn conditional_record(id: &str) -> OperationRecord {

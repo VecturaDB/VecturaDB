@@ -419,6 +419,22 @@ pub mod test_utils {
             .await
             .expect("Expect it to be created")
     }
+
+    /// The write lock of SQLite held by another connection of the pool, as by the write of another request, until
+    /// release_the_write_lock. A transaction that has read and then writes gets "database is locked" at once from SQLite
+    /// while it is held, without busy_timeout; one whose first statement writes waits for it.
+    pub async fn hold_the_write_lock(db: &SqliteDb) -> sqlx::pool::PoolConnection<sqlx::Sqlite> {
+        let mut holder = db.get_conn().acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        holder
+    }
+
+    pub async fn release_the_write_lock(mut holder: sqlx::pool::PoolConnection<sqlx::Sqlite>) {
+        sqlx::query("COMMIT").execute(&mut *holder).await.unwrap();
+    }
 }
 
 //////////////////////// Tests ////////////////////////

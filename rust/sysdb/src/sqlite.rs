@@ -190,6 +190,12 @@ impl SqliteSysDb {
             .begin()
             .await
             .map_err(|e| DeleteDatabaseError::Internal(e.into()))?;
+        // The collections are read before they are deleted, and a transaction that has read and then writes gets
+        // "database is locked" at once from SQLite while another connection holds the write lock, without busy_timeout.
+        self.db
+            .begin_immediate(&mut *tx)
+            .await
+            .map_err(|e| DeleteDatabaseError::Internal(e.into()))?;
 
         let collections = self
             .get_collections_with_conn(
@@ -518,11 +524,19 @@ impl SqliteSysDb {
             .begin()
             .await
             .map_err(|e| UpdateCollectionError::Internal(e.into()))?;
+        // An update of the configuration reads the collection before it writes it, and a transaction that has read and
+        // then writes gets "database is locked" at once from SQLite while another connection holds the write lock,
+        // without busy_timeout.
+        self.db
+            .begin_immediate(&mut *tx)
+            .await
+            .map_err(|e| UpdateCollectionError::Internal(e.into()))?;
 
         if let Some(dimension) = dimension {
             // The first writer initializes dimension; later writers must agree.
-            // This statement acquires SQLite's write transaction before reading
-            // the winning dimension, including across frontend instances.
+            // The write lock, taken at the start of the transaction, is held
+            // before the read of the winning dimension, including across
+            // frontend instances.
             let actual: Option<i64> = sqlx::query_scalar(
                 "UPDATE collections SET dimension = COALESCE(dimension, ?)
                  WHERE id = ? RETURNING dimension",
@@ -3457,6 +3471,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.collection_id, collection_id);
+    }
+
+    // An update of the configuration of a collection reads the collection before it writes it. While another connection
+    // holds the write lock of SQLite, as another write does, it waits for it instead of failing with "database is locked".
+    #[tokio::test]
+    async fn an_update_of_the_configuration_waits_for_the_write_lock() {
+        let db = get_new_sqlite_db().await;
+        let sysdb = SqliteSysDb::new(db, "default".to_string(), "default".to_string());
+        let id = CollectionUuid::new();
+        sysdb
+            .create_collection(
+                "default_tenant".into(),
+                "default_database".into(),
+                id,
+                "read_first".into(),
+                vec![],
+                Some(InternalCollectionConfiguration::default_hnsw()),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let holder = chroma_sqlite::db::test_utils::hold_the_write_lock(&sysdb.db).await;
+        let other = sysdb.clone();
+        let update = tokio::spawn(async move {
+            other
+                .update_collection(
+                    id,
+                    None,
+                    None,
+                    None,
+                    Some(InternalUpdateCollectionConfiguration {
+                        vector_index: Some(UpdateVectorIndexConfiguration::Hnsw(Some(
+                            UpdateHnswConfiguration {
+                                ef_search: Some(10),
+                                ..Default::default()
+                            },
+                        ))),
+                        embedding_function: None,
+                    }),
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if update.is_finished() {
+            panic!("the update did not wait: {:?}", update.await.unwrap());
+        }
+        chroma_sqlite::db::test_utils::release_the_write_lock(holder).await;
+        update.await.unwrap().unwrap();
+    }
+
+    // The delete of a database reads its collections before it deletes them. While another connection holds the write
+    // lock of SQLite, as another write does, it waits for it instead of failing with "database is locked".
+    #[tokio::test]
+    async fn the_delete_of_a_database_waits_for_the_write_lock() {
+        let db = get_new_sqlite_db().await;
+        let sysdb = SqliteSysDb::new(db, "default".to_string(), "default".to_string());
+        sysdb
+            .create_database(Uuid::new_v4(), "doomed", "default_tenant")
+            .await
+            .unwrap();
+
+        let holder = chroma_sqlite::db::test_utils::hold_the_write_lock(&sysdb.db).await;
+        let other = sysdb.clone();
+        let delete = tokio::spawn(async move {
+            other
+                .delete_database("doomed".into(), "default_tenant".into())
+                .await
+                .map(|_| ())
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if delete.is_finished() {
+            panic!("the delete did not wait: {:?}", delete.await.unwrap());
+        }
+        chroma_sqlite::db::test_utils::release_the_write_lock(holder).await;
+        delete.await.unwrap().unwrap();
     }
 
     #[tokio::test]
