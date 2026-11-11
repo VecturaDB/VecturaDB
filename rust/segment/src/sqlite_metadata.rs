@@ -483,8 +483,14 @@ impl SqliteMetadataWriter {
         Ok(())
     }
 
+    /// A write transaction, which takes the write lock of SQLite at its start. An update or a delete of a record reads the
+    /// id of its row before it writes it, so the first statement of the transaction can be a read; and a transaction that
+    /// has read and then writes gets "database is locked" at once from SQLite while another connection holds the write
+    /// lock, without busy_timeout.
     pub async fn begin(&self) -> Result<Transaction<'static, Sqlite>, SqliteMetadataError> {
-        Ok(self.db.get_conn().begin().await?)
+        let mut tx = self.db.get_conn().begin().await?;
+        self.db.begin_immediate(&mut *tx).await?;
+        Ok(tx)
     }
 
     pub async fn update_collection_schema<C>(
@@ -2285,6 +2291,51 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::HashMap;
     use tokio::runtime::Runtime;
+
+    // An update and a delete read the id of their row before they write it. A transaction of the writer that starts with
+    // one of them, while another connection holds the write lock of SQLite, as another write does, waits for it instead
+    // of failing with "database is locked".
+    #[tokio::test]
+    async fn a_write_that_starts_with_an_update_waits_for_the_write_lock() {
+        a_write_that_starts_with_waits_for_the_write_lock(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_write_that_starts_with_a_delete_waits_for_the_write_lock() {
+        a_write_that_starts_with_waits_for_the_write_lock(false).await;
+    }
+
+    async fn a_write_that_starts_with_waits_for_the_write_lock(update: bool) {
+        let writer = SqliteMetadataWriter::new(get_new_sqlite_db().await);
+        let segment = chroma_types::SegmentUuid::new();
+        let mut tx = writer.begin().await.unwrap();
+        for (seq_id, user_id) in [(1, "a"), (2, "b")] {
+            SqliteMetadataWriter::add_record(&mut *tx, segment, seq_id, user_id.into())
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+        {
+            let holder = chroma_sqlite::db::test_utils::hold_the_write_lock(&writer.db).await;
+            let other = SqliteMetadataWriter::new(writer.db.clone());
+            let write = tokio::spawn(async move {
+                let mut tx = other.begin().await?;
+                let id = if update {
+                    SqliteMetadataWriter::update_record(&mut *tx, segment, 3, "a".into()).await?
+                } else {
+                    SqliteMetadataWriter::delete_record(&mut *tx, segment, "b".into()).await?
+                };
+                tx.commit().await?;
+                Ok::<_, super::SqliteMetadataError>(id)
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            if write.is_finished() {
+                panic!("the write did not wait: {:?}", write.await.unwrap());
+            }
+            chroma_sqlite::db::test_utils::release_the_write_lock(holder).await;
+            assert!(write.await.unwrap().unwrap().is_some());
+        }
+    }
 
     // The ids of the rows given by each record operation, in every case: a new record, a duplicate in the same batch, a
     // duplicate already stored, an update, an upsert of a stored and of a new record, the delete of a stored and of a
