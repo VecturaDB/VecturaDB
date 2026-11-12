@@ -2684,9 +2684,9 @@ mod tests {
             .is_err());
     }
 
-    // A save every sync_threshold records kept the index waiting for the disk under a steady load: after its first save,
-    // an instance saves again only once SAVE_INTERVAL has passed since it, however many records come in between, which
-    // stay in memory. The position of the segment in SQLite, which a save moves, tells the saves apart.
+    // With a save interval, after its first save an instance saves again only once the interval has passed since it,
+    // however many records come in between, which stay in memory. The position of the segment in SQLite, which a save
+    // moves, tells the saves apart.
     #[tokio::test]
     async fn saves_after_the_first_wait_for_the_save_interval() {
         let sqlite = get_new_sqlite_db().await;
@@ -2712,6 +2712,10 @@ mod tests {
         .await
         .expect("writer");
         writer.index.set_sync_threshold(2).await;
+        writer
+            .index
+            .set_save_interval(super::Duration::from_secs(30))
+            .await;
         // The records first and first + 1, as two records of the log.
         let chunk = |first: i64| {
             Chunk::new(
@@ -2767,6 +2771,79 @@ mod tests {
             Some(10),
             "a save once the interval has passed"
         );
+        writer.index.close().await;
+    }
+
+    // An index saves at every sync_threshold by default, as Chroma 1.5.9: the journal of a save is taken under the write
+    // lock of the index and grows with the records of the save, so fewer records a save keep that lock shorter. The
+    // position of the segment in SQLite, which a save moves, follows every threshold.
+    #[tokio::test]
+    async fn by_default_an_index_saves_at_every_sync_threshold() {
+        let sqlite = get_new_sqlite_db().await;
+        let persist_dir = tempfile::tempdir().expect("persist dir");
+        let persist_path = persist_dir.path().to_str().expect("utf-8 path").to_string();
+        let mut collection = Collection::test_collection(3);
+        collection.schema = Some(Schema::new_default(KnnIndex::Hnsw));
+        let vector_segment = Segment {
+            id: SegmentUuid::new(),
+            r#type: SegmentType::HnswLocalPersisted,
+            scope: SegmentScope::VECTOR,
+            collection: collection.collection_id,
+            metadata: None,
+            file_path: Default::default(),
+        };
+        let mut writer = super::LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &vector_segment,
+            3,
+            Some(persist_path.clone()),
+            sqlite.clone(),
+        )
+        .await
+        .expect("writer");
+        writer.index.set_sync_threshold(2).await;
+        // The records first and first + 1, as two records of the log.
+        let chunk = |first: i64| {
+            Chunk::new(
+                (first..first + 2)
+                    .map(|log_offset| LogRecord {
+                        log_offset,
+                        record: OperationRecord {
+                            id: format!("id-{log_offset}"),
+                            embedding: Some(vec![log_offset as f32, 2.0, 3.0]),
+                            encoding: None,
+                            metadata: None,
+                            document: None,
+                            operation: Operation::Add,
+                        },
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        };
+        let saved = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT CAST(seq_id AS INTEGER) FROM max_seq_id WHERE segment_id = ?",
+            )
+            .bind(vector_segment.id.to_string())
+            .fetch_optional(sqlite.get_conn())
+            .await
+            .expect("max_seq_id")
+        };
+
+        for first in [1, 3, 5, 7] {
+            writer
+                .apply_log_chunk(chunk(first))
+                .await
+                .expect("apply log");
+            writer.index.wait_for_save().await;
+            assert_eq!(
+                saved().await,
+                Some(first + 1),
+                "a save at the threshold, at the records {first} and {}",
+                first + 1
+            );
+        }
         writer.index.close().await;
     }
 
