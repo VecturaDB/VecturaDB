@@ -364,7 +364,7 @@ mod tests {
         );
     }
 
-    // hnsw_min_save_interval_seconds of the server reaches the segment manager, which takes 30 seconds without it; a
+    // hnsw_min_save_interval_seconds of the server reaches the segment manager, which takes 0 seconds without it; a
     // value in the block of the segment manager (segment_manager, at the top of the file: the frontend block is flattened
     // into the server one) wins, as persist_path does.
     #[test]

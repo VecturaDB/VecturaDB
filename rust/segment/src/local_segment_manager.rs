@@ -1904,7 +1904,7 @@ mod tests {
             io::ErrorKind::NotFound
         );
         writer.index.set_sync_threshold(1).await;
-        // The deletion below saves too, as before SAVE_INTERVAL.
+        // The deletion below saves too, whatever the default.
         writer
             .index
             .set_save_interval(std::time::Duration::ZERO)
@@ -2097,7 +2097,7 @@ mod tests {
         let second = second.unwrap();
         assert!(Arc::ptr_eq(&first.index.inner, &second.index.inner));
         first.index.set_sync_threshold(1).await;
-        // A save at every record, as before SAVE_INTERVAL.
+        // A save at every record, whatever the default.
         first
             .index
             .set_save_interval(std::time::Duration::ZERO)
@@ -2136,12 +2136,12 @@ mod tests {
         assert_eq!(reader.index.applied_state().await, (2, 2));
     }
 
-    // hnsw_min_save_interval_seconds reaches the indexes that the manager opens: at 0 an index saves at every threshold,
-    // as Chroma 1.5.9 does; without it, the save after the first waits for the 30 seconds of SAVE_INTERVAL, and the
-    // position in SQLite stays at the first one.
+    // hnsw_min_save_interval_seconds reaches the indexes that the manager opens: at 0, and without it, an index saves at
+    // every threshold, as Chroma 1.5.9 does; at 30 the save after the first waits for those seconds, and the position in
+    // SQLite stays at the first one.
     #[tokio::test]
     async fn the_min_save_interval_of_the_config_reaches_the_indexes() {
-        for (seconds, position) in [(Some(0), Some(2)), (None, Some(1))] {
+        for (seconds, position) in [(Some(0), Some(2)), (None, Some(2)), (Some(30), Some(1))] {
             let root = tempfile::tempdir().unwrap();
             let sqlite = get_new_sqlite_db().await;
             let config = LocalSegmentManagerConfig {

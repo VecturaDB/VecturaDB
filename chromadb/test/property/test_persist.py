@@ -85,8 +85,8 @@ def clear_shared_system_cache() -> Generator[None, None, None]:
 
 def saving_at_every_threshold(settings: Settings) -> Settings:
     """The settings with a save of the index at every hnsw:sync_threshold, as Chroma 1.5.9 makes them, for the tests
-    that count those saves or the log they leave: after its first save, VecturaDB saves an index at most every
-    chroma_hnsw_min_save_interval_seconds, 30 by default."""
+    that count those saves or the log they leave, whatever the default of chroma_hnsw_min_save_interval_seconds:
+    after its first save, VecturaDB saves an index at most every that many seconds."""
     return settings.model_copy(update={"chroma_hnsw_min_save_interval_seconds": 0})
 
 

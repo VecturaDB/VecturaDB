@@ -1,6 +1,6 @@
 # write <batches> [<pause after>]: one collection "col", batches of 100 records of 3 dimensions, printing each batch
-# acknowledged; after the batch <pause after>, a pause of 31 seconds, past the 30 seconds that a local HNSW index waits
-# after a save before the next (SAVE_INTERVAL), so that the batch after it saves the index again.
+# acknowledged; after the batch <pause after>, a pause of 31 seconds, for a server with hnsw_min_save_interval_seconds
+# of 30, so that the batch after it saves the index again.
 # read <batches>: every acknowledged record read back with its embedding, and a query on each 100th one.
 import json, sys, time, urllib.request, urllib.error
 B = "http://127.0.0.1:8000/api/v2/tenants/default_tenant/databases/default_database"

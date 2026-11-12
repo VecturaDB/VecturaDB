@@ -16,7 +16,7 @@ cors_allow_origins: ["*"]
 # General settings #
 ####################
 persist_path: "./chroma"
-hnsw_min_save_interval_seconds: 30 # the shortest time between two saves of a local HNSW index; 0 saves at every sync_threshold
+hnsw_min_save_interval_seconds: 0 # the shortest time between two saves of a local HNSW index; 0 saves at every sync_threshold
 spann_block_cache_mib: 256 # the limit, in MiB, of the memory that the cache of the blocks of the SPANN indexes holds
 allow_reset: false # defaults to false
 sqlitedb:

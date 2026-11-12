@@ -1,5 +1,6 @@
 # Changed from the original Chroma file; see the git history for the changes and their authors.
 import asyncio
+import sqlite3
 import threading
 import time
 from typing import Any, Awaitable, Callable, Generator, cast, Dict, Tuple
@@ -370,6 +371,49 @@ def test_a_second_client_on_a_folder_in_use_waits_then_is_refused() -> None:
         first_system.stop()
         client = chromadb.PersistentClient(path=tmpdir)
         assert client.get_collection("test_collection").count() == 1
+        client.close()
+        client.clear_system_cache()
+
+
+def test_a_persistent_client_saves_its_index_at_every_sync_threshold_by_default() -> None:
+    """With the default Settings, a PersistentClient saves the HNSW index of a collection at every hnsw:sync_threshold,
+    as Chroma 1.5.9: the position of its vector segment in max_seq_id follows the records written. The saves are written
+    in the background, so the position is waited for, up to 10 s."""
+    if os.environ.get("CHROMA_INTEGRATION_TEST_ONLY"):
+        pytest.skip("Integration test only")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        client = chromadb.PersistentClient(path=tmpdir)
+        collection = client.create_collection(
+            "saves",
+            embedding_function=None,
+            configuration={"hnsw": {"sync_threshold": 2}},
+        )
+        for first in (0, 2, 4):
+            collection.add(
+                ids=[f"id{first}", f"id{first + 1}"],
+                embeddings=[[float(first), 1.0, 2.0], [float(first + 1), 1.0, 2.0]],
+            )
+
+        database = os.path.join(tmpdir, "chroma.sqlite3")
+
+        def saved() -> int:
+            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=5)
+            try:
+                row = connection.execute(
+                    "SELECT CAST(m.seq_id AS INTEGER) FROM max_seq_id m JOIN segments s ON s.id = m.segment_id "
+                    "WHERE s.scope = 'VECTOR' AND s.collection = ?",
+                    (str(collection.id),),
+                ).fetchone()
+                return row[0] if row else 0
+            finally:
+                connection.close()
+
+        deadline = time.time() + 10
+        while saved() < 6 and time.time() < deadline:
+            time.sleep(0.1)
+        position = saved()
+        assert position == 6, f"the position of the vector segment is {position}, not the 6 records written"
         client.close()
         client.clear_system_cache()
 

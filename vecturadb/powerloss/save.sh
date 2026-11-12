@@ -1,8 +1,8 @@
 #!/bin/bash
 # $1 rounds. Each round on an empty folder: batches of 100 records in one collection, across
-# the saves of the index: the first at 1000 records, the next at the batch after a pause of 31 seconds that follows the
-# batch 20 (client_save.py), as a save waits 30 seconds after the one before; after the batch $k a power cut (kill -9,
-# LazyFS drops what was not synced) at a delay 0-400 ms, then every acknowledged record read back with its embedding.
+# the saves of the index, at every 1000 records (sync_threshold), after the batches 10 and 20; after the batch $k a power
+# cut (kill -9, LazyFS drops what was not synced) at a delay 0-400 ms, then every acknowledged record read back with its
+# embedding.
 set -u
 cat > /lz.toml <<T
 [faults]
@@ -27,7 +27,7 @@ for r in $(seq "$1"); do
   mkdir -p /real/$r /data; mount_lz; : > /tmp/srv.log
   k=$((8 + RANDOM % 18)); d=$((RANDOM % 400))
   up || { echo "round $r: start on an empty folder failed"; pkill -9 -f "vecturadb run"; sleep 1; fusermount3 -u /data; sleep 1; fail=$((fail+1)); continue; }
-  python3 /client_save.py write "$k" 20 > /tmp/acks || { echo "round $r: write failed"; }
+  python3 /client_save.py write "$k" > /tmp/acks || { echo "round $r: write failed"; }
   sleep "0.$(printf %03d $d)"
   pkill -9 -f "vecturadb run"; sleep 1
   echo "lazyfs::clear-cache" > /tmp/faults.fifo; sleep 1
