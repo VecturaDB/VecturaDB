@@ -1904,7 +1904,7 @@ mod tests {
             io::ErrorKind::NotFound
         );
         writer.index.set_sync_threshold(1).await;
-        // The deletion below saves too, as before SAVE_INTERVAL.
+        // The deletion below saves too, whatever the default.
         writer
             .index
             .set_save_interval(std::time::Duration::ZERO)
@@ -2097,7 +2097,7 @@ mod tests {
         let second = second.unwrap();
         assert!(Arc::ptr_eq(&first.index.inner, &second.index.inner));
         first.index.set_sync_threshold(1).await;
-        // A save at every record, as before SAVE_INTERVAL.
+        // A save at every record, whatever the default.
         first
             .index
             .set_save_interval(std::time::Duration::ZERO)

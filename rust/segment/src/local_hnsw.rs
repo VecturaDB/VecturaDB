@@ -45,13 +45,14 @@ pub const HNSW_HEADER_FILE: &str = "header.bin";
 pub const HNSW_INDEX_FILES: [&str; 4] = chroma_index::hnsw_provider::FILES;
 const HNSW_PERSISTENCE_VERSION: i32 = 1;
 
-// The shortest time between two saves of an index by the same instance: a save syncs the files of the index, and a
-// save every sync_threshold records kept the index waiting for the disk most of the time under a steady load. The
-// records after the last save are in the log of SQLite, whose position for the segment moves only after a save, and
-// the next load applies them again, as after any stop between two saves. The first save of an instance waits for the
-// threshold only, as in Chroma 1.5.9: the files of an index never saved are not read at load. The default of
-// hnsw_min_save_interval_seconds of the segment manager, which sets it on every index it opens.
-pub(crate) const SAVE_INTERVAL: Duration = Duration::from_secs(30);
+// The shortest time between two saves of an index by the same instance, after its first one: none, so an index saves
+// at every sync_threshold records, as in Chroma 1.5.9. The journal of a save is taken under the write lock of the index
+// and grows with the records of the save, so the fewer records a save holds, the shorter every write that waits for
+// that lock; the files are written in the background, without it. A longer interval keeps the records after the last
+// save in the log of SQLite, whose position for the segment moves only after a save, and the next load applies them
+// again, as after any stop between two saves. The default of hnsw_min_save_interval_seconds of the segment manager,
+// which sets it on every index it opens.
+pub(crate) const SAVE_INTERVAL: Duration = Duration::ZERO;
 
 // Native HNSW uses four C-runtime streams per persistent index (and another
 // four temporarily while loading). Windows defaults to 512 streams per process.
@@ -1086,7 +1087,7 @@ pub struct Inner {
     num_elements_since_last_persist: u64,
     // When this instance last saved its index; None before its first save.
     last_persist: Option<tokio::time::Instant>,
-    // SAVE_INTERVAL, or hnsw_min_save_interval_seconds of the segment manager; shorter in tests.
+    // SAVE_INTERVAL, or hnsw_min_save_interval_seconds of the segment manager; set in tests.
     save_interval: Duration,
     last_seen_seq_id: u64,
     sync_threshold: usize,
@@ -1311,7 +1312,7 @@ impl LocalHnswIndex {
     }
 
     /// The shortest time between two saves of this instance after its first one, SAVE_INTERVAL otherwise: the segment
-    /// manager sets its hnsw_min_save_interval_seconds, and tests that save more than once set it shorter.
+    /// manager sets its hnsw_min_save_interval_seconds, and tests of the interval set their own.
     pub async fn set_save_interval(&self, save_interval: Duration) {
         self.inner.write().await.save_interval = save_interval;
     }
