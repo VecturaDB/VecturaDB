@@ -14,6 +14,7 @@ CVE-2026-115907
 CVE-2026-115908
 CVE-2026-115909
 CVE-2026-119375
+CVE-2026-126360 # opentelemetry-api: fixed in 1.45.2, which needs Python 3.10; Python 3.9 has no fixed version
 CVE-2026-18140
 CVE-2026-43868
 CVE-2026-45829
@@ -39,6 +40,7 @@ GHSA-36p7-vc44-83pf
 GHSA-4684-h2q9-2vcp
 GHSA-4grx-2x9w-596c
 GHSA-4v9h-p7m9-rh26
+GHSA-6pp4-4cxf-xf88 # quinn-udp 0.5.14: no build compiles it, `cargo tree --locked -i quinn-udp --workspace --target all -e normal` prints nothing (reqwest names quinn only in weak features)
 GHSA-72w2-rjgg-q729
 GHSA-82j2-j2ch-gfr8
 GHSA-8ffr-xgwf-xj56
@@ -60,6 +62,7 @@ GHSA-hhw4-xg65-fp2x
 GHSA-hjqx-j4rw-g7xv
 GHSA-hx9q-6w63-j58v
 GHSA-m665-v7pm-7grj
+GHSA-mf5v-w3w3-f6cg # opentelemetry-api: fixed in 1.45.2, which needs Python 3.10; Python 3.9 has no fixed version
 GHSA-mr82-8j83-vxmv
 GHSA-q7v9-x93c-xqv3
 GHSA-q83h-524g-xf6h
@@ -119,3 +122,4 @@ RUSTSEC-2026-0441
 RUSTSEC-2026-0442
 RUSTSEC-2026-0459
 RUSTSEC-2026-0462
+RUSTSEC-2026-0538 # quinn-udp 0.5.14: no build compiles it, `cargo tree --locked -i quinn-udp --workspace --target all -e normal` prints nothing (reqwest names quinn only in weak features)
