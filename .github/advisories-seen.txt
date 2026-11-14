@@ -14,6 +14,7 @@ CVE-2026-115907
 CVE-2026-115908
 CVE-2026-115909
 CVE-2026-119375
+CVE-2026-126360 # opentelemetry-api: fixed in 1.45.2, which needs Python 3.10; Python 3.9 has no fixed version
 CVE-2026-18140
 CVE-2026-43868
 CVE-2026-45829
@@ -60,6 +61,7 @@ GHSA-hhw4-xg65-fp2x
 GHSA-hjqx-j4rw-g7xv
 GHSA-hx9q-6w63-j58v
 GHSA-m665-v7pm-7grj
+GHSA-mf5v-w3w3-f6cg # opentelemetry-api: fixed in 1.45.2, which needs Python 3.10; Python 3.9 has no fixed version
 GHSA-mr82-8j83-vxmv
 GHSA-q7v9-x93c-xqv3
 GHSA-q83h-524g-xf6h
