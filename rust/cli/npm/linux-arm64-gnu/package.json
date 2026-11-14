@@ -1,0 +1,28 @@
+{
+  "name": "vecturadb-cli-linux-arm64-gnu",
+  "version": "0.0.0",
+  "description": "The VecturaDB CLI for Linux arm64 with glibc 2.17 or later, for the npm package vecturadb.",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "files": [
+    "vecturadb",
+    "NOTICE",
+    "THIRD-PARTY-NOTICES"
+  ],
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VecturaDB/VecturaDB.git",
+    "directory": "rust/cli/npm/linux-arm64-gnu"
+  }
+}
