@@ -40,6 +40,7 @@ GHSA-36p7-vc44-83pf
 GHSA-4684-h2q9-2vcp
 GHSA-4grx-2x9w-596c
 GHSA-4v9h-p7m9-rh26
+GHSA-6pp4-4cxf-xf88 # quinn-udp 0.5.14: no build compiles it, `cargo tree --locked -i quinn-udp --workspace --target all -e normal` prints nothing (reqwest names quinn only in weak features)
 GHSA-72w2-rjgg-q729
 GHSA-82j2-j2ch-gfr8
 GHSA-8ffr-xgwf-xj56
@@ -121,3 +122,4 @@ RUSTSEC-2026-0441
 RUSTSEC-2026-0442
 RUSTSEC-2026-0459
 RUSTSEC-2026-0462
+RUSTSEC-2026-0538 # quinn-udp 0.5.14: no build compiles it, `cargo tree --locked -i quinn-udp --workspace --target all -e normal` prints nothing (reqwest names quinn only in weak features)
