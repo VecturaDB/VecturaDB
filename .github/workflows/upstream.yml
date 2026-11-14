@@ -1,0 +1,64 @@
+name: Upstream
+
+# Every day, the commits of the main of chroma-core/chroma and of the master of chroma-core/hnswlib that VecturaDB does
+# not contain: those of Chroma against this branch, those of hnswlib against the commit of VecturaDB/hnswlib that
+# Cargo.lock pins. A missing commit fails the job, with the list in the summary of the run: GitHub sends an email about
+# it. The commits of Chroma come in with a merge, not with a cherry-pick, so that this check by ancestry finds them.
+on:
+  schedule:
+    - cron: '43 5 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - .github/workflows/upstream.yml
+
+permissions: {}
+
+jobs:
+  upstream:
+    name: Upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # All the commits, without their files: enough for git log.
+          fetch-depth: 0
+          filter: tree:0
+      - name: Commits of Chroma and of its hnswlib that VecturaDB does not contain
+        run: |
+          set -euo pipefail
+          missing=0
+          report() { # <what> <ours> <theirs>
+            local list
+            list=$(git log --format='%h %ad %s' --date=short "$2..$3")
+            if [ -n "$list" ]; then
+              missing=1
+              echo "::error::$1: $(echo "$list" | wc -l) commits not in VecturaDB"
+              # The subjects are written by others: no workflow command in them runs.
+              t=$(openssl rand -hex 16)
+              echo "::stop-commands::$t"
+              echo "$list"
+              echo "::$t::"
+              { echo "### $1: commits not in VecturaDB"; echo '```'; echo "$list"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "$1: every commit is in VecturaDB" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+          git fetch --quiet --filter=tree:0 https://github.com/chroma-core/chroma.git +main:refs/upstream/chroma
+          report "chroma-core/chroma main" HEAD refs/upstream/chroma
+          pinned=$(sed -n 's|^source = "git+https://github.com/VecturaDB/hnswlib.git?rev=[0-9a-f]*#\([0-9a-f]\{40\}\)"$|\1|p' Cargo.lock)
+          if [ "$(echo "$pinned" | wc -w)" != 1 ]; then
+            echo "::error::Cargo.lock does not pin one commit of VecturaDB/hnswlib: '$pinned'"
+            exit 1
+          fi
+          git init --quiet "$RUNNER_TEMP/hnswlib"
+          cd "$RUNNER_TEMP/hnswlib"
+          git fetch --quiet --filter=tree:0 https://github.com/VecturaDB/hnswlib.git "+$pinned:refs/pinned"
+          git fetch --quiet --filter=tree:0 https://github.com/chroma-core/hnswlib.git +master:refs/upstream/hnswlib
+          report "chroma-core/hnswlib master, against VecturaDB/hnswlib ${pinned:0:7}" refs/pinned refs/upstream/hnswlib
+          exit $missing
