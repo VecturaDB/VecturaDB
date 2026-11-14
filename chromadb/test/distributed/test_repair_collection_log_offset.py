@@ -1,7 +1,9 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 # Add some records, wait for compaction, then roll back the log offset.
 # Poll the log for up to 240s to see if the offset gets repaired.
 
 import grpc
+import pytest
 import random
 import time
 from typing import cast
@@ -67,6 +69,9 @@ def _wait_for_collection_log_start(
 
 @skip_if_not_cluster()
 @multi_region_test
+@pytest.mark.not_on_single_node(
+    "it reads and rolls back the log of a collection through the gRPC log service of distributed Chroma"
+)
 def test_repair_collection_log_offset(
     client: ClientAPI,
 ) -> None:

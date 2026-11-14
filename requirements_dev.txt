@@ -1,6 +1,6 @@
 # Changed from the original Chroma file; see the git history for the changes and their authors.
 black==23.3.0 # match what's in pyproject.toml
-boto3
+boto3>=1.44 # Without a lower bound, python-dateutil 4, which botocore does not take, leads uv to boto3 0.0.3, which does not import on Python 3.11
 build
 chroma-hnswlib==0.7.6
 fastapi>=0.115.9

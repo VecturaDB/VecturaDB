@@ -353,6 +353,10 @@ def _collect_knn_queries(rank: Any) -> List[Any]:
     return queries
 
 
+@pytest.mark.not_on_single_node(
+    "(tracked) as on the single node of Chroma 1.5.9, the schema read back right after a write already has "
+    "the keys that the write discovered, where the test expects it unchanged"
+)
 def test_schema_defaults_enable_indexed_operations(
     client_factories: "ClientFactories",
 ) -> None:
@@ -2475,6 +2479,10 @@ def test_server_validates_invalid_source_key_in_sparse_vector_config(
 @pytest.mark.skipif(
     is_spann_disabled_mode,
     reason="on the single node the default index is HNSW, not SPANN as on distributed Chroma: the _local test checks it",
+)
+@pytest.mark.not_on_single_node(
+    "the default index of the single node is HNSW, as in Chroma 1.5.9, where distributed Chroma makes "
+    "SPANN"
 )
 def test_modify_collection_no_initial_config_creates_default_schema(
     client: ClientAPI,

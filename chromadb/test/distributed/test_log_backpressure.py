@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 # Add up to 2M records until the log-is-full message is seen.
 
 import threading
@@ -35,6 +36,10 @@ def is_rate_limit_error(exc: Exception) -> bool:
 
 
 @skip_if_not_cluster()
+@pytest.mark.not_on_single_node(
+    "it expects backpressure on an HNSW collection; the single node applies an HNSW write at the write, and "
+    "pushes back only on a SPANN collection, whose log waits for a flush"
+)
 def test_log_backpressure(
     client: ClientAPI,
 ) -> None:

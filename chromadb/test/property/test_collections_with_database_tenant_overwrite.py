@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 from typing import Dict, Optional, Tuple
 from overrides import overrides
 from hypothesis.stateful import (
@@ -38,6 +39,12 @@ def singleton_database_name(database_name: str) -> str:
     if database_name == DEFAULT_MCMR_DATABASE:
         return f"{MULTI_REGION_TOPOLOGY}+{SINGLETON_DATABASE_NAME}"
     return SINGLETON_DATABASE_NAME
+
+
+# Outside cluster mode the fixture starts a server whose credentials keep the singleton user in its tenant and its
+# database. In cluster mode it connects to the server of CHROMA_SERVER_HOST, which has no such users, and there the
+# singleton user switches as any client does.
+SINGLETON_USER_SCOPED = not (os.getenv("CHROMA_SERVER_HOST") and not NOT_CLUSTER_ONLY)
 
 
 class SingletonTenantDatabaseCollectionStateMachine(
@@ -111,9 +118,13 @@ class SingletonTenantDatabaseCollectionStateMachine(
 
     @overrides
     def set_api_tenant_database(self, tenant: str, database: str) -> None:
-        if self.client == self.singleton_client and (tenant, database) != (
-            SINGLETON_TENANT,
-            self.singleton_database,
+        if (
+            SINGLETON_USER_SCOPED
+            and self.client == self.singleton_client
+            and (tenant, database) != (
+                SINGLETON_TENANT,
+                self.singleton_database,
+            )
         ):
             # As with the API keys of the Rust server, the singleton user
             # reaches its tenant and its database only: the client cannot
@@ -177,7 +188,7 @@ class SingletonTenantDatabaseCollectionStateMachine(
     @property
     def model(self) -> Dict[str, Optional[types.CollectionMetadata]]:
         # The singleton client always stays in its tenant and database.
-        if self.client == self.singleton_client:
+        if SINGLETON_USER_SCOPED and self.client == self.singleton_client:
             return self.tenant_to_database_to_model[SINGLETON_TENANT][
                 self.singleton_database
             ]

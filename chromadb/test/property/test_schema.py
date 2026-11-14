@@ -1,4 +1,7 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 import math
+
+import pytest
 from typing import Any, Dict, Optional, Set, Tuple, cast
 
 from hypothesis import given
@@ -649,8 +652,6 @@ def _assert_schema_indexes(
             ), f"Key '{key}' vector_index enabled mismatch: expected {expected_enabled}, got {actual_float_list.vector_index.enabled}"
 
 
-@multi_region_test
-
 def _asks_for_spann(configuration: Any, schema: Any) -> bool:
     """Whether the configuration or the schema of a new collection asks for SPANN: the single node gives it with a data
     path, as distributed Chroma."""
@@ -670,6 +671,11 @@ def _asks_for_spann(configuration: Any, schema: Any) -> bool:
     return schema is not None and has_spann(schema.serialize_to_json())
 
 
+@multi_region_test
+@pytest.mark.not_on_single_node(
+    "in cluster mode it expects SPANN for every new collection; the default index of the single node is HNSW, "
+    "as in Chroma 1.5.9, and the integration mode checks what it gives"
+)
 @given(
     name=strategies.collection_name(),
     optional_fields=strategies.metadata_configuration_schema_strategy(),
