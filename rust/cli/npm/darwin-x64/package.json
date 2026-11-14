@@ -1,0 +1,25 @@
+{
+  "name": "vecturadb-cli-darwin-x64",
+  "version": "0.0.0",
+  "description": "The VecturaDB CLI for macOS x64 (Intel), for the npm package vecturadb.",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "vecturadb",
+    "NOTICE",
+    "THIRD-PARTY-NOTICES"
+  ],
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VecturaDB/VecturaDB.git",
+    "directory": "rust/cli/npm/darwin-x64"
+  }
+}

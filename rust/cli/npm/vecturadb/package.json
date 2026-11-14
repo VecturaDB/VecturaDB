@@ -1,0 +1,44 @@
+{
+  "name": "vecturadb",
+  "version": "0.0.0",
+  "description": "Vector database compatible with the Chroma API, as a server from npm: npx vecturadb run. Independent project. Not affiliated with, endorsed by or sponsored by Chroma Inc. CHROMA is a registered trademark of Chroma Inc., used here only to describe compatibility.",
+  "keywords": [
+    "vecturadb",
+    "vector",
+    "database",
+    "embedding",
+    "ai"
+  ],
+  "author": "VecturaDB contributors",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/VecturaDB/VecturaDB#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VecturaDB/VecturaDB.git",
+    "directory": "rust/cli/npm/vecturadb"
+  },
+  "bugs": {
+    "url": "https://github.com/VecturaDB/VecturaDB/issues"
+  },
+  "type": "module",
+  "files": [
+    "cli.mjs",
+    "NOTICE"
+  ],
+  "dependencies": {
+    "semver": "^7.7.1"
+  },
+  "optionalDependencies": {
+    "vecturadb-cli-darwin-arm64": "0.0.0",
+    "vecturadb-cli-darwin-x64": "0.0.0",
+    "vecturadb-cli-linux-arm64-gnu": "0.0.0",
+    "vecturadb-cli-linux-x64-gnu": "0.0.0",
+    "vecturadb-cli-win32-x64-msvc": "0.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "vecturadb": "cli.mjs"
+  }
+}
