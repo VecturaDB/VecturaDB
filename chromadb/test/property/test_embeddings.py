@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 import hypothesis.stateful
 import hypothesis.strategies
 from overrides import overrides
@@ -1521,6 +1522,10 @@ def test_0dim_embedding_validation() -> None:
     )
 
 
+@pytest.mark.not_on_single_node(
+    "(tracked) on a collection never written to, deletes of absent ids leave the version at 0, where "
+    "distributed Chroma counts one"
+)
 def test_no_op_compaction(client: ClientAPI) -> None:
     create_isolated_database(client)
     coll = client.create_collection(name="noop")

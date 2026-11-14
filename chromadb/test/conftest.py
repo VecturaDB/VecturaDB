@@ -1228,6 +1228,31 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "needs(*features): run test only if the server of its client has these features (server_has)",
     )
+    config.addinivalue_line(
+        "markers",
+        "not_on_single_node(reason): in cluster mode against the single node of VecturaDB, skip the test with the reason",
+    )
+
+
+def cluster_server_is_single_node() -> bool:
+    """In cluster mode, whether the server of CHROMA_SERVER_HOST is the single node of VecturaDB: it lists its features
+    in the server block of its pre-flight checks, which distributed Chroma does not have."""
+    if NOT_CLUSTER_ONLY:
+        return False
+    host, port = _get_server_host_port_from_env()
+    return bool(_server_features(host, port, False))
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: List[pytest.Item]) -> None:
+    """In cluster mode against the single node of VecturaDB, the tests marked `not_on_single_node` are skipped with
+    their reason: they need the infrastructure of distributed Chroma, expect what distributed Chroma does where the
+    single node differs, or fail for a difference that is tracked."""
+    if not cluster_server_is_single_node():
+        return
+    for item in items:
+        marker = item.get_closest_marker("not_on_single_node")
+        if marker is not None:
+            item.add_marker(pytest.mark.skip(reason=f"single node: {marker.args[0]}"))
 
 
 def is_client_in_process(client: ClientAPI) -> bool:
