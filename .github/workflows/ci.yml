@@ -26,6 +26,14 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_PROFILE_RELEASE_DEBUG: "0"
   CARGO_PROFILE_RELEASE_STRIP: symbols
+  # The Python tests of the single node, in process and against the server.
+  PYTHON_TESTS: >-
+    chromadb/test/api chromadb/test/configurations chromadb/test/test_api.py chromadb/test/test_client.py
+    chromadb/test/test_local_sparse_search.py chromadb/test/ef/test_default_ef.py
+    chromadb/test/ef/test_chroma_bm25_embedding_function.py
+    chromadb/test/auth/test_authz_tenant_scope.py chromadb/test/server/test_fastapi_security.py
+    chromadb/test/property --ignore-glob chromadb/test/property/test_cross_version_persist.py
+    --ignore chromadb/test/property/test_add_mcmr.py
 
 jobs:
   cli-linux:
@@ -374,20 +382,91 @@ jobs:
         env:
           CHROMA_RUST_BINDINGS_TEST_ONLY: "1"
           RUST_BACKTRACE: 1
-        run: >-
-          python -m pytest -x -v --color=yes --durations 10
-          chromadb/test/api chromadb/test/configurations chromadb/test/test_api.py chromadb/test/test_client.py
-          chromadb/test/test_local_sparse_search.py chromadb/test/ef/test_default_ef.py
-          chromadb/test/ef/test_chroma_bm25_embedding_function.py
-          chromadb/test/auth/test_authz_tenant_scope.py chromadb/test/server/test_fastapi_security.py
-          chromadb/test/property --ignore-glob chromadb/test/property/test_cross_version_persist.py
-          --ignore chromadb/test/property/test_add_mcmr.py
+          # As the pull requests of Chroma: 100 examples a property test, and a failure reported without shrinking it.
+          PROPERTY_TESTING_PRESET: normal
+          CHROMA_HYPOTHESIS_CI_REPRODUCE_ONLY: "1"
+        run: python -m pytest -x -v --color=yes --durations 10 $PYTHON_TESTS
       - name: Smoke test with the CLI server
         # chroma run listens on localhost, which can resolve to ::1 only: the clients call localhost, as users do
         run: |
           chroma run --path ./smoke-data --port 8001 &
           for i in $(seq 1 30); do curl -sf http://localhost:8001/api/v2/heartbeat && break; sleep 2; done
           python vecturadb/smoke.py 8001 localhost
+
+  # Chroma's Python tests against the server, started from the image of this run, with allow_reset. Integration is the
+  # mode of Chroma's tests against its single-node server, with the files of the job above. Cluster is the mode of
+  # its tests against distributed Chroma, with the tests of the functions of distributed Chroma, the attached functions
+  # with their files on MinIO among them: a test that needs the infrastructure of distributed Chroma, or expects what
+  # distributed Chroma does where the single node differs, is marked not_on_single_node with the reason (-rs lists
+  # them). Server, MinIO and tests share the network of the runner, as the services of distributed Chroma at
+  # localhost:8000 and localhost:9000. Not in a release, whose image is not an artifact: its tag is on a commit of main.
+  python-tests-server:
+    name: Python tests against the server (${{ matrix.mode }})
+    needs: [image, wheel-linux-x86_64]
+    if: inputs.version == ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [integration, cluster]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/python
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheel-linux-x86_64
+          path: dist
+      - run: pip install --no-index --find-links dist VecturaDB
+      - uses: ./.github/actions/preload-default-onnx-model
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vecturadb-image-amd64
+      - name: Load the image
+        run: gunzip -c vecturadb-image-amd64.tar.gz | docker load
+      - name: MinIO, for the files of the attached functions
+        if: matrix.mode == 'cluster'
+        # The image of MinIO of the tests of distributed Chroma (k8s/test/minio.yaml).
+        run: >-
+          docker run -d --name minio --network host -e MINIO_ACCESS_KEY=minio -e MINIO_SECRET_KEY=minio123
+          ghcr.io/chroma-core/ci-minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+          server /storage --console-address=:9005
+      - name: Server
+        env:
+          MODE: ${{ matrix.mode }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/data"
+          printf 'persist_path: "/data"\nport: 8000\nlisten_address: "0.0.0.0"\nallow_reset: true\n' > "$RUNNER_TEMP/config.yaml"
+          if [ "$MODE" = cluster ]; then
+            # The files of the attached functions on MinIO at minio.chroma:9000, as in distributed Chroma.
+            printf 'local_compaction_manager:\n  storage:\n    s3:\n      bucket: "chroma-storage"\n      credentials: "Minio"\n' >> "$RUNNER_TEMP/config.yaml"
+          fi
+          docker run -d --name vecturadb --network host --add-host minio.chroma:127.0.0.1 --user "$(id -u):$(id -g)" \
+            -v "$RUNNER_TEMP/data:/data" -v "$RUNNER_TEMP/config.yaml:/config.yaml:ro" ghcr.io/vecturadb/vecturadb:ci
+          for i in $(seq 1 30); do curl -sf http://localhost:8000/api/v2/heartbeat && break; sleep 2; done
+      - name: Test
+        env:
+          MODE: ${{ matrix.mode }}
+          RUST_BACKTRACE: 1
+          PROPERTY_TESTING_PRESET: normal
+          CHROMA_HYPOTHESIS_CI_REPRODUCE_ONLY: "1"
+          # The tests of the attached functions read the count of their failures in the database of the server.
+          VECTURADB_SQLITE_PATH: ${{ runner.temp }}/data/chroma.sqlite3
+        run: |
+          # The address of the server as Chroma's bin/rust-integration-test.sh and its cluster tests give it.
+          if [ "$MODE" = integration ]; then
+            export CHROMA_INTEGRATION_TEST_ONLY=1 CHROMA_SERVER_HOST=localhost CHROMA_SERVER_HTTP_PORT=8000
+            tests=$PYTHON_TESTS
+          else
+            export CHROMA_CLUSTER_TEST_ONLY=1 CHROMA_SERVER_HOST=localhost:8000
+            tests="chromadb/test/api chromadb/test/property chromadb/test/distributed
+              --ignore-glob chromadb/test/property/test_cross_version_persist.py"
+          fi
+          python -m pytest -x -v -rs --color=yes --durations 10 $tests
+      - if: failure()
+        run: docker logs vecturadb
 
   hosted-embedding-functions:
     name: Hosted embedding functions (models from Hugging Face)
