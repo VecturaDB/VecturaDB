@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 from typing import Sequence
 from chromadb.test.conftest import (
     reset,
@@ -5,10 +6,14 @@ from chromadb.test.conftest import (
 )
 from chromadb.api import ClientAPI
 from kubernetes import client as k8s_client, config
+import pytest
 import time
 
 
 @skip_if_not_cluster()
+@pytest.mark.not_on_single_node(
+    "it restarts a query pod through the Kubernetes API of distributed Chroma"
+)
 def test_reroute(
     client: ClientAPI,
 ) -> None:

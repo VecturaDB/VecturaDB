@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 import uuid
 from random import randint
 from typing import cast, List, Any, Dict, Tuple
@@ -18,6 +19,11 @@ from chromadb.test.utils.wait_for_version_increase import wait_for_version_incre
 from chromadb.utils.batch_utils import create_batches
 from chromadb.api.client import AdminClient
 from chromadb.config import Settings
+
+pytestmark = pytest.mark.not_on_single_node(
+    "it needs two regions, servers at localhost:8000 and localhost:8001, as the multi-region topology of "
+    "distributed Chroma"
+)
 
 MIN_RECORDS_BETWEEN_COMPACTION_WAITS = 10
 

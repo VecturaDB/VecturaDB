@@ -1,3 +1,4 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 import uuid
 from random import randint
 from typing import cast, List, Any, Dict
@@ -34,6 +35,11 @@ LARGE_MAX_RECORDS = 15_000
 collection_st = st.shared(strategies.collections(with_hnsw_params=True), key="coll")
 
 
+@pytest.mark.not_on_single_node(
+    "(tracked) it waits 120 s for a flush of a SPANN collection of fewer than 10 records, which comes, with the "
+    "flush thresholds of distributed Chroma, at 10 records (min_compaction_size) or after a day (timeout_us); "
+    "Chroma runs it with MULTI_REGION, where it does not wait"
+)
 @given(
     collection=collection_st,
     record_set=strategies.recordsets(collection_st, min_size=1, max_size=5),

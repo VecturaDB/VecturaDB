@@ -1,4 +1,7 @@
+# Changed from the original Chroma file; see the git history for the changes and their authors.
 from time import sleep
+
+import pytest
 
 from chromadb.api import ClientAPI
 from chromadb.api.types import IndexingStatus
@@ -57,6 +60,10 @@ def test_indexing_status_after_add(client: ClientAPI) -> None:
 
 
 @skip_if_not_cluster()
+@pytest.mark.not_on_single_node(
+    "it counts operations; the single node counts records, so after an upsert or a delete its totals are not "
+    "those of distributed Chroma"
+)
 def test_indexing_status_after_upsert(client: ClientAPI) -> None:
     """Test indexing status after upsert operations"""
     client.reset()
@@ -84,6 +91,10 @@ def test_indexing_status_after_upsert(client: ClientAPI) -> None:
 
 
 @skip_if_not_cluster()
+@pytest.mark.not_on_single_node(
+    "it counts operations; the single node counts records, so after an upsert or a delete its totals are not "
+    "those of distributed Chroma"
+)
 def test_indexing_status_after_delete(client: ClientAPI) -> None:
     """Test indexing status after delete operations"""
     client.reset()
@@ -149,6 +160,10 @@ def test_indexing_status_field_types(client: ClientAPI) -> None:
 
 
 @skip_if_not_cluster()
+@pytest.mark.not_on_single_node(
+    "it expects a compaction after the writes; the single node applies an HNSW write to its index at the write, "
+    "so the indexing is complete when the write returns and no version follows"
+)
 def test_indexing_status_batch_progression(client: ClientAPI) -> None:
     """Test indexing status with 2000 records based on index version progression"""
     client.reset()
@@ -219,6 +234,10 @@ def test_indexing_status_not_found(client: ClientAPI) -> None:
 
 
 @skip_if_not_cluster()
+@pytest.mark.not_on_single_node(
+    "it expects a compaction after the writes; the single node applies an HNSW write to its index at the write, "
+    "so the indexing is complete when the write returns and no version follows"
+)
 def test_indexing_status_concurrent_progress_variation(client: ClientAPI) -> None:
     """Test that progress values vary as indexing completes"""
     client.reset()
