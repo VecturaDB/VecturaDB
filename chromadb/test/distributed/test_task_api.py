@@ -1,3 +1,7 @@
+# Changed from the original Chroma file: against VecturaDB, _wait_for_wqs_failure_count reads the failure count of an
+# asynchronous function in the SQLite database of the server, given by VECTURADB_SQLITE_PATH; without it, as against
+# distributed Chroma, in workqueue_state.parquet on MinIO, as the original does. See the git history for the changes
+# and their authors.
 """
 Integration test for Chroma's Task API
 
@@ -7,6 +11,7 @@ for automatically processing collections.
 
 import contextlib
 import functools
+import io
 import json
 import os
 import sqlite3
@@ -132,27 +137,39 @@ def _wait_for_wqs_failure_count(
 ) -> None:
     # VecturaDB keeps the queue of the asynchronous functions in the rows of
     # attached_functions of its SQLite database, not in workqueue_state.parquet as
-    # distributed Chroma: the failure count is read from the database of the server
-    # under test, given by VECTURADB_SQLITE_PATH.
+    # distributed Chroma: against VecturaDB the failure count is read from the database
+    # of the server under test, given by VECTURADB_SQLITE_PATH. Without it, as in the
+    # original, from workqueue_state.parquet on MinIO.
     path = os.environ.get("VECTURADB_SQLITE_PATH")
-    if not path:
-        pytest.fail(
-            "VECTURADB_SQLITE_PATH must give the SQLite database of the server under test"
-        )
+    parquet = None if path else pytest.importorskip("pyarrow.parquet")
+
+    def failure_count() -> Optional[int]:
+        if path:
+            with contextlib.closing(
+                sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            ) as conn:
+                row = conn.execute(
+                    "SELECT failure_count FROM attached_functions "
+                    "WHERE id = ? AND input_collection_id = ?",
+                    (function_id, input_collection_id),
+                ).fetchone()
+            return None if row is None else cast(int, row[0])
+        body = _minio_get_object(MINIO_BUCKET, "workqueue_state.parquet")
+        if body is not None:
+            for row in parquet.read_table(io.BytesIO(body)).to_pylist():
+                if (
+                    row["fn_id"] == function_id
+                    and row["input_coll_id"] == input_collection_id
+                ):
+                    return cast(int, row["failure_count"])
+        return None
 
     deadline = time.monotonic() + timeout_seconds
     last_failure_count = None
     while time.monotonic() < deadline:
-        with contextlib.closing(
-            sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        ) as conn:
-            row = conn.execute(
-                "SELECT failure_count FROM attached_functions "
-                "WHERE id = ? AND input_collection_id = ?",
-                (function_id, input_collection_id),
-            ).fetchone()
-        if row is not None:
-            last_failure_count = row[0]
+        count = failure_count()
+        if count is not None:
+            last_failure_count = count
             if last_failure_count >= expected_failure_count:
                 return
         sleep(5)
