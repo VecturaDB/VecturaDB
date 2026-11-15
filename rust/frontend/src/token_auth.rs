@@ -18,14 +18,13 @@ use crate::config::FrontendServerConfig;
 /// Every tenant, or every database of a tenant, as in Chroma 0.5.
 const ALL: &str = "*";
 
-/// The header that carries the key, as `chroma_auth_token_transport_header` in Chroma 0.5. The default is the header of
-/// Chroma Cloud.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// The header that carries the key, as `chroma_auth_token_transport_header` in Chroma 0.5. Without the setting the key is
+/// taken from either: `X-Chroma-Token`, as Chroma Cloud, or `Authorization: Bearer`, the default of Chroma 0.5.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TokenTransportHeader {
     /// `Authorization: Bearer <key>`
     Authorization,
     /// `X-Chroma-Token: <key>`
-    #[default]
     XChromaToken,
 }
 
@@ -87,7 +86,8 @@ fn valid_token(token: &str) -> bool {
 #[derive(Debug)]
 pub struct TokenAuthentication {
     users: HashMap<String, User>,
-    header: TokenTransportHeader,
+    /// The header of the setting; without it, either header.
+    header: Option<TokenTransportHeader>,
 }
 
 impl TokenAuthentication {
@@ -100,8 +100,7 @@ impl TokenAuthentication {
             .auth_token_transport_header
             .as_deref()
             .map(TokenTransportHeader::try_from)
-            .transpose()?
-            .unwrap_or_default();
+            .transpose()?;
         let users = match (
             &config.server_authn_credentials_file,
             &config.server_authn_credentials,
@@ -166,18 +165,30 @@ impl TokenAuthentication {
     /// The user of the key in the request, or 401.
     fn authenticate(&self, headers: &HeaderMap) -> Result<&User, AuthError> {
         let unauthorized = || AuthError(StatusCode::UNAUTHORIZED);
-        let token = match self.header {
-            TokenTransportHeader::XChromaToken => headers
+        let x_chroma_token = || {
+            headers
                 .get("x-chroma-token")
                 .and_then(|value| value.to_str().ok())
-                .ok_or_else(unauthorized)?,
-            TokenTransportHeader::Authorization => headers
+                .map(str::trim)
+        };
+        // An `Authorization` that is not `Bearer <key>`, as the Basic of a proxy, carries no key.
+        let bearer = || {
+            headers
                 .get("authorization")
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.strip_prefix("Bearer "))
-                .ok_or_else(unauthorized)?,
+                .map(str::trim)
+        };
+        let token = match self.header {
+            Some(TokenTransportHeader::XChromaToken) => x_chroma_token(),
+            Some(TokenTransportHeader::Authorization) => bearer(),
+            // Without the setting, either header; two different keys are refused, not chosen between.
+            None => match (x_chroma_token(), bearer()) {
+                (Some(a), Some(b)) if a != b => return Err(unauthorized()),
+                (a, b) => a.or(b),
+            },
         }
-        .trim();
+        .ok_or_else(unauthorized)?;
         if !valid_token(token) {
             return Err(unauthorized());
         }
@@ -454,20 +465,127 @@ users:
         assert!(identity.databases.is_empty());
     }
 
-    // The header of Chroma Cloud by default; `Authorization: Bearer` with the setting of Chroma 0.5, and then only that.
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(*name, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    fn user_of(auth: &TokenAuthentication, headers: &HeaderMap) -> Option<String> {
+        auth.authenticate(headers).ok().map(|user| user.id.clone())
+    }
+
+    // Without the setting, the key in either header: `X-Chroma-Token` as Chroma Cloud, `Authorization: Bearer` as the
+    // default of Chroma 0.5 and the clients and consoles that send it.
     #[test]
-    fn the_key_travels_in_the_configured_header() {
-        let mut bearer = HeaderMap::new();
-        bearer.insert("authorization", HeaderValue::from_static("Bearer token-a"));
-        let default = auth_with(CREDENTIALS, None);
-        assert!(default.authenticate(&token("token-a")).is_ok());
-        assert!(default.authenticate(&bearer).is_err());
+    fn without_the_setting_the_key_travels_in_either_header() {
+        let auth = auth_with(CREDENTIALS, None);
+        let team_a = Some("team_a".to_string());
+        assert_eq!(
+            user_of(&auth, &headers(&[("x-chroma-token", "token-a")])),
+            team_a
+        );
+        assert_eq!(
+            user_of(&auth, &headers(&[("authorization", "Bearer token-a")])),
+            team_a
+        );
+        // Both, with the same key.
+        assert_eq!(
+            user_of(
+                &auth,
+                &headers(&[
+                    ("x-chroma-token", "token-a"),
+                    ("authorization", "Bearer token-a")
+                ])
+            ),
+            team_a
+        );
+        // Both, with two different keys: no guess of which one is meant, even when both are valid.
+        assert_eq!(
+            user_of(
+                &auth,
+                &headers(&[
+                    ("x-chroma-token", "token-a"),
+                    ("authorization", "Bearer admin-token")
+                ])
+            ),
+            None
+        );
+        assert_eq!(
+            user_of(
+                &auth,
+                &headers(&[
+                    ("x-chroma-token", "token-a"),
+                    ("authorization", "Bearer wrong")
+                ])
+            ),
+            None
+        );
+        // An `Authorization` that is not `Bearer`, as the Basic of a proxy, is not a key: it is left aside.
+        assert_eq!(
+            user_of(
+                &auth,
+                &headers(&[
+                    ("x-chroma-token", "token-a"),
+                    ("authorization", "Basic dXNlcjpwYXNz")
+                ])
+            ),
+            team_a
+        );
+        assert_eq!(
+            user_of(&auth, &headers(&[("authorization", "Basic dXNlcjpwYXNz")])),
+            None
+        );
+        assert_eq!(
+            user_of(&auth, &headers(&[("authorization", "token-a")])),
+            None
+        );
+        assert_eq!(
+            user_of(&auth, &headers(&[("authorization", "Bearer wrong")])),
+            None
+        );
+        assert_eq!(user_of(&auth, &HeaderMap::new()), None);
+    }
+
+    // With the setting of Chroma 0.5, only the chosen header.
+    #[test]
+    fn with_the_setting_only_the_chosen_header() {
+        let bearer = headers(&[("authorization", "Bearer token-a")]);
+        let chroma_token = headers(&[("x-chroma-token", "token-a")]);
+        let team_a = Some("team_a".to_string());
         let authorization = auth_with(CREDENTIALS, Some("Authorization"));
-        assert!(authorization.authenticate(&bearer).is_ok());
-        assert!(authorization.authenticate(&token("token-a")).is_err());
-        let mut no_bearer = HeaderMap::new();
-        no_bearer.insert("authorization", HeaderValue::from_static("token-a"));
-        assert!(authorization.authenticate(&no_bearer).is_err());
+        assert_eq!(user_of(&authorization, &bearer), team_a);
+        assert_eq!(user_of(&authorization, &chroma_token), None);
+        assert_eq!(
+            user_of(&authorization, &headers(&[("authorization", "token-a")])),
+            None
+        );
+        // The other header is not read at all, so a different key there changes nothing.
+        assert_eq!(
+            user_of(
+                &authorization,
+                &headers(&[
+                    ("authorization", "Bearer token-a"),
+                    ("x-chroma-token", "admin-token")
+                ])
+            ),
+            team_a
+        );
+        let x_chroma_token = auth_with(CREDENTIALS, Some("X-Chroma-Token"));
+        assert_eq!(user_of(&x_chroma_token, &chroma_token), team_a);
+        assert_eq!(user_of(&x_chroma_token, &bearer), None);
+        assert_eq!(
+            user_of(
+                &x_chroma_token,
+                &headers(&[
+                    ("x-chroma-token", "token-a"),
+                    ("authorization", "Bearer admin-token")
+                ])
+            ),
+            team_a
+        );
     }
 
     // The checks of Chroma 0.5 on the file.

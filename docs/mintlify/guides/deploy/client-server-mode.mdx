@@ -113,7 +113,7 @@ Name the file with `server_authn_credentials_file` in the configuration file, or
 
 The server then answers as Chroma Cloud does:
 
-- The key travels in the `x-chroma-token` header. Set `auth_token_transport_header: Authorization` (`CHROMA_AUTH_TOKEN_TRANSPORT_HEADER`) to take it from `Authorization: Bearer <key>` instead.
+- The key travels in the `x-chroma-token` header, as on Chroma Cloud, or in `Authorization: Bearer <key>`, the default of Chroma 0.5 and of the clients and consoles that send a Bearer key. A request with two different keys in the two headers gets `401`, and an `Authorization` that is not `Bearer`, such as the Basic of a proxy, is left aside. Set `auth_token_transport_header` (`CHROMA_AUTH_TOKEN_TRANSPORT_HEADER`) to `X-Chroma-Token` or `Authorization` to accept that header only, as in Chroma 0.5.
 - Without a valid key a request gets `401`; with a key outside its tenant or its databases, `403`.
 - A key with a tenant sees that tenant only. A key with databases sees those databases only, may list the databases of its tenant, and cannot create or delete a database.
 - A key without a tenant sees every tenant, and only such a key may create tenants or reset the server.

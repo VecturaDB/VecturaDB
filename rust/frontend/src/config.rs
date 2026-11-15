@@ -213,8 +213,8 @@ pub struct FrontendServerConfig {
     /// A single API key, for every tenant (`chroma_server_authn_credentials` in Chroma 0.5).
     #[serde(default)]
     pub server_authn_credentials: Option<String>,
-    /// The header of the API key: `X-Chroma-Token` by default, as on Chroma Cloud, or `Authorization` for
-    /// `Bearer <key>` (`chroma_auth_token_transport_header` in Chroma 0.5).
+    /// The header of the API key (`chroma_auth_token_transport_header` in Chroma 0.5): `X-Chroma-Token`, as on Chroma
+    /// Cloud, or `Authorization` for `Bearer <key>`, and then only that one. Without it, either header.
     #[serde(default)]
     pub auth_token_transport_header: Option<String>,
     /// The `server` block of `/api/v2/pre-flight-checks`, set by `chroma run` and never read from the file.
