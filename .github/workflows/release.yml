@@ -219,7 +219,7 @@ jobs:
                 echo "$name@$VERSION is on npm already"
                 continue
               fi
-              npm publish "npm/$file" --tag "$tag"
+              npm publish "./npm/$file" --tag "$tag"
             done
       - name: What npm install vecturadb installs
         env:
