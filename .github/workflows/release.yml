@@ -213,22 +213,54 @@ jobs:
           fi
           echo "dist-tag: $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          node -e 'for (const p of require("./npm/packages.json")) console.log(p.filename, p.name, p.integrity)' |
-            while read -r file name integrity; do
-              if [ "$(npm view "$name@$VERSION" dist.integrity 2>/dev/null)" = "$integrity" ]; then
-                echo "$name@$VERSION is on npm already"
-                continue
-              fi
-              npm publish "./npm/$file" --tag "$tag"
+          # vecturadb goes last, once npm serves the tarballs of the packages of the platforms: until then npm install
+          # vecturadb would install it without the CLI, its packages being optional dependencies. npm can take minutes to
+          # show a new version and longer to serve its tarball: 6 and 10-13 minutes for the 31-85 MB packages of the CLI
+          # of 1.0.0-preview.10.post1.
+          on_npm() {
+            [ "$(npm view --prefer-online "$1@$VERSION" dist.integrity 2>/dev/null)" = "$2" ] &&
+              curl -sfI -o /dev/null "$(npm view --prefer-online "$1@$VERSION" dist.tarball)"
+          }
+          wait_npm() {
+            for i in $(seq 1 80); do
+              on_npm "$1" "$2" && return 0
+              echo "$1@$VERSION is not on npm yet"; sleep 30
             done
+            echo "$1@$VERSION is not on npm, with its tarball, after 40 minutes"; return 1
+          }
+          publish() {
+            if [ "$(npm view "$2@$VERSION" dist.integrity 2>/dev/null)" = "$3" ]; then
+              echo "$2@$VERSION is on npm already"
+            else
+              npm publish "./npm/$1" --tag "$tag"
+            fi
+          }
+          packages=$(node -e 'for (const p of require("./npm/packages.json")) console.log(p.filename, p.name, p.integrity)')
+          while read -r file name integrity; do
+            [ "$name" = vecturadb ] || publish "$file" "$name" "$integrity"
+          done <<< "$packages"
+          while read -r file name integrity; do
+            [ "$name" = vecturadb ] || wait_npm "$name" "$integrity"
+          done <<< "$packages"
+          while read -r file name integrity; do
+            [ "$name" != vecturadb ] || publish "$file" "$name" "$integrity"
+          done <<< "$packages"
       - name: What npm install vecturadb installs
         env:
           VERSION: ${{ needs.version.outputs.version }}
           TAG: ${{ steps.publish.outputs.tag }}
         run: |
+          # npm can take minutes to show vecturadb and serve its tarball, as the packages of the platforms in Publish.
           node -e 'for (const p of require("./npm/packages.json")) console.log(p.name, p.integrity)' |
             while read -r name integrity; do
-              test "$(npm view "$name@$VERSION" dist.integrity)" = "$integrity"
+              for i in $(seq 1 80); do
+                if [ "$(npm view --prefer-online "$name@$VERSION" dist.integrity 2>/dev/null)" = "$integrity" ] &&
+                  curl -sfI -o /dev/null "$(npm view --prefer-online "$name@$VERSION" dist.tarball)"; then
+                  continue 2
+                fi
+                echo "$name@$VERSION is not on npm yet"; sleep 30
+              done
+              echo "$name@$VERSION is not on npm, with its tarball, after 40 minutes"; exit 1
             done
           npm view vecturadb dist-tags
           spec=vecturadb
@@ -238,10 +270,11 @@ jobs:
           for i in $(seq 1 20); do
             npm install --prefer-online "$spec"
             installed=$(node -p 'require("vecturadb/package.json").version')
-            [ "$installed" = "$VERSION" ] && break
-            echo "npm install $spec installs $installed, not $VERSION yet"; sleep 30
+            cli=$(node -p 'try { require("vecturadb-cli-linux-x64-gnu/package.json").version } catch { "none" }')
+            [ "$installed" = "$VERSION" ] && [ "$cli" = "$VERSION" ] && break
+            echo "npm install $spec installs $installed with the CLI package $cli, not $VERSION yet"; sleep 30
           done
-          test "$installed" = "$VERSION"
+          test "$installed" = "$VERSION" && test "$cli" = "$VERSION"
           npx vecturadb --version | tee /dev/stderr | grep -qx "vecturadb $VERSION"
           test "$(sha256sum < node_modules/vecturadb-cli-linux-x64-gnu/vecturadb)" = "$(sha256sum < ../cli/vecturadb-linux-x86_64)"
           npm audit signatures
