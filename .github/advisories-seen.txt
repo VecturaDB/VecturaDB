@@ -123,3 +123,5 @@ RUSTSEC-2026-0442
 RUSTSEC-2026-0459
 RUSTSEC-2026-0462
 RUSTSEC-2026-0538 # quinn-udp 0.5.14: no build compiles it, `cargo tree --locked -i quinn-udp --workspace --target all -e normal` prints nothing (reqwest names quinn only in weak features)
+RUSTSEC-2026-0542 # humantime 2.3.0: unmaintained; inherited from Chroma, same version; look again if Chroma replaces it
+RUSTSEC-2026-0543 # chrono 0.4.44: unmaintained; inherited from Chroma, same version; look again if Chroma replaces it
