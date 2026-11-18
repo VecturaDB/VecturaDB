@@ -197,6 +197,10 @@ Chroma 1.5.9 opens a data path with attached functions, and serves its collectio
 
 Distributed Chroma deletes a collection in two phases: it marks the collection as deleted, and its garbage collector removes the files later. The single node deletes the collection and removes its index files before it answers; if removing a file fails, it retries at startup and every hour. The end result is the same: the collection and its files are gone.
 
+## Forking a collection
+
+Distributed Chroma forks a collection with copy-on-write: the fork shares the files of the source and writes files of its own only for what changes. The single node copies every record of the source into the fork, which keeps files of its own; the fork is visible once the copy has ended. The end result is the same: the fork answers with the records of the source at the moment of the fork.
+
 ## Clients
 
 A client that needs to know which server it talks to reads `GET /api/v2/pre-flight-checks`. VecturaDB answers with the fields of Chroma and adds a `server` block, for example:
