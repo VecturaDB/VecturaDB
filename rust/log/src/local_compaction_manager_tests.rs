@@ -2172,11 +2172,13 @@ async fn a_collection_with_five_failed_flushes_is_left_out_until_a_restart() {
         .await
         .unwrap();
     let count = || async {
-        sqlx::query_scalar::<_, i32>("SELECT compaction_failure_count FROM collections WHERE id = ?")
-            .bind(collection_id.to_string())
-            .fetch_one(f.db.get_conn())
-            .await
-            .unwrap()
+        sqlx::query_scalar::<_, i32>(
+            "SELECT compaction_failure_count FROM collections WHERE id = ?",
+        )
+        .bind(collection_id.to_string())
+        .fetch_one(f.db.get_conn())
+        .await
+        .unwrap()
     };
     let other = CollectionUuid::new();
     for failures in 1..=5 {
@@ -2193,7 +2195,11 @@ async fn a_collection_with_five_failed_flushes_is_left_out_until_a_restart() {
         assert_eq!(count().await, failures);
         let round = without_too_many_failures(&f.db, 5, vec![collection_id, other]).await;
         if failures < 5 {
-            assert_eq!(round, vec![collection_id, other], "left out after {failures} failures");
+            assert_eq!(
+                round,
+                vec![collection_id, other],
+                "left out after {failures} failures"
+            );
         } else {
             assert_eq!(round, vec![other], "still flushed after 5 failures");
         }

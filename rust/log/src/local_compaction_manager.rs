@@ -1328,6 +1328,8 @@ impl Handler<SpannFlushed> for LocalCompactionManager {
                 error = %err,
                 "SPANN flush failed; its records stay in the log for the next round"
             );
+        }
+        if result.is_err() {
             self.increment_compaction_failure_count(collection_id).await;
         }
         let requests = self
@@ -1398,8 +1400,11 @@ impl LocalCompactionManager {
     async fn increment_compaction_failure_count(&self, collection_id: CollectionUuid) {
         let counted = match self.sqlite_db.get_conn().acquire().await {
             Ok(mut conn) => {
-                chroma_sysdb::sqlite::increment_compaction_failure_count_in(&mut conn, collection_id)
-                    .await
+                chroma_sysdb::sqlite::increment_compaction_failure_count_in(
+                    &mut conn,
+                    collection_id,
+                )
+                .await
             }
             Err(err) => Err(err),
         };
@@ -1416,7 +1421,9 @@ impl LocalCompactionManager {
     // 18/11). Distributed Chroma brings a collection back with a one-off compaction instead.
     async fn reset_compaction_failure_counts(&self) {
         let reset = match self.sqlite_db.get_conn().acquire().await {
-            Ok(mut conn) => chroma_sysdb::sqlite::reset_compaction_failure_counts_in(&mut conn).await,
+            Ok(mut conn) => {
+                chroma_sysdb::sqlite::reset_compaction_failure_counts_in(&mut conn).await
+            }
             Err(err) => Err(err),
         };
         match reset {
@@ -1425,7 +1432,9 @@ impl LocalCompactionManager {
                 collections = reset,
                 "The compaction failure counts are back to 0: the collections left out flush again"
             ),
-            Err(err) => tracing::warn!(error = %err, "The compaction failure counts could not be set back to 0"),
+            Err(err) => {
+                tracing::warn!(error = %err, "The compaction failure counts could not be set back to 0")
+            }
         }
     }
 

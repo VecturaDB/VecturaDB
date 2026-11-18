@@ -3292,6 +3292,103 @@ mod tests {
 
     // As the sysdb of distributed Chroma: the files of a segment are kept, a flush replaces them together with the log
     // position they cover, and a fork shares them.
+    // As distributed Chroma (go/pkg/sysdb/metastore/db/dao/collection.go): each failed compaction counts one more, the
+    // collection reads show the count, and a flush that succeeds sets it back to 0.
+    #[tokio::test]
+    async fn test_a_flush_sets_the_compaction_failure_count_back_to_0() {
+        let db = get_new_sqlite_db().await;
+        let sysdb = SqliteSysDb::new(db.clone(), "default".to_string(), "default".to_string());
+        let collection_id = CollectionUuid::new();
+        let segment = |r#type, scope| Segment {
+            id: SegmentUuid::new(),
+            r#type,
+            scope,
+            collection: collection_id,
+            metadata: None,
+            file_path: HashMap::new(),
+        };
+        let record = segment(SegmentType::BlockfileRecord, SegmentScope::RECORD);
+        sysdb
+            .create_collection(
+                "default_tenant".to_string(),
+                "default_database".to_string(),
+                collection_id,
+                "failures".to_string(),
+                vec![
+                    segment(SegmentType::Sqlite, SegmentScope::METADATA),
+                    record.clone(),
+                    segment(SegmentType::Spann, SegmentScope::VECTOR),
+                ],
+                Some(InternalCollectionConfiguration::default_hnsw()),
+                Some(Schema::new_default(KnnIndex::Hnsw)),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let count = || async {
+            sysdb
+                .get_collection_with_segments(collection_id)
+                .await
+                .unwrap()
+                .collection
+                .compaction_failure_count
+        };
+        assert_eq!(count().await, 0);
+        for _ in 0..5 {
+            sysdb
+                .increment_compaction_failure_count(collection_id)
+                .await
+                .unwrap();
+        }
+        assert_eq!(count().await, 5);
+        let mut conn = db.get_conn().acquire().await.unwrap();
+        assert_eq!(
+            collections_over_compaction_failure_limit_in(&mut conn, 5)
+                .await
+                .unwrap(),
+            HashMap::from([(collection_id, 5)])
+        );
+        assert!(collections_over_compaction_failure_limit_in(&mut conn, 6)
+            .await
+            .unwrap()
+            .is_empty());
+        drop(conn);
+        sysdb
+            .flush_compaction(
+                collection_id,
+                7,
+                0,
+                vec![SegmentFlushInfo {
+                    segment_id: record.id,
+                    file_paths: HashMap::from([(
+                        "id_to_data".to_string(),
+                        vec!["id_to_data/a".to_string()],
+                    )]),
+                }]
+                .into(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(count().await, 0);
+        // The reset at the start of the server.
+        for _ in 0..3 {
+            sysdb
+                .increment_compaction_failure_count(collection_id)
+                .await
+                .unwrap();
+        }
+        let mut conn = db.get_conn().acquire().await.unwrap();
+        assert_eq!(
+            reset_compaction_failure_counts_in(&mut conn).await.unwrap(),
+            1
+        );
+        drop(conn);
+        assert_eq!(count().await, 0);
+    }
+
     #[tokio::test]
     async fn test_flush_compaction_keeps_the_files_of_the_segments() {
         let db = get_new_sqlite_db().await;
