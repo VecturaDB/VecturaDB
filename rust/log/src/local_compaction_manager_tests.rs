@@ -2171,12 +2171,13 @@ async fn a_collection_with_five_failed_flushes_is_left_out_until_a_restart() {
         )
         .await
         .unwrap();
+    let db = f.db.clone();
     let count = || async {
         sqlx::query_scalar::<_, i32>(
             "SELECT compaction_failure_count FROM collections WHERE id = ?",
         )
         .bind(collection_id.to_string())
-        .fetch_one(f.db.get_conn())
+        .fetch_one(db.get_conn())
         .await
         .unwrap()
     };
