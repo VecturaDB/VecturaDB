@@ -193,6 +193,10 @@ The storage holds only the files of the functions: the indexes stay in the data 
 
 Chroma 1.5.9 opens a data path with attached functions, and serves its collections as before; it does not run the functions. A synchronous function catches up with the writes of Chroma 1.5.9 once VecturaDB opens the data path again. An asynchronous function takes the records that already existed and that Chroma 1.5.9 deleted or updated as if they had not existed: `count_to_file_async` does not count those deletes, and counts those upserts as new records. To count again, detach it and attach it again with a new file.
 
+## Deleting a collection
+
+Distributed Chroma deletes a collection in two phases: it marks the collection as deleted, and its garbage collector removes the files later. The single node deletes the collection and removes its index files before it answers; if removing a file fails, it retries at startup and every hour. The end result is the same: the collection and its files are gone.
+
 ## Clients
 
 A client that needs to know which server it talks to reads `GET /api/v2/pre-flight-checks`. VecturaDB answers with the fields of Chroma and adds a `server` block, for example:
