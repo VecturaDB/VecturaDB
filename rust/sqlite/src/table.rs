@@ -46,6 +46,7 @@ pub enum Collections {
     ConfigJsonStr,
     SchemaStr,
     Version,
+    CompactionFailureCount,
 }
 
 #[derive(Iden)]

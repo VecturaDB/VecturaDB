@@ -201,6 +201,10 @@ Distributed Chroma deletes a collection in two phases: it marks the collection a
 
 Distributed Chroma forks a collection with copy-on-write: the fork shares the files of the source and writes files of its own only for what changes. The single node copies every record of the source into the fork, which keeps files of its own; the fork is visible once the copy has ended. The end result is the same: the fork answers with the records of the source at the moment of the fork.
 
+## Failed compactions
+
+As distributed Chroma, the single node counts the failed flushes of a SPANN collection in a row and leaves the collection out of the flushes after `local_compaction_manager: max_failure_count` of them, 5 by default; a flush that succeeds sets the count back to 0. Distributed Chroma brings such a collection back with a compaction that an operator asks for. The single node has no such request: every start of the server sets all the counts back to 0, so a restart tries every collection again.
+
 ## Clients
 
 A client that needs to know which server it talks to reads `GET /api/v2/pre-flight-checks`. VecturaDB answers with the fields of Chroma and adds a `server` block, for example:

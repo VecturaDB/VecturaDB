@@ -346,6 +346,11 @@ async fn repairs_legacy_construction_settings_and_preserves_records_and_logs() {
                 .execute(&mut db)
                 .await
                 .unwrap();
+            // The failed compactions of a collection (00020).
+            sqlx::query("ALTER TABLE collections DROP COLUMN compaction_failure_count")
+                .execute(&mut db)
+                .await
+                .unwrap();
             if version < 7 {
                 sqlx::query("ALTER TABLE collections DROP COLUMN config_json_str")
                     .execute(&mut db)
