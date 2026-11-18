@@ -103,6 +103,7 @@ impl Fixture {
             max_compaction_size: 10_000,
             max_partition_size: 5_000,
             max_concurrent_jobs: 50,
+            max_failure_count: 5,
             compaction_timeout: Duration::from_secs(86_400),
             spann_flushes: SpannFlushes::default(),
             spann_flush_stop: None,
@@ -267,6 +268,7 @@ impl Fixture {
             max_compaction_size: 10_000,
             max_partition_size: 5_000,
             max_concurrent_jobs: 50,
+            max_failure_count: 5,
             compaction_timeout: Duration::from_secs(86_400),
             spann_flushes: SpannFlushes::default(),
             spann_flush_stop: None,
@@ -1914,6 +1916,7 @@ async fn replaced_spann_versions_are_forgotten_after_the_grace() {
         max_compaction_size: 10_000,
         max_partition_size: 5_000,
         max_concurrent_jobs: 50,
+        max_failure_count: 5,
         compaction_timeout: Duration::from_secs(86_400),
         spann_flushes: SpannFlushes::default(),
         spann_flush_stop: None,
@@ -2127,4 +2130,83 @@ async fn a_flush_fails_when_any_of_its_stages_fails() {
             "{stage:?}: the flush did not fail"
         );
     }
+}
+
+// As the scheduler of distributed Chroma (rust/worker/src/compactor/scheduler.rs): each failed flush counts one more
+// failure, a collection with max_failure_count of them is left out of the rounds, and on the single node a start of the
+// server sets every count back to 0 (Federico, 18/11).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_collection_with_five_failed_flushes_is_left_out_until_a_restart() {
+    let mut f = Fixture::new().await;
+    let mut sysdb = SysDb::Sqlite(chroma_sysdb::sqlite::SqliteSysDb::new(
+        f.db.clone(),
+        "default".into(),
+        "default".into(),
+    ));
+    let collection_id = CollectionUuid::new();
+    let segment = |r#type, scope| Segment {
+        id: SegmentUuid::new(),
+        r#type,
+        scope,
+        collection: collection_id,
+        metadata: None,
+        file_path: Default::default(),
+    };
+    sysdb
+        .create_collection(
+            "default_tenant".to_string(),
+            chroma_types::DatabaseName::new("default_database").unwrap(),
+            collection_id,
+            "failing".to_string(),
+            vec![
+                segment(SegmentType::Sqlite, SegmentScope::METADATA),
+                segment(SegmentType::BlockfileRecord, SegmentScope::RECORD),
+                segment(SegmentType::Spann, SegmentScope::VECTOR),
+            ],
+            Some(chroma_types::InternalCollectionConfiguration::default_hnsw()),
+            Some(Schema::new_default(KnnIndex::Spann)),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let count = || async {
+        sqlx::query_scalar::<_, i32>("SELECT compaction_failure_count FROM collections WHERE id = ?")
+            .bind(collection_id.to_string())
+            .fetch_one(f.db.get_conn())
+            .await
+            .unwrap()
+    };
+    let other = CollectionUuid::new();
+    for failures in 1..=5 {
+        f.handle
+            .request(
+                SpannFlushed {
+                    collection_id,
+                    result: Err(CompactionManagerError::SpannFlushPanicked),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(count().await, failures);
+        let round = without_too_many_failures(&f.db, 5, vec![collection_id, other]).await;
+        if failures < 5 {
+            assert_eq!(round, vec![collection_id, other], "left out after {failures} failures");
+        } else {
+            assert_eq!(round, vec![other], "still flushed after 5 failures");
+        }
+    }
+    // A start of the server: the count back to 0, and the collection in the rounds again.
+    f.restart_compactor().await;
+    f.round_done().await;
+    assert_eq!(count().await, 0);
+    assert_eq!(
+        without_too_many_failures(&f.db, 5, vec![collection_id]).await,
+        vec![collection_id]
+    );
+    // The default of distributed Chroma (rust/worker/src/compactor/config.rs).
+    assert_eq!(LocalCompactionManagerConfig::default().max_failure_count, 5);
+    f.stop().await;
 }

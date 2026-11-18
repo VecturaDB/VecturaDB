@@ -827,6 +827,14 @@ impl SqliteSysDb {
         Ok(response)
     }
 
+    pub(crate) async fn increment_compaction_failure_count(
+        &self,
+        collection_id: CollectionUuid,
+    ) -> Result<(), sqlx::Error> {
+        let mut conn = self.db.get_conn().acquire().await?;
+        increment_compaction_failure_count_in(&mut conn, collection_id).await
+    }
+
     pub(crate) async fn delete_collection(
         &self,
         tenant: String,
@@ -1867,6 +1875,10 @@ impl SqliteSysDb {
             .column((table::Collections::Table, table::Collections::DatabaseId))
             .column((table::Collections::Table, table::Collections::SchemaStr))
             .column((table::Collections::Table, table::Collections::Version))
+            .column((
+                table::Collections::Table,
+                table::Collections::CompactionFailureCount,
+            ))
             .inner_join(
                 table::Databases::Table,
                 sea_query::Expr::col((table::Databases::Table, table::Databases::Id))
@@ -1946,6 +1958,10 @@ impl SqliteSysDb {
             )
             // As the version of distributed Chroma, which each flush moves (00016).
             .column((table::Collections::Table, table::Collections::Version))
+            .column((
+                table::Collections::Table,
+                table::Collections::CompactionFailureCount,
+            ))
             .build_sqlx(sea_query::SqliteQueryBuilder);
 
         let mut rows = sqlx::query_with(&sql, values).fetch(conn);
@@ -2024,7 +2040,7 @@ impl SqliteSysDb {
                     lineage_file_path: None,
                     updated_at: SystemTime::UNIX_EPOCH,
                     database_id,
-                    compaction_failure_count: 0,
+                    compaction_failure_count: first_row.get::<i32, _>("compaction_failure_count"),
                 }))
             })
             .collect::<Result<Vec<_>, GetCollectionsError>>()?;
@@ -2381,6 +2397,53 @@ impl Configurable<SqliteSysDbConfig> for SqliteSysDb {
 /// cover, as the max_seq_id of the segment, which never goes down; a segment of another collection fails the whole
 /// flush. A caller can record a flush in the transaction of other writes to the same database, as the compaction of a
 /// SPANN collection on a single node does with its records.
+/// One more failed compaction of a collection, as distributed Chroma counts them
+/// (go/pkg/sysdb/metastore/db/dao/collection.go).
+pub async fn increment_compaction_failure_count_in(
+    conn: &mut sqlx::SqliteConnection,
+    collection_id: CollectionUuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE collections SET compaction_failure_count = compaction_failure_count + 1 WHERE id = $1",
+    )
+    .bind(collection_id.to_string())
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// The collections with at least max_failure_count failed compactions in a row, with their counts: the compactor leaves
+/// them out, as the scheduler of distributed Chroma (rust/worker/src/compactor/scheduler.rs).
+pub async fn collections_over_compaction_failure_limit_in(
+    conn: &mut sqlx::SqliteConnection,
+    max_failure_count: i32,
+) -> Result<HashMap<CollectionUuid, i32>, sqlx::Error> {
+    let rows: Vec<(String, i32)> = sqlx::query_as(
+        "SELECT id, compaction_failure_count FROM collections WHERE compaction_failure_count >= $1",
+    )
+    .bind(max_failure_count)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, count)| CollectionUuid::from_str(&id).ok().map(|id| (id, count)))
+        .collect())
+}
+
+/// The failed compactions of every collection back to 0, at the start of the server: on the single node a restart
+/// tries again the collections left out (Federico, 18/11). Distributed Chroma has no such reset: there a one-off
+/// compaction asked by an operator brings a collection back.
+pub async fn reset_compaction_failure_counts_in(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE collections SET compaction_failure_count = 0 WHERE compaction_failure_count <> 0",
+    )
+    .execute(&mut *conn)
+    .await?
+    .rows_affected())
+}
+
 pub async fn flush_compaction_in(
     conn: &mut sqlx::SqliteConnection,
     collection_id: CollectionUuid,
@@ -2396,9 +2459,10 @@ pub async fn flush_compaction_in(
         .map(|schema| serde_json::to_string(&schema))
         .transpose()
         .map_err(|e| internal(e.to_string()))?;
-    // As a flush of distributed Chroma, one more version of the collection.
+    // As a flush of distributed Chroma, one more version of the collection, and its failed compactions back to 0
+    // (go/pkg/sysdb/metastore/db/dao/collection.go).
     let collection_version: i32 = sqlx::query_scalar(
-        "UPDATE collections SET schema_str = COALESCE($1, schema_str), version = version + 1 WHERE id = $2 \
+        "UPDATE collections SET schema_str = COALESCE($1, schema_str), version = version + 1, compaction_failure_count = 0 WHERE id = $2 \
          RETURNING version",
     )
     .bind(schema_str)

@@ -855,7 +855,10 @@ impl SysDb {
                 test.increment_compaction_failure_count(collection_id);
                 Ok(())
             }
-            SysDb::Sqlite(_) => Err(IncrementCompactionFailureCountError::Unimplemented),
+            SysDb::Sqlite(sqlite) => sqlite
+                .increment_compaction_failure_count(collection_id)
+                .await
+                .map_err(IncrementCompactionFailureCountError::Sqlite),
         }
     }
 

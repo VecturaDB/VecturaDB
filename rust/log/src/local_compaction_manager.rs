@@ -86,6 +86,11 @@ pub struct LocalCompactionManagerConfig {
     /// its credentials. Without it, the data path, as the SPANN indexes (Federico, 01/11).
     #[serde(default)]
     pub storage: Option<chroma_storage::config::StorageConfig>,
+    /// The failed flushes in a row after which a SPANN collection is left out of the rounds, as max_failure_count of the
+    /// compactor of distributed Chroma (rust/worker/src/compactor/config.rs), with its default, 5. A flush that succeeds
+    /// sets the count back to 0, as a one-off flush does, and so does a start of the server.
+    #[serde(default = "LocalCompactionManagerConfig::default_max_failure_count")]
+    pub max_failure_count: i32,
 }
 
 impl LocalCompactionManagerConfig {
@@ -120,6 +125,10 @@ impl LocalCompactionManagerConfig {
     fn default_purge_interval_sec() -> u64 {
         7_200
     }
+
+    fn default_max_failure_count() -> i32 {
+        5
+    }
 }
 
 impl Default for LocalCompactionManagerConfig {
@@ -133,6 +142,7 @@ impl Default for LocalCompactionManagerConfig {
             timeout_us: Self::default_timeout_us(),
             shutdown_grace_sec: Self::default_shutdown_grace_sec(),
             purge_interval_sec: Self::default_purge_interval_sec(),
+            max_failure_count: Self::default_max_failure_count(),
             storage: None,
         }
     }
@@ -168,6 +178,8 @@ pub struct LocalCompactionManager {
     max_compaction_size: usize,
     max_partition_size: usize,
     max_concurrent_jobs: usize,
+    // See LocalCompactionManagerConfig::max_failure_count.
+    max_failure_count: i32,
     compaction_timeout: Duration,
     // The flushes of SPANN collections that run out of the actor, with the one-off flushes that wait for them.
     spann_flushes: SpannFlushes,
@@ -287,6 +299,51 @@ impl FunctionRuns {
             tracing::error!(collection_id = %collection_id, "The queue of the attached functions is closed");
         }
     }
+}
+
+// The collections of a round without those with max_failure_count failed compactions or more, as the scheduler of
+// distributed Chroma leaves them out (rust/worker/src/compactor/scheduler.rs), with the same log. The one-off flushes do
+// not go through here, as there a one-off compaction skips the count.
+async fn without_too_many_failures(
+    sqlite_db: &SqliteDb,
+    max_failure_count: i32,
+    collections: Vec<CollectionUuid>,
+) -> Vec<CollectionUuid> {
+    if collections.is_empty() {
+        return collections;
+    }
+    let over = match sqlite_db.get_conn().acquire().await {
+        Ok(mut conn) => {
+            chroma_sysdb::sqlite::collections_over_compaction_failure_limit_in(
+                &mut conn,
+                max_failure_count,
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    };
+    let over = match over {
+        Ok(over) => over,
+        Err(err) => {
+            tracing::warn!(error = %err, "The compaction failure counts could not be read; the round flushes them all");
+            return collections;
+        }
+    };
+    collections
+        .into_iter()
+        .filter(|collection_id| match over.get(collection_id) {
+            Some(count) => {
+                tracing::info!(
+                    "Ignoring collection {} - too many compaction failures ({}/{})",
+                    collection_id,
+                    count,
+                    max_failure_count
+                );
+                false
+            }
+            None => true,
+        })
+        .collect()
 }
 
 // A request of a one-off flush, answered at the end of its flush.
@@ -453,6 +510,7 @@ impl Configurable<LocalCompactionManagerConfig> for LocalCompactionManager {
             max_compaction_size: config.max_compaction_size,
             max_partition_size: config.max_partition_size,
             max_concurrent_jobs: config.max_concurrent_jobs,
+            max_failure_count: config.max_failure_count,
             compaction_timeout: Duration::from_micros(config.timeout_us),
             spann_flushes: SpannFlushes::default(),
             spann_flush_stop: registry.get::<SpannFlushStop>().ok(),
@@ -482,6 +540,7 @@ impl Component for LocalCompactionManager {
     // As the compaction manager of distributed Chroma, which schedules its first compaction when it starts
     // (rust/worker/src/compactor/compaction_manager.rs).
     async fn on_start(&mut self, ctx: &ComponentContext<Self>) -> () {
+        self.reset_compaction_failure_counts().await;
         ctx.scheduler.schedule(
             ScheduledCompactMessage {},
             self.compaction_interval,
@@ -1139,6 +1198,8 @@ impl Handler<ScheduledCompactMessage> for LocalCompactionManager {
             .into_iter()
             .filter(|collection_id| !self.spann_flushes.running.contains_key(collection_id))
             .collect::<Vec<_>>();
+        let collections =
+            without_too_many_failures(&self.sqlite_db, self.max_failure_count, collections).await;
         for collection_id in &collections {
             self.spann_flushes
                 .running
@@ -1267,6 +1328,7 @@ impl Handler<SpannFlushed> for LocalCompactionManager {
                 error = %err,
                 "SPANN flush failed; its records stay in the log for the next round"
             );
+            self.increment_compaction_failure_count(collection_id).await;
         }
         let requests = self
             .spann_flushes
@@ -1329,6 +1391,42 @@ impl LocalCompactionManager {
         )
         .await
         .map_err(|_| CompactionManagerError::PullLogsFailure)
+    }
+
+    // As fail_job of the scheduler of distributed Chroma (rust/worker/src/compactor/scheduler.rs): one more failed
+    // compaction of the collection, which only logs when it cannot be counted.
+    async fn increment_compaction_failure_count(&self, collection_id: CollectionUuid) {
+        let counted = match self.sqlite_db.get_conn().acquire().await {
+            Ok(mut conn) => {
+                chroma_sysdb::sqlite::increment_compaction_failure_count_in(&mut conn, collection_id)
+                    .await
+            }
+            Err(err) => Err(err),
+        };
+        if let Err(e) = counted {
+            tracing::warn!(
+                "Failed to increment compaction failure count in sysdb for {}: {:?}.",
+                collection_id,
+                e
+            );
+        }
+    }
+
+    // At the start of the server, every count back to 0: a restart tries again the collections left out (Federico,
+    // 18/11). Distributed Chroma brings a collection back with a one-off compaction instead.
+    async fn reset_compaction_failure_counts(&self) {
+        let reset = match self.sqlite_db.get_conn().acquire().await {
+            Ok(mut conn) => chroma_sysdb::sqlite::reset_compaction_failure_counts_in(&mut conn).await,
+            Err(err) => Err(err),
+        };
+        match reset {
+            Ok(0) => {}
+            Ok(reset) => tracing::info!(
+                collections = reset,
+                "The compaction failure counts are back to 0: the collections left out flush again"
+            ),
+            Err(err) => tracing::warn!(error = %err, "The compaction failure counts could not be set back to 0"),
+        }
     }
 
     /// How long a stop waits, for the work out of the actor and then for the connections of SQLite.
