@@ -193,6 +193,10 @@ The storage holds only the files of the functions: the indexes stay in the data 
 
 Chroma 1.5.9 opens a data path with attached functions, and serves its collections as before; it does not run the functions. A synchronous function catches up with the writes of Chroma 1.5.9 once VecturaDB opens the data path again. An asynchronous function takes the records that already existed and that Chroma 1.5.9 deleted or updated as if they had not existed: `count_to_file_async` does not count those deletes, and counts those upserts as new records. To count again, detach it and attach it again with a new file.
 
+## Failed compactions
+
+As distributed Chroma, the single node counts the failed flushes of a SPANN collection in a row and leaves the collection out of the flushes after `local_compaction_manager: max_failure_count` of them, 5 by default; a flush that succeeds sets the count back to 0. Distributed Chroma brings such a collection back with a compaction that an operator asks for. The single node has no such request: every start of the server sets all the counts back to 0, so a restart tries every collection again.
+
 ## Clients
 
 A client that needs to know which server it talks to reads `GET /api/v2/pre-flight-checks`. VecturaDB answers with the fields of Chroma and adds a `server` block, for example:
