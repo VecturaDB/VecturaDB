@@ -193,6 +193,14 @@ The storage holds only the files of the functions: the indexes stay in the data 
 
 Chroma 1.5.9 opens a data path with attached functions, and serves its collections as before; it does not run the functions. A synchronous function catches up with the writes of Chroma 1.5.9 once VecturaDB opens the data path again. An asynchronous function takes the records that already existed and that Chroma 1.5.9 deleted or updated as if they had not existed: `count_to_file_async` does not count those deletes, and counts those upserts as new records. To count again, detach it and attach it again with a new file.
 
+## Deleting a collection
+
+Distributed Chroma deletes a collection in two phases: it marks the collection as deleted, and its garbage collector removes the files later. The single node deletes the collection and removes its index files before it answers; if removing a file fails, it retries at startup and every hour. The end result is the same: the collection and its files are gone.
+
+## Forking a collection
+
+Distributed Chroma forks a collection with copy-on-write: the fork shares the files of the source and writes files of its own only for what changes. The single node copies every record of the source into the fork, which keeps files of its own; the fork is visible once the copy has ended. The end result is the same: the fork answers with the records of the source at the moment of the fork.
+
 ## Failed compactions
 
 As distributed Chroma, the single node counts the failed flushes of a SPANN collection in a row and leaves the collection out of the flushes after `local_compaction_manager: max_failure_count` of them, 5 by default; a flush that succeeds sets the count back to 0. Distributed Chroma brings such a collection back with a compaction that an operator asks for. The single node has no such request: every start of the server sets all the counts back to 0, so a restart tries every collection again.
