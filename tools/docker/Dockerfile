@@ -54,7 +54,7 @@ LABEL org.opencontainers.image.title="VecturaDB" \
       org.opencontainers.image.url="https://vecturadb.org" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.revision="${REVISION}"
-COPY vecturadb/docker/config.yaml /config.yaml
+COPY tools/docker/config.yaml /config.yaml
 COPY --from=builder /vecturadb /usr/local/bin/vecturadb
 RUN ln -s vecturadb /usr/local/bin/chroma
 EXPOSE 8000

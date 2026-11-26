@@ -36,7 +36,7 @@ jobs:
       version: ${{ needs.version.outputs.version }}
 
   # The image is built from the source as Chroma builds its official one (.github/workflows/_build_release_container.yml
-  # of Chroma), with vecturadb/docker/Dockerfile: each architecture on a runner of its own, without emulation, pushed with
+  # of Chroma), with tools/docker/Dockerfile: each architecture on a runner of its own, without emulation, pushed with
   # a tag of its architecture; then one tag for both.
   image:
     name: Image (${{ matrix.arch }})
@@ -75,7 +75,7 @@ jobs:
         run: |
           docker pull --platform "linux/${{ matrix.arch }}" rust:1.92.0
           docker pull --platform "linux/${{ matrix.arch }}" debian:stable-slim
-          docker buildx build --platform "linux/${{ matrix.arch }}" -f vecturadb/docker/Dockerfile \
+          docker buildx build --platform "linux/${{ matrix.arch }}" -f tools/docker/Dockerfile \
             --build-arg REVISION=${{ github.sha }} -t "$IMAGE:$VERSION-${{ matrix.arch }}" --push .
 
   image-manifest:
